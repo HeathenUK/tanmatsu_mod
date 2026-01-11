@@ -108,14 +108,23 @@ static void draw_file_browser(file_browser_t *browser) {
             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + 4, file_y, RGB565_WHITE, font_scale, browser->files[i].is_dir ? ">" : "");
         }
         char name[64];
-        int name_len = snprintf(name, sizeof(name), "%s%s", browser->files[i].is_dir ? "[" : "", browser->files[i].filename);
-        if (name_len >= (int)sizeof(name)) {
-            name[sizeof(name) - 1] = '\0';
+        // Special handling for ".." entry - ensure it displays correctly
+        if (strcmp(browser->files[i].filename, "..") == 0) {
+            snprintf(name, sizeof(name), "[..]");
+        } else {
+            int name_len = snprintf(name, sizeof(name), "%s%s", browser->files[i].is_dir ? "[" : "", browser->files[i].filename);
+            if (name_len >= (int)sizeof(name)) {
+                name[sizeof(name) - 1] = '\0';
+            }
+            if (browser->files[i].is_dir) {
+                int len = strlen(name);
+                if (len < (int)sizeof(name) - 1) {
+                    name[len] = ']';
+                    name[len + 1] = '\0';
+                }
+            }
         }
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + 20, file_y, RGB565_WHITE, font_scale, name);
-        if (browser->files[i].is_dir) {
-            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + strlen(name) * (FONT_WIDTH * font_scale) + 20, file_y, RGB565_WHITE, font_scale, "]");
-        }
     }
     
     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, FB_HEIGHT - MARGIN_BOTTOM - line_height, RGB565_WHITE, font_scale, "UP/DN: navigate  RT/ENT: select  LT: back");
@@ -227,7 +236,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
     // Initialize audio system
-    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_BLACK, 2, "Initializing audio...");
     blit();
     res = audio_init();
@@ -249,7 +258,7 @@ void app_main(void) {
         }
     } else {
         ESP_LOGW(TAG, "Audio initialization failed: %s", esp_err_to_name(res));
-        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Audio init failed");
         blit();
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -259,17 +268,17 @@ void app_main(void) {
     //
     // if (wifi_remote_initialize() == ESP_OK) {
     //
-    //     fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+    //     fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     //     pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Starting WiFi stack...");
     //     blit();
     //     wifi_connection_init_stack();  // Start the Espressif WiFi stack
     //
-    //     fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+    //     fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     //     pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Connecting to WiFi network...");
     //     blit();
     //
     //     if (wifi_connect_try_all() == ESP_OK) {
-    //         fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+    //         fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     //         pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Succesfully connected to WiFi network");
     //         blit();
     //     } else {
@@ -288,7 +297,7 @@ void app_main(void) {
     // vTaskDelay(pdMS_TO_TICKS(500));
 
     // Initialize SD card
-    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_BLACK, 2, "Initializing SD card...");
     blit();
     res = sdcard_init();
@@ -296,7 +305,7 @@ void app_main(void) {
         ESP_LOGI(TAG, "SD card initialized successfully");
     } else {
         ESP_LOGW(TAG, "SD card initialization failed: %s", esp_err_to_name(res));
-        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "SD card init failed");
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_BLACK, 2, "Continuing without SD");
         blit();
@@ -356,7 +365,7 @@ void app_main(void) {
         blit();
     } else {
         // No SD card - show error
-        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "SD card not mounted");
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_BLACK, 2, "Insert SD card and");
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 36, RGB565_BLACK, 2, "restart device");
@@ -468,32 +477,32 @@ void app_main(void) {
                                                             mod_info_loaded = false;  // Force reload of module info
                                                             // Tracker UI will be drawn in main loop
                                                         } else {
-                                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
                                                             blit();
                                                         }
                                                     } else {
                                                         free(mod_file_data);
                                                         mod_file_data = NULL;
-                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
                                                         blit();
                                                     }
                                                 } else {
                                                     free(mod_file_data);
                                                     mod_file_data = NULL;
-                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
                                                     blit();
                                                 }
                                             } else {
                                                 fclose(f);
-                                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                 font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
                                                 blit();
                                             }
                                         } else {
-                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
                         blit();
                     }
@@ -625,32 +634,32 @@ void app_main(void) {
                                                         // Tracker UI will be drawn in main loop
                                                         browser_needs_redraw = false;  // Don't redraw browser, we're playing now
                                                     } else {
-                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
                                                         blit();
                                                     }
                                                 } else {
                                                     free(mod_file_data);
                                                     mod_file_data = NULL;
-                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
                                                     blit();
                                                 }
                                             } else {
                                                 free(mod_file_data);
                                                 mod_file_data = NULL;
-                                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                 font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
                                                 blit();
                                             }
                                         } else {
                                             fclose(f);
-                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
                                             blit();
                                         }
                                     } else {
-                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
                                         blit();
                                     }
@@ -712,32 +721,32 @@ void app_main(void) {
                                                         mod_info_loaded = false;  // Force reload of module info
                                                         // Tracker UI will be drawn in main loop
                                                     } else {
-                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
                                                     blit();
                                                 }
                                             } else {
                                                 free(mod_file_data);
                                                 mod_file_data = NULL;
-                                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                 font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
                                                 blit();
                                             }
                                         } else {
                                             free(mod_file_data);
                                             mod_file_data = NULL;
-                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
                                             blit();
                                         }
                                     } else {
                                         fclose(f);
-                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
                                         blit();
                                     }
                                 } else {
-                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
                                     blit();
                                 }
@@ -745,7 +754,7 @@ void app_main(void) {
                         }
                         // If directory was entered, file_browser_select already refreshed and changed directory
                         // Draw browser view
-                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_WHITE);
+                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_WHITE, 2, "MOD file browser");
                         char path_text[128];
                         int path_len = snprintf(path_text, sizeof(path_text), "Path: %s", browser.current_path);
