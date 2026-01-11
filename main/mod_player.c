@@ -26,9 +26,10 @@ static TaskHandle_t mod_task_handle = NULL;
 static StackType_t *mod_task_stack = NULL;
 static StaticTask_t *mod_task_tcb = NULL;
 
-// Audio buffer for MOD playback (1024 samples for better buffering against CPU contention)
-// 512 samples = ~11.6ms at 44.1kHz, 1024 samples = ~23.2ms (more headroom for UI delays)
-#define MOD_BUFFER_SAMPLES 1024
+// Audio buffer for MOD playback (4096 samples for maximum buffering against CPU contention)
+// 512 samples = ~11.6ms, 1024 = ~23.2ms, 2048 = ~46.4ms, 4096 = ~92.9ms at 44.1kHz
+// Large buffer provides significant headroom for UI operations (scrolling, rendering, PPA rotation)
+#define MOD_BUFFER_SAMPLES 4096
 #define MOD_BUFFER_SIZE (MOD_BUFFER_SAMPLES * 2 * sizeof(int16_t))  // Stereo 16-bit
 
 /**
@@ -41,9 +42,9 @@ static void mod_playback_task(void *arg) {
     static int16_t stereo_buffer[MOD_BUFFER_SAMPLES * 2] = {0};
     size_t bytes_written;
     uint32_t buffer_count = 0;
-    uint32_t last_log_time = 0;
+    // uint32_t last_log_time = 0;  // Commented out - logging disabled
 
-    ESP_LOGI(TAG, "MOD playback task started");
+    // ESP_LOGI(TAG, "MOD playback task started");  // Commented out - logging disabled
 
     while (1) {
         // Only play if MOD is loaded, playing flag is set, and we have valid handles
@@ -53,20 +54,20 @@ static void mod_playback_task(void *arg) {
             int rc = xmp_play_buffer(mod_ctx, mono_buffer, sizeof(mono_buffer), 1);
             
             if (rc == 0) {
-                // First write after starting - log to confirm audio is flowing
-                static bool first_write = true;
-                if (first_write) {
-                    ESP_LOGI(TAG, "First MOD audio buffer written to I2S");
-                    // Check if buffer actually contains audio data (not all zeros)
-                    int16_t max_sample = 0;
-                    int16_t min_sample = 0;
-                    for (int i = 0; i < MOD_BUFFER_SAMPLES; i++) {
-                        if (mono_buffer[i] > max_sample) max_sample = mono_buffer[i];
-                        if (mono_buffer[i] < min_sample) min_sample = mono_buffer[i];
-                    }
-                    ESP_LOGI(TAG, "First buffer sample range: min=%d, max=%d", min_sample, max_sample);
-                    first_write = false;
-                }
+                // First write after starting - logging commented out
+                // static bool first_write = true;
+                // if (first_write) {
+                //     ESP_LOGI(TAG, "First MOD audio buffer written to I2S");
+                //     // Check if buffer actually contains audio data (not all zeros)
+                //     int16_t max_sample = 0;
+                //     int16_t min_sample = 0;
+                //     for (int i = 0; i < MOD_BUFFER_SAMPLES; i++) {
+                //         if (mono_buffer[i] > max_sample) max_sample = mono_buffer[i];
+                //         if (mono_buffer[i] < min_sample) min_sample = mono_buffer[i];
+                //     }
+                //     ESP_LOGI(TAG, "First buffer sample range: min=%d, max=%d", min_sample, max_sample);
+                //     first_write = false;
+                // }
                 
                 // Convert mono to stereo (duplicate L/R)
                 // Match the beep's format: buffer[i * I2S_CHANNELS + 0] for L, +1 for R
@@ -96,39 +97,26 @@ static void mod_playback_task(void *arg) {
                             stereo_buffer[i * 2 + 1] = mono_buffer[i];
                         }
                     }
-                    ESP_LOGI(TAG, "I2S buffer pre-filled");
+                    // ESP_LOGI(TAG, "I2S buffer pre-filled");
                 }
 
                 // Write to I2S (blocking, same as beep - ensures continuous playback)
                 // Channel is already enabled by audio_init(), no need to re-enable
-                esp_err_t ret = i2s_channel_write(i2s_handle, stereo_buffer, 
-                                                   sizeof(stereo_buffer), 
-                                                   &bytes_written, 
-                                                   portMAX_DELAY);  // Blocking to ensure continuous audio
+                i2s_channel_write(i2s_handle, stereo_buffer, 
+                                   sizeof(stereo_buffer), 
+                                   &bytes_written, 
+                                   portMAX_DELAY);  // Blocking to ensure continuous audio
                 
                 buffer_count++;
                 
                 // Yield after I2S write to prevent CPU hogging and allow UI thread to run
                 // This helps prevent buffer underruns when UI does heavy work (scrolling, rendering)
                 taskYIELD();
-                uint32_t current_time = xTaskGetTickCount();
                 
-                // Log every 2 seconds (approximately 43 buffers at 44100Hz / 1024 samples = ~43 buffers/sec)
-                if (current_time - last_log_time > pdMS_TO_TICKS(2000)) {
-                    ESP_LOGI(TAG, "MOD playback: %lu buffers written, last write: %zu/%zu bytes, rc=%d", 
-                             buffer_count, bytes_written, sizeof(stereo_buffer), rc);
-                    last_log_time = current_time;
-                }
-                
-                if (ret != ESP_OK) {
-                    ESP_LOGW(TAG, "I2S write error: %s (wrote %zu/%zu bytes)", 
-                             esp_err_to_name(ret), bytes_written, sizeof(stereo_buffer));
-                } else if (bytes_written != sizeof(stereo_buffer)) {
-                    ESP_LOGW(TAG, "Partial I2S write: %zu/%zu bytes", bytes_written, sizeof(stereo_buffer));
-                }
+                // Logging commented out - removed ret check and all logging statements
             } else {
                 // Playback ended or error
-                ESP_LOGI(TAG, "MOD playback ended (rc=%d) after %lu buffers", rc, buffer_count);
+                // ESP_LOGI(TAG, "MOD playback ended (rc=%d) after %lu buffers", rc, buffer_count);
                 mod_playing = false;
                 buffer_count = 0;
             }
@@ -139,7 +127,7 @@ static void mod_playback_task(void *arg) {
                 i2s_channel_write(i2s_handle, stereo_buffer, sizeof(stereo_buffer), &bytes_written, 0);  // Non-blocking
             }
             buffer_count = 0;
-            last_log_time = 0;
+            // last_log_time = 0;  // Commented out - logging disabled
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
