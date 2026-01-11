@@ -70,6 +70,7 @@ static QueueHandle_t input_event_queue = NULL;
 #define RGB565_YELLOW  0xFFE0
 #define RGB565_MAGENTA 0xF81F
 #define RGB565_CYAN    0x07FF
+#define RGB565_GRAY    0x8410  // Medium gray for muted channels (50% brightness)
 
 // KAMI support removed - Tanmatsu only
 
@@ -125,6 +126,56 @@ static void draw_file_browser(file_browser_t *browser) {
     }
     
     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, FB_HEIGHT - MARGIN_BOTTOM - line_height, RGB565_WHITE, font_scale, "UP/DN: navigate  RT/ENT: select  LT: back");
+}
+
+// Hardware-accelerated scrolling using PPA SRM with 0° rotation
+// Uses fb_rotated as temporary buffer (we don't need it during scrolling)
+static void scroll_framebuffer_ppa(uint16_t *fb_pixels, int src_y, int dst_y, int copy_height, int stride) {
+    if (!fb_pixels || !fb_rotated || !ppa_srm_handle || copy_height <= 0) {
+        return;
+    }
+    
+    int copy_width = stride;  // Full width
+    size_t copy_bytes = copy_height * stride * sizeof(uint16_t);
+    
+    // Step 1: Copy source region to temporary buffer (fb_rotated) using PPA SRM with 0° rotation
+    // Use full framebuffer as input picture, block_offset_y specifies source region
+    ppa_srm_oper_config_t srm_config_copy1 = {
+        .in.buffer = fb_pixels,  // Full framebuffer as input picture
+        .in.pic_w = stride,
+        .in.pic_h = FB_HEIGHT,
+        .in.block_w = copy_width,
+        .in.block_h = copy_height,
+        .in.block_offset_x = 0,
+        .in.block_offset_y = src_y,  // Start reading from src_y
+        .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        .out.buffer = fb_rotated,  // Use rotated buffer as temporary
+        .out.buffer_size = copy_bytes,
+        .out.pic_w = copy_width,
+        .out.pic_h = copy_height,
+        .out.block_offset_x = 0,
+        .out.block_offset_y = 0,
+        .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,  // No rotation, just copy
+        .scale_x = 1,
+        .scale_y = 1,
+        .rgb_swap = 0,
+        .byte_swap = 0,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    
+    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config_copy1);
+    if (ret != ESP_OK) {
+        // Fallback to memmove if PPA fails
+        uint16_t *src_ptr = fb_pixels + src_y * stride;
+        uint16_t *dst_ptr = fb_pixels + dst_y * stride;
+        memmove(dst_ptr, src_ptr, copy_bytes);
+        return;
+    }
+    
+    // Step 2: Copy from temporary buffer to destination (non-overlapping, memcpy is fine)
+    uint16_t *dst_ptr = fb_pixels + dst_y * stride;
+    memcpy(dst_ptr, fb_rotated, copy_bytes);
 }
 
 void blit(void) {
@@ -543,6 +594,29 @@ void app_main(void) {
                         }
                     }
                     
+                    // Handle number keys (0-9) for channel mute toggle during playback
+                    // Standard PC scancodes (Set 1): 0=0x0B, 1-9=0x02-0x0A
+                    // Direct mapping: key number = channel number
+                    if (!browser_active && mod_player_is_playing()) {
+                        int channel = -1;
+                        if (sc >= 0x02 && sc <= 0x0A) {
+                            // Keys 1-9: scancodes 0x02-0x0A map directly to channels 1-9
+                            channel = sc - 0x01;
+                        } else if (sc == 0x0B) {
+                            // Key 0: scancode 0x0B maps to channel 0
+                            channel = 0;
+                        }
+                        
+                        if (channel >= 0 && channel < XMP_MAX_CHANNELS) {
+                            // Toggle channel mute
+                            esp_err_t mute_res = mod_player_toggle_channel_mute(channel);
+                            if (mute_res == ESP_OK) {
+                                // Force redraw on next frame to show color change
+                                // The mute state will be checked during rendering
+                            }
+                        }
+                    }
+                    
                     // Handle arrow keys via scancode (fallback for navigation)
                     if (browser_active) {
                         bool browser_needs_redraw = false;
@@ -752,9 +826,14 @@ void app_main(void) {
                 // Only render when row changes (frame rate limiting)
                 if (frame_info.row != last_row) {
                     // Load module info if not loaded
+                    static bool tracker_initialized = false;  // Declare here so it persists across renders
                     if (!mod_info_loaded) {
                         mod_player_get_module_info(&mod_info);
                         mod_info_loaded = true;
+                        // Reset tracker_initialized when module info is reloaded (new MOD started)
+                        tracker_initialized = false;
+                        tick_history_count = 0;  // Reset tick history for new MOD
+                        last_row = -1;  // Reset last_row to force first render
                     }
                     
                     int num_channels = mod_info.mod ? mod_info.mod->chn : 0;
@@ -785,17 +864,10 @@ void app_main(void) {
                         int max_rows_on_screen = cached_max_rows;
                         int ch_width = cached_ch_width;
                         
-                        // Track if this is the first render (need full screen)
-                        static bool tracker_initialized = false;
-                        // Reset tracker_initialized when module info is reloaded (new MOD started)
-                        if (!mod_info_loaded) {
-                            tracker_initialized = false;
-                        }
-                        
                         // Header height should align with line_height to prevent partial rows showing
-                        // Use 2 * line_height for header area (text is scaled 2x = 16px, so fits in 2 rows)
-                        // Header starts at MARGIN_TOP and is exactly 2 * line_height tall
-                        int header_height = line_height * 2;
+                        // Use 2 * line_height + 3 for header area (text is scaled 2x = 16px, so fits in 2 rows, plus 3px extra to prevent sliver)
+                        // Header starts at MARGIN_TOP and is 2 * line_height + 3 pixels tall
+                        int header_height = line_height * 2 + 3;
                         int header_y = MARGIN_TOP + header_height;  // First row starts immediately after header
                         
                         // Track volume changes to update header
@@ -820,7 +892,7 @@ void app_main(void) {
                         void draw_header(void) {
                             // Always clear header area exactly (from MARGIN_TOP to header_y, which is MARGIN_TOP + header_height)
                             // This ensures no sliver of content shows below the header and prevents smudging when updating
-                            // Header area is exactly 2 * line_height pixels tall, aligned to row boundaries
+                            // Header area is 2 * line_height + 3 pixels tall (extra 3px to prevent sliver)
                             int header_start = MARGIN_TOP * stride;
                             memset(fb_pixels + header_start, 0, header_height * stride * sizeof(uint16_t));
                             
@@ -919,7 +991,10 @@ void app_main(void) {
                                         
                                         snprintf(ch_str, sizeof(ch_str), "%s %02X %c%02X", note_str, ins, effect_char, fxp);
                                         
-                                    uint16_t ch_color = channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
+                                    // Check if channel is muted (gray color for muted channels)
+                                    bool channel_muted = false;
+                                    mod_player_get_channel_mute(ch, &channel_muted);
+                                    uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
                                     // Scale factor: line_height / FONT_HEIGHT (typically 14-18 / 8 = 1-2)
                                     int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
                                     if (font_scale < 1) font_scale = 1;
@@ -963,13 +1038,13 @@ void app_main(void) {
                             // Scroll framebuffer content up (skip header row at top, account for margins)
                             int scrollable_height = FB_HEIGHT - header_y - MARGIN_BOTTOM;
                             int scroll_lines = line_height;
-                            int src_offset = (header_y + scroll_lines) * stride;
-                            int dst_offset = header_y * stride;
+                            int src_y = header_y + scroll_lines;
+                            int dst_y = header_y;
                             int copy_height = scrollable_height - scroll_lines;
                             
-                            // Scroll the content region up using memmove
+                            // Scroll the content region up using PPA SRM (hardware-accelerated)
                             if (copy_height > 0) {
-                                memmove(fb_pixels + dst_offset, fb_pixels + src_offset, copy_height * stride * sizeof(uint16_t));
+                                scroll_framebuffer_ppa(fb_pixels, src_y, dst_y, copy_height, stride);
                             }
                             
                             // Clear the bottom line_height rows (where new content will go, account for margin)
@@ -1023,7 +1098,10 @@ void app_main(void) {
                                     
                                     snprintf(ch_str, sizeof(ch_str), "%s %02X %c%02X", note_str, ins, effect_char, fxp);
                                     
-                                    uint16_t ch_color = channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
+                                    // Check if channel is muted (gray color for muted channels)
+                                    bool channel_muted = false;
+                                    mod_player_get_channel_mute(ch, &channel_muted);
+                                    uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
                                     // Scale factor: line_height / FONT_HEIGHT (typically 14-18 / 8 = 1-2)
                                     int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
                                     if (font_scale < 1) font_scale = 1;

@@ -249,6 +249,13 @@ esp_err_t mod_player_start(void) {
         return ESP_OK;
     }
 
+    // Configure libxmp settings
+    // Limit mixer voices to 32 (default is 128) to reduce CPU load with many channels
+    // This must be set before xmp_start_player()
+    xmp_set_player(mod_ctx, XMP_PLAYER_VOICES, 32);
+    // Enable DSP filtering (lowpass filter)
+    xmp_set_player(mod_ctx, XMP_PLAYER_DSP, XMP_DSP_LOWPASS);
+    
     // I2S channel should already be enabled by audio_init()
     // Start player (mono output, loop enabled)
     // Note: XMP_FORMAT_MONO = 4, 0 = stereo (see xmp.h)
@@ -258,11 +265,11 @@ esp_err_t mod_player_start(void) {
         return ESP_ERR_INVALID_STATE;
     }
     
-    // Configure libxmp settings for better audio quality
-    // Use spline interpolation for better quality (reduces aliasing/artifacts vs default linear)
+    // Configure libxmp settings for audio quality
+    // Use spline interpolation (highest quality, reduces aliasing/artifacts)
     xmp_set_player(mod_ctx, XMP_PLAYER_INTERP, XMP_INTERP_SPLINE);
     
-    ESP_LOGI(TAG, "MOD player started at %lu Hz, format: MONO, interpolation: SPLINE", sample_rate);
+    ESP_LOGI(TAG, "MOD player started at %lu Hz, format: MONO, interpolation: SPLINE, voices: 32, DSP: enabled", sample_rate);
 
     mod_playing = true;
     ESP_LOGI(TAG, "MOD playback started");
@@ -306,5 +313,42 @@ esp_err_t mod_player_get_module_info(struct xmp_module_info *mod_info) {
         return ESP_ERR_INVALID_STATE;
     }
     xmp_get_module_info(mod_ctx, mod_info);
+    return ESP_OK;
+}
+
+esp_err_t mod_player_toggle_channel_mute(int channel) {
+    if (mod_ctx == NULL || !mod_playing) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (channel < 0 || channel >= XMP_MAX_CHANNELS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // xmp_channel_mute with status=2 toggles the mute state
+    int ret = xmp_channel_mute(mod_ctx, channel, 2);
+    if (ret < 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    return ESP_OK;
+}
+
+esp_err_t mod_player_get_channel_mute(int channel, bool *is_muted) {
+    if (mod_ctx == NULL || !mod_playing || is_muted == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (channel < 0 || channel >= XMP_MAX_CHANNELS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // xmp_channel_mute with status=-1 queries the current mute state
+    int ret = xmp_channel_mute(mod_ctx, channel, -1);
+    if (ret < 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    *is_muted = (ret != 0);
     return ESP_OK;
 }

@@ -9,7 +9,7 @@
 /**
  * @brief Initialize MOD player
  * 
- * @param sample_rate Sample rate for playback (typically 44100)
+ * @param sample_rate Sample rate for playback (typically 22050 or 44100)
  * @return esp_err_t ESP_OK on success
  */
 esp_err_t mod_player_init(uint32_t sample_rate);
@@ -66,3 +66,20 @@ esp_err_t mod_player_get_frame_info(struct xmp_frame_info *frame_info);
  * @return esp_err_t ESP_OK on success, ESP_ERR_INVALID_STATE if not loaded
  */
 esp_err_t mod_player_get_module_info(struct xmp_module_info *mod_info);
+
+/**
+ * @brief Toggle mute state of a channel
+ * 
+ * @param channel Channel number (0-based)
+ * @return esp_err_t ESP_OK on success, ESP_ERR_INVALID_STATE if not playing, ESP_ERR_INVALID_ARG if invalid channel
+ */
+esp_err_t mod_player_toggle_channel_mute(int channel);
+
+/**
+ * @brief Check if a channel is muted
+ * 
+ * @param channel Channel number (0-based)
+ * @param is_muted Pointer to store mute state
+ * @return esp_err_t ESP_OK on success, ESP_ERR_INVALID_STATE if not playing, ESP_ERR_INVALID_ARG if invalid channel
+ */
+esp_err_t mod_player_get_channel_mute(int channel, bool *is_muted);
