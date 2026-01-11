@@ -824,7 +824,7 @@ void app_main(void) {
                         }
                         
                         if (!tracker_initialized) {
-                            // First render - full screen
+                            // First render - full screen (fb_fill already clears all margins)
                             fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                             
                             // Display MOD file name and volume at the top
@@ -943,6 +943,10 @@ void app_main(void) {
                             // Clear the bottom line_height rows (where new content will go, account for margin)
                             int clear_y = FB_HEIGHT - MARGIN_BOTTOM - scroll_lines;
                             memset(fb_pixels + clear_y * stride, 0, scroll_lines * stride * sizeof(uint16_t));
+                            
+                            // Explicitly clear the bottom margin area to prevent leftover pixels
+                            int bottom_margin_start = FB_HEIGHT - MARGIN_BOTTOM;
+                            memset(fb_pixels + bottom_margin_start * stride, 0, MARGIN_BOTTOM * stride * sizeof(uint16_t));
                             
                             // Only draw the new row at the bottom (account for margin)
                             int y = logical_height - MARGIN_BOTTOM - line_height;
