@@ -472,12 +472,14 @@ void app_main(void) {
                                                     res = mod_player_load(mod_file_data, mod_file_size);
                                                     if (res == ESP_OK) {
                                                         res = mod_player_start();
-                                                        if (res == ESP_OK) {
-                                                            browser_active = false;
-                                                            mod_info_loaded = false;  // Force reload of module info
-                                                            // Tracker UI will be drawn in main loop
-                                                        } else {
-                                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                    if (res == ESP_OK) {
+                                                        browser_active = false;
+                                                        mod_info_loaded = false;  // Force reload of module info
+                                                        // Clear screen immediately to prevent white flash
+                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        // Tracker UI will be drawn in main loop
+                                                    } else {
+                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
                                                             blit();
                                                         }
@@ -631,6 +633,8 @@ void app_main(void) {
                                                     if (res == ESP_OK) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
+                                                        // Clear screen immediately to prevent white flash
+                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         // Tracker UI will be drawn in main loop
                                                         browser_needs_redraw = false;  // Don't redraw browser, we're playing now
                                                     } else {
@@ -685,6 +689,7 @@ void app_main(void) {
                             is_directory = browser.files[browser.selected_index].is_dir;
                         }
                         
+                        bool browser_needs_redraw = false;
                         static char selected_path[MAX_FILENAME_LEN];
                         esp_err_t select_res = file_browser_select(&browser, selected_path, sizeof(selected_path));
                         if (select_res == ESP_OK && !is_directory) {
@@ -719,6 +724,8 @@ void app_main(void) {
                                                     if (res == ESP_OK) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
+                                                        // Clear screen immediately to prevent white flash
+                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         // Tracker UI will be drawn in main loop
                                                     } else {
                                                     fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
@@ -750,44 +757,17 @@ void app_main(void) {
                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
                                     blit();
                                 }
-                            }
-                        }
-                        // If directory was entered, file_browser_select already refreshed and changed directory
-                        // Draw browser view
-                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_WHITE, 2, "MOD file browser");
-                        char path_text[128];
-                        int path_len = snprintf(path_text, sizeof(path_text), "Path: %s", browser.current_path);
-                        if (path_len >= (int)sizeof(path_text)) {
-                            path_text[sizeof(path_text) - 1] = '\0';
-                        }
-                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_WHITE, 2, path_text);
-                        
-                        int start_idx = browser.selected_index > 5 ? browser.selected_index - 5 : 0;
-                        int end_idx = start_idx + 10;
-                        if (end_idx > browser.count) end_idx = browser.count;
-                        
-                        for (int i = start_idx; i < end_idx; i++) {
-                            int y = 36 + (i - start_idx) * 14;
-                            if (i == browser.selected_index) {
-                                fb_rect(fb, FB_WIDTH, FB_HEIGHT, 0, y - 2, FB_WIDTH, 14, argb32_to_rgb565(0xFF0000FF));
-                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 4, y, RGB565_WHITE, 2, browser.files[i].is_dir ? ">" : "");
-                            } else {
-                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 4, y, RGB565_WHITE, 2, browser.files[i].is_dir ? ">" : "");
-                            }
-                            char name[64];
-                            int name_len = snprintf(name, sizeof(name), "%s%s", browser.files[i].is_dir ? "[" : "", browser.files[i].filename);
-                            if (name_len >= (int)sizeof(name)) {
-                                name[sizeof(name) - 1] = '\0';
-                            }
-                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 20, y, RGB565_WHITE, 2, name);
-                            if (browser.files[i].is_dir) {
-                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, strlen(name) * 6 + 20, y, RGB565_WHITE, 2, "]");
+                            } else if (select_res == ESP_OK) {
+                                // Directory entered - browser already refreshed
+                                browser_needs_redraw = true;
                             }
                         }
                         
-                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, FB_HEIGHT - 14, RGB565_WHITE, 2, "UP/DN: navigate  RT/ENT: select  LT: back");
-                    blit();
+                        // Redraw file browser if directory was entered
+                        if (browser_needs_redraw) {
+                            draw_file_browser(&browser);
+                            blit();
+                        }
                     }
                     
                     // Debug: Scancode event (commented out)
