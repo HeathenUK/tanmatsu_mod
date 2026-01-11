@@ -1,12 +1,20 @@
 idf_component_register(
 	SRCS
 		"main.c"
+		"audio.c"
+		"mod_player.c"
+		"sdcard.c"
+		"file_browser.c"
+		"simple_font.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
 		nvs_flash
 		badge-bsp
 		tanmatsu-wifi
+		libxmp
+		esp_driver_sdmmc
+		esp_driver_ppa
 	INCLUDE_DIRS
 		"."
 )

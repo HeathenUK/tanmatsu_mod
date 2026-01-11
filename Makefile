@@ -30,19 +30,48 @@ prepare: submodules sdk
 submodules: 
 	if [ ! -f .submodules_update_done ]; then \
 		echo "Updating submodules"; \
-		git submodule update --init --recursive; \
+		git submodule foreach --recursive 'git clean -fd' || true; \
+		git submodule update --init --recursive --force; \
 		touch .submodules_update_done; \
 	fi
 
 .PHONY: sdk
 sdk:
-	if test -d "$(IDF_PATH)"; then echo -e "ESP-IDF target folder exists!\r\nPlease remove the folder or un-set the environment variable."; exit 1; fi
-	if test -d "$(IDF_TOOLS_PATH)"; then echo -e "ESP-IDF tools target folder exists!\r\nPlease remove the folder or un-set the environment variable."; exit 1; fi
-	git clone --recursive --branch "$(IDF_BRANCH)" https://github.com/espressif/esp-idf.git "$(IDF_PATH)" --depth=1 --shallow-submodules
-	cd "$(IDF_PATH)"; git fetch origin "$(IDF_COMMIT)" --recurse-submodules || true
-	cd "$(IDF_PATH)"; git checkout "$(IDF_COMMIT)"
-	cd "$(IDF_PATH)"; git submodule update --init --recursive
-	cd "$(IDF_PATH)"; bash install.sh all
+	@if test -d "$(IDF_PATH)"; then \
+		echo "ESP-IDF directory exists, attempting to repair/complete setup..."; \
+		if [ -d "$(IDF_PATH)/.git" ]; then \
+			echo "Found existing git repository, updating..."; \
+			cd "$(IDF_PATH)"; \
+			git fetch origin "$(IDF_COMMIT)" --recurse-submodules || true; \
+			git checkout "$(IDF_COMMIT)" || (git reset --hard "$(IDF_COMMIT)" && git clean -fd); \
+			git submodule foreach --recursive 'git clean -fd; git reset --hard HEAD' 2>/dev/null || true; \
+			git submodule sync --recursive || true; \
+			git submodule update --init --recursive --force; \
+		else \
+			echo "Directory exists but is not a git repository. Removing and starting fresh..."; \
+			rm -rf "$(IDF_PATH)"; \
+			git clone --recursive --branch "$(IDF_BRANCH)" https://github.com/espressif/esp-idf.git "$(IDF_PATH)" --depth=1 --shallow-submodules; \
+			cd "$(IDF_PATH)"; git fetch origin "$(IDF_COMMIT)" --recurse-submodules || true; \
+			git checkout "$(IDF_COMMIT)" || (git reset --hard "$(IDF_COMMIT)" && git clean -fd); \
+			git submodule foreach --recursive 'git clean -fd; git reset --hard HEAD' 2>/dev/null || true; \
+			git submodule sync --recursive || true; \
+			git submodule update --init --recursive --force; \
+		fi; \
+	else \
+		echo "Cloning ESP-IDF..."; \
+		git clone --recursive --branch "$(IDF_BRANCH)" https://github.com/espressif/esp-idf.git "$(IDF_PATH)" --depth=1 --shallow-submodules; \
+		cd "$(IDF_PATH)"; git fetch origin "$(IDF_COMMIT)" --recurse-submodules || true; \
+		git checkout "$(IDF_COMMIT)" || (git reset --hard "$(IDF_COMMIT)" && git clean -fd); \
+		git submodule foreach --recursive 'git clean -fd; git reset --hard HEAD' 2>/dev/null || true; \
+		git submodule sync --recursive || true; \
+		git submodule update --init --recursive --force; \
+	fi
+	@if test -d "$(IDF_TOOLS_PATH)/python_env" && find "$(IDF_TOOLS_PATH)/python_env" -name "bin/python" -type f 2>/dev/null | head -1 | grep -q .; then \
+		echo "ESP-IDF tools already installed, skipping..."; \
+	else \
+		echo "Installing ESP-IDF tools..."; \
+		cd "$(IDF_PATH)"; bash install.sh all; \
+	fi
 
 .PHONY: removesdk
 removesdk:

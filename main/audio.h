@@ -1,0 +1,59 @@
+#pragma once
+
+#include "esp_err.h"
+
+/**
+ * @brief Initialize audio system (I2S and ES8156 codec)
+ * 
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t audio_init(void);
+
+/**
+ * @brief Play a tone at specified frequency and duration
+ * 
+ * @param frequency Frequency in Hz (e.g., 440 for A4)
+ * @param duration_ms Duration in milliseconds
+ * @param volume Volume level (0.0 to 1.0)
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t audio_play_tone(float frequency, uint32_t duration_ms, float volume);
+
+/**
+ * @brief Play a beep (short tone at 440Hz)
+ * 
+ * @param duration_ms Duration in milliseconds
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t audio_beep(uint32_t duration_ms);
+
+/**
+ * @brief Stop audio playback
+ * 
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t audio_stop(void);
+
+/**
+ * @brief Set audio volume
+ * 
+ * @param volume Volume level (0.0 to 1.0)
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t audio_set_volume(float volume);
+
+/**
+ * @brief Get current audio volume
+ * 
+ * @param volume Pointer to store volume level (0.0 to 1.0)
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t audio_get_volume(float *volume);
+
+/**
+ * @brief Get I2S handle for direct audio operations
+ * 
+ * @param handle Pointer to store I2S handle
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t audio_get_i2s_handle(void **handle);
