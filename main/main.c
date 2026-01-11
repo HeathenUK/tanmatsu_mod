@@ -794,8 +794,9 @@ void app_main(void) {
                         
                         // Header height should align with line_height to prevent partial rows showing
                         // Use 2 * line_height for header area (text is scaled 2x = 16px, so fits in 2 rows)
+                        // Header starts at MARGIN_TOP and is exactly 2 * line_height tall
                         int header_height = line_height * 2;
-                        int header_y = MARGIN_TOP + header_height;
+                        int header_y = MARGIN_TOP + header_height;  // First row starts immediately after header
                         
                         // Track volume changes to update header
                         static float last_volume = -1.0f;
@@ -816,10 +817,13 @@ void app_main(void) {
                         int stride = logical_width;  // Pixels per row in landscape framebuffer (800)
                         
                         // Helper function to draw header (defined here so it can use variables from outer scope)
-                        void draw_header(void) {
-                            // Clear header area (from MARGIN_TOP to header_y)
-                            int header_start = MARGIN_TOP * stride;
-                            memset(fb_pixels + header_start, 0, header_height * stride * sizeof(uint16_t));
+                        void draw_header(bool clear_area) {
+                            // Clear header area exactly (from MARGIN_TOP to header_y, which is MARGIN_TOP + header_height)
+                            // This ensures no sliver of content shows below the header
+                            if (clear_area) {
+                                int header_start = MARGIN_TOP * stride;
+                                memset(fb_pixels + header_start, 0, header_height * stride * sizeof(uint16_t));
+                            }
                             
                             float header_vol = 0.0f;
                             if (audio_get_volume(&header_vol) == ESP_OK) {
@@ -861,14 +865,12 @@ void app_main(void) {
                             tick_history[MAX_TRACKER_ROWS - 1].num_channels = num_channels;
                         }
                         
-                        if (!tracker_initialized || vol_changed) {
-                            if (!tracker_initialized) {
-                                // First render - full screen (fb_fill already clears all margins)
-                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                            }
+                        if (!tracker_initialized) {
+                            // First render - full screen (fb_fill already clears all margins)
+                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                             
-                            // Draw or update header (always on first render, or when volume changes)
-                            draw_header();
+                            // Draw header on first render (clear area not needed, fb_fill already did it)
+                            draw_header(false);
                             
                             // Render all visible rows
                             int rows_to_show = (tick_history_count < max_rows_on_screen) ? max_rows_on_screen : tick_history_count;
@@ -954,9 +956,9 @@ void app_main(void) {
                             blit();
                         } else {
                             // Subsequent renders - scroll content up and only draw new row
-                            // Update header if volume changed
+                            // Update header if volume changed (minimal update, no clear to avoid stuttering)
                             if (vol_changed) {
-                                draw_header();
+                                draw_header(false);  // Don't clear, just update text
                             }
                             
                             // Scroll framebuffer content up (skip header row at top, account for margins)
