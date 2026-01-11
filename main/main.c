@@ -103,9 +103,6 @@ static void draw_file_browser(file_browser_t *browser) {
         if (i == browser->selected_index) {
             // Draw blue highlight - match text height exactly (16 pixels for scale 2)
             fb_rect(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, file_y, CONTENT_WIDTH, line_height, argb32_to_rgb565(0xFF0000FF));
-            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + 4, file_y, RGB565_WHITE, font_scale, browser->files[i].is_dir ? ">" : "");
-        } else {
-            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + 4, file_y, RGB565_WHITE, font_scale, browser->files[i].is_dir ? ">" : "");
         }
         char name[64];
         // Special handling for ".." entry - ensure it displays correctly
@@ -124,7 +121,7 @@ static void draw_file_browser(file_browser_t *browser) {
                 }
             }
         }
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + 20, file_y, RGB565_WHITE, font_scale, name);
+        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + 4, file_y, RGB565_WHITE, font_scale, name);
     }
     
     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, FB_HEIGHT - MARGIN_BOTTOM - line_height, RGB565_WHITE, font_scale, "UP/DN: navigate  RT/ENT: select  LT: back");
@@ -638,8 +635,8 @@ void app_main(void) {
                                         blit();
                                     }
                                 }
-                            } else if (select_res == ESP_OK) {
-                                // Directory entered - browser already refreshed
+                            } else if (select_res == ESP_OK && is_directory) {
+                                // Directory entered - browser already refreshed by file_browser_select()
                                 browser_needs_redraw = true;
                             }
                         }
@@ -727,10 +724,10 @@ void app_main(void) {
                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
                                     blit();
                                 }
-                            } else if (select_res == ESP_OK) {
-                                // Directory entered - browser already refreshed
-                                browser_needs_redraw = true;
                             }
+                        } else if (select_res == ESP_OK && is_directory) {
+                            // Directory entered - browser already refreshed by file_browser_select()
+                            browser_needs_redraw = true;
                         }
                         
                         // Redraw file browser if directory was entered
