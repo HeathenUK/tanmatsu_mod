@@ -811,10 +811,10 @@ void app_main(void) {
                         
                         // Recalculate if channel count changed
                         if (cached_num_channels != num_channels) {
-                            // Dynamic text scaling to use ~85% of logical landscape width (800px)
-                            const int logical_width = FB_WIDTH;  // 800
-                            const int logical_height = FB_HEIGHT;  // 480
-                            int available_width = (int)(logical_width * 0.85);
+                            // Dynamic text scaling to use ~85% of content width (after margins: 780px)
+                            const int content_width = CONTENT_WIDTH;  // 780 (800 - 10 - 10)
+                            const int content_height = CONTENT_HEIGHT;  // 470 (480 - 5 - 5)
+                            int available_width = (int)(content_width * 0.85);
                             int ch_width_estimate = available_width / num_channels;
                             // Scale line height from 10px to 18px based on channel width
                             cached_line_height = 10 + (ch_width_estimate - 40) * 8 / 200;
