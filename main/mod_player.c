@@ -26,8 +26,9 @@ static TaskHandle_t mod_task_handle = NULL;
 static StackType_t *mod_task_stack = NULL;
 static StaticTask_t *mod_task_tcb = NULL;
 
-// Audio buffer for MOD playback (512 samples matches Mod_Watch implementation)
-#define MOD_BUFFER_SAMPLES 512
+// Audio buffer for MOD playback (1024 samples for better buffering against CPU contention)
+// 512 samples = ~11.6ms at 44.1kHz, 1024 samples = ~23.2ms (more headroom for UI delays)
+#define MOD_BUFFER_SAMPLES 1024
 #define MOD_BUFFER_SIZE (MOD_BUFFER_SAMPLES * 2 * sizeof(int16_t))  // Stereo 16-bit
 
 /**
@@ -106,9 +107,13 @@ static void mod_playback_task(void *arg) {
                                                    portMAX_DELAY);  // Blocking to ensure continuous audio
                 
                 buffer_count++;
+                
+                // Yield after I2S write to prevent CPU hogging and allow UI thread to run
+                // This helps prevent buffer underruns when UI does heavy work (scrolling, rendering)
+                taskYIELD();
                 uint32_t current_time = xTaskGetTickCount();
                 
-                // Log every 2 seconds (approximately 86 buffers at 44100Hz / 512 samples = ~86 buffers/sec)
+                // Log every 2 seconds (approximately 43 buffers at 44100Hz / 1024 samples = ~43 buffers/sec)
                 if (current_time - last_log_time > pdMS_TO_TICKS(2000)) {
                     ESP_LOGI(TAG, "MOD playback: %lu buffers written, last write: %zu/%zu bytes, rc=%d", 
                              buffer_count, bytes_written, sizeof(stereo_buffer), rc);
