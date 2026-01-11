@@ -791,7 +791,22 @@ void app_main(void) {
                         if (!mod_info_loaded) {
                             tracker_initialized = false;
                         }
-                        int header_y = MARGIN_TOP + FONT_HEIGHT * 2 + 2;  // Leave space for header (margin + text + gap)
+                        
+                        // Header height should align with line_height to prevent partial rows showing
+                        // Use 2 * line_height for header area (text is scaled 2x = 16px, so fits in 2 rows)
+                        int header_height = line_height * 2;
+                        int header_y = MARGIN_TOP + header_height;
+                        
+                        // Track volume changes to update header
+                        static float last_volume = -1.0f;
+                        float current_vol = 0.0f;
+                        bool vol_changed = false;
+                        if (audio_get_volume(&current_vol) == ESP_OK) {
+                            vol_changed = (current_vol != last_volume);
+                            if (vol_changed) {
+                                last_volume = current_vol;
+                            }
+                        }
                         
                         // Get direct framebuffer access for scrolling (RGB565 = 2 bytes per pixel)
                         // Logical landscape framebuffer: 800 pixels wide, 480 pixels tall
@@ -799,6 +814,29 @@ void app_main(void) {
                         const int logical_width = FB_WIDTH;  // 800
                         const int logical_height = FB_HEIGHT;  // 480
                         int stride = logical_width;  // Pixels per row in landscape framebuffer (800)
+                        
+                        // Helper function to draw header (defined here so it can use variables from outer scope)
+                        void draw_header(void) {
+                            // Clear header area (from MARGIN_TOP to header_y)
+                            int header_start = MARGIN_TOP * stride;
+                            memset(fb_pixels + header_start, 0, header_height * stride * sizeof(uint16_t));
+                            
+                            float header_vol = 0.0f;
+                            if (audio_get_volume(&header_vol) == ESP_OK) {
+                                char header_text[128];
+                                const char *filename = strrchr(current_mod_path, '/');
+                                if (!filename) filename = current_mod_path;
+                                else filename++;
+                                if (!filename[0]) filename = "Unknown";
+                                
+                                int vol_percent = (int)(header_vol * 100.0f);
+                                int header_len = snprintf(header_text, sizeof(header_text), "%s | Vol: %d%%", filename, vol_percent);
+                                if (header_len >= (int)sizeof(header_text)) {
+                                    header_text[sizeof(header_text) - 1] = '\0';
+                                }
+                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, MARGIN_TOP, RGB565_WHITE, 2, header_text);
+                            }
+                        }
                         
                         // Hex digit lookup table removed - using snprintf with %02X format instead
                         
@@ -823,26 +861,14 @@ void app_main(void) {
                             tick_history[MAX_TRACKER_ROWS - 1].num_channels = num_channels;
                         }
                         
-                        if (!tracker_initialized) {
-                            // First render - full screen (fb_fill already clears all margins)
-                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                            
-                            // Display MOD file name and volume at the top
-                            float current_vol = 0.0f;
-                            if (audio_get_volume(&current_vol) == ESP_OK) {
-                                char header_text[128];
-                                const char *filename = strrchr(current_mod_path, '/');
-                                if (!filename) filename = current_mod_path;
-                                else filename++;
-                                if (!filename[0]) filename = "Unknown";
-                                
-                                int vol_percent = (int)(current_vol * 100.0f);
-                                int header_len = snprintf(header_text, sizeof(header_text), "%s | Vol: %d%%", filename, vol_percent);
-                                if (header_len >= (int)sizeof(header_text)) {
-                                    header_text[sizeof(header_text) - 1] = '\0';
-                                }
-                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, MARGIN_TOP, RGB565_WHITE, 2, header_text);
+                        if (!tracker_initialized || vol_changed) {
+                            if (!tracker_initialized) {
+                                // First render - full screen (fb_fill already clears all margins)
+                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                             }
+                            
+                            // Draw or update header (always on first render, or when volume changes)
+                            draw_header();
                             
                             // Render all visible rows
                             int rows_to_show = (tick_history_count < max_rows_on_screen) ? max_rows_on_screen : tick_history_count;
@@ -928,6 +954,11 @@ void app_main(void) {
                             blit();
                         } else {
                             // Subsequent renders - scroll content up and only draw new row
+                            // Update header if volume changed
+                            if (vol_changed) {
+                                draw_header();
+                            }
+                            
                             // Scroll framebuffer content up (skip header row at top, account for margins)
                             int scrollable_height = FB_HEIGHT - header_y - MARGIN_BOTTOM;
                             int scroll_lines = line_height;
