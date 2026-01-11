@@ -259,7 +259,12 @@ esp_err_t mod_player_start(void) {
         ESP_LOGE(TAG, "Failed to start MOD player (error: %d)", ret);
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "MOD player started at %lu Hz, format: MONO", sample_rate);
+    
+    // Configure libxmp settings for better audio quality
+    // Use spline interpolation for better quality (reduces aliasing/artifacts vs default linear)
+    xmp_set_player(mod_ctx, XMP_PLAYER_INTERP, XMP_INTERP_SPLINE);
+    
+    ESP_LOGI(TAG, "MOD player started at %lu Hz, format: MONO, interpolation: SPLINE", sample_rate);
 
     mod_playing = true;
     ESP_LOGI(TAG, "MOD playback started");
