@@ -35,6 +35,7 @@ badgelink/
 sdkconfig
 sdkconfig.old
 sdkconfig.ci
+sdkconfig_*
 dependencies.lock
 
 # Environment files
