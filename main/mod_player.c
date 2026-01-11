@@ -109,10 +109,8 @@ static void mod_playback_task(void *arg) {
                 
                 buffer_count++;
                 
-                // Yield after I2S write to prevent CPU hogging and allow UI thread to run
-                // This helps prevent buffer underruns when UI does heavy work (scrolling, rendering)
-                taskYIELD();
-                
+                // No yield needed - blocking I2S write already handles timing
+                // Large buffer (4096 samples ~93ms) provides sufficient headroom
                 // Logging commented out - removed ret check and all logging statements
             } else {
                 // Playback ended or error
