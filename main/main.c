@@ -330,38 +330,8 @@ void app_main(void) {
     if (sdcard_is_mounted()) {
         browser_active = true;
         file_browser_init(&browser, "/sdcard");
-        // Draw initial file browser view
-        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_WHITE, 2, "MOD file browser");
-        char path_text[128];
-        int path_len = snprintf(path_text, sizeof(path_text), "Path: %s", browser.current_path);
-        if (path_len >= (int)sizeof(path_text)) {
-            path_text[sizeof(path_text) - 1] = '\0';
-        }
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_WHITE, 2, path_text);
-        
-        // Draw file list
-        int start_idx = 0;
-        int end_idx = browser.count < 10 ? browser.count : 10;
-        for (int i = start_idx; i < end_idx; i++) {
-            int y = 36 + (i - start_idx) * 14;
-            if (i == browser.selected_index) {
-                fb_rect(fb, FB_WIDTH, FB_HEIGHT, 0, y - 2, FB_WIDTH, 14, argb32_to_rgb565(0xFF0000FF));
-                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 4, y, RGB565_WHITE, 2, browser.files[i].is_dir ? ">" : "");
-            } else {
-                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 4, y, RGB565_WHITE, 2, browser.files[i].is_dir ? ">" : "");
-            }
-            char name[64];
-            int name_len = snprintf(name, sizeof(name), "%s%s", browser.files[i].is_dir ? "[" : "", browser.files[i].filename);
-            if (name_len >= (int)sizeof(name)) {
-                name[sizeof(name) - 1] = '\0';
-            }
-            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 20, y, RGB565_WHITE, 2, name);
-            if (browser.files[i].is_dir) {
-                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, strlen(name) * 6 + 20, y, RGB565_WHITE, 2, "]");
-            }
-        }
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, FB_HEIGHT - 14, RGB565_WHITE, 2, "UP/DN: navigate  RT/ENT: select  LT: back");
+        // Draw initial file browser view using helper function (with margins)
+        draw_file_browser(&browser);
         blit();
     } else {
         // No SD card - show error
