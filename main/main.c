@@ -24,8 +24,12 @@
 #include "esp_heap_caps.h"
 #include "portmacro.h"
 #include "driver/ppa.h"  // For PPA rotation
+#include "hal/color_types.h"  // For color_pixel_argb8888_data_t
+#include "esp_attr.h"  // For IRAM_ATTR
+#include "esp_async_memcpy.h"  // For GDMA memory operations
 #include "wifi_connection.h"
 #include "wifi_remote.h"
+#include "profiling.h"
 
 // Constants
 static char const TAG[] = "main";
@@ -59,7 +63,148 @@ static uint16_t *fb = NULL;  // Logical landscape framebuffer (800x480) in PSRAM
 static uint16_t *fb_rotated = NULL;  // Rotated framebuffer (480x800) for display output
 static esp_lcd_panel_handle_t panel_handle = NULL;  // Panel handle for direct drawing
 static ppa_client_handle_t ppa_srm_handle = NULL;  // PPA SRM client for rotation
+static ppa_client_handle_t ppa_fill_handle = NULL;  // PPA Fill client for hardware-accelerated fills
+static async_memcpy_handle_t async_memcpy_handle = NULL;  // GDMA async memcpy handle
 static QueueHandle_t input_event_queue = NULL;
+
+// RGB565 to ARGB8888 conversion helper for PPA Fill
+// RGB565: 0bRRRRRGGGGGGBBBBB
+// ARGB8888: 0xAARRGGBB (A=0xFF for opaque)
+static inline color_pixel_argb8888_data_t rgb565_to_argb8888(uint16_t rgb565) {
+    color_pixel_argb8888_data_t argb;
+    // Extract RGB components from RGB565
+    uint8_t r = ((rgb565 >> 11) & 0x1F) << 3;  // 5 bits -> 8 bits (scale by 8)
+    uint8_t g = ((rgb565 >> 5) & 0x3F) << 2;   // 6 bits -> 8 bits (scale by 4)
+    uint8_t b = (rgb565 & 0x1F) << 3;          // 5 bits -> 8 bits (scale by 8)
+    // Set ARGB8888 (A=0xFF for opaque)
+    argb.a = 0xFF;
+    argb.r = r;
+    argb.g = g;
+    argb.b = b;
+    return argb;
+}
+
+// Hardware-accelerated framebuffer fill using PPA Fill
+// Falls back to CPU fill if PPA is unavailable or operation fails
+static void IRAM_ATTR ppa_fill_framebuffer(uint16_t *fb, int width, int height, uint16_t color) {
+    if (!fb || width <= 0 || height <= 0) {
+        return;
+    }
+    
+    // Try PPA Fill first (hardware-accelerated)
+    if (ppa_fill_handle && fb) {
+        // Convert RGB565 to ARGB8888 for PPA
+        color_pixel_argb8888_data_t fill_color = rgb565_to_argb8888(color);
+        
+        // Configure PPA Fill operation
+        ppa_fill_oper_config_t fill_config = {
+            .out = {
+                .buffer = fb,
+                .buffer_size = width * height * sizeof(uint16_t),
+                .pic_w = width,
+                .pic_h = height,
+                .block_offset_x = 0,
+                .block_offset_y = 0,
+                .fill_cm = PPA_FILL_COLOR_MODE_RGB565,  // Output format is RGB565
+            },
+            .fill_block_w = width,
+            .fill_block_h = height,
+            .fill_argb_color = fill_color,
+            .mode = PPA_TRANS_MODE_BLOCKING,
+            .user_data = NULL,
+        };
+        
+        esp_err_t ret = ppa_do_fill(ppa_fill_handle, &fill_config);
+        if (ret == ESP_OK) {
+            return;  // Success - hardware fill completed
+        }
+        // Log fallback to CPU fill
+        ESP_LOGW(TAG, "PPA Fill failed (%s), falling back to CPU fill", esp_err_to_name(ret));
+    } else {
+        // PPA Fill handle not available
+        ESP_LOGD(TAG, "PPA Fill handle not available, using CPU fill");
+    }
+    
+    // CPU fallback (original fb_fill implementation)
+    int total_pixels = width * height;
+    for (int i = 0; i < total_pixels; i++) {
+        fb[i] = color;
+    }
+}
+
+// Hardware-accelerated rectangle fill using PPA Fill
+// Falls back to CPU fill if PPA is unavailable or operation fails
+static void IRAM_ATTR ppa_fill_rect(uint16_t *fb, int width, int height, int x, int y, int w, int h, uint16_t color) {
+    if (!fb || width <= 0 || height <= 0 || w <= 0 || h <= 0) {
+        return;
+    }
+    
+    // Clamp rectangle to framebuffer bounds
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > width) {
+        w = width - x;
+    }
+    if (y + h > height) {
+        h = height - y;
+    }
+    if (w <= 0 || h <= 0) {
+        return;  // Rectangle is completely outside framebuffer
+    }
+    
+    // Try PPA Fill first (hardware-accelerated)
+    if (ppa_fill_handle) {
+        // Convert RGB565 to ARGB8888 for PPA
+        color_pixel_argb8888_data_t fill_color = rgb565_to_argb8888(color);
+        
+        // Configure PPA Fill operation for the rectangle region
+        ppa_fill_oper_config_t fill_config = {
+            .out = {
+                .buffer = fb,
+                .buffer_size = width * height * sizeof(uint16_t),
+                .pic_w = width,
+                .pic_h = height,
+                .block_offset_x = x,  // Rectangle X position
+                .block_offset_y = y,  // Rectangle Y position
+                .fill_cm = PPA_FILL_COLOR_MODE_RGB565,  // Output format is RGB565
+            },
+            .fill_block_w = w,  // Rectangle width
+            .fill_block_h = h,  // Rectangle height
+            .fill_argb_color = fill_color,
+            .mode = PPA_TRANS_MODE_BLOCKING,
+            .user_data = NULL,
+        };
+        
+        esp_err_t ret = ppa_do_fill(ppa_fill_handle, &fill_config);
+        if (ret == ESP_OK) {
+            return;  // Success - hardware fill completed
+        }
+        // Log fallback to CPU fill
+        ESP_LOGW(TAG, "PPA Fill rect failed (%s), falling back to CPU fill", esp_err_to_name(ret));
+    } else {
+        // PPA Fill handle not available
+        ESP_LOGD(TAG, "PPA Fill handle not available, using CPU fill for rect");
+    }
+    
+    // CPU fallback (original fb_rect implementation)
+    for (int dy = 0; dy < h; dy++) {
+        int fy = y + dy;
+        if (fy >= 0 && fy < height) {
+            for (int dx = 0; dx < w; dx++) {
+                int fx = x + dx;
+                if (fx >= 0 && fx < width) {
+                    fb[fy * width + fx] = color;
+                }
+            }
+        }
+    }
+}
 
 // RGB565 color constants
 #define RGB565_BLACK   0x0000
@@ -75,11 +220,57 @@ static QueueHandle_t input_event_queue = NULL;
 // KAMI support removed - Tanmatsu only
 
 // Helper function to draw file browser view
+// Helper function to format channel string consistently
+// use_compact: true for compact format (C4 01 A02), false for full format (C-4 01 A02)
+// Always uses leading zeros for consistency
+static void IRAM_ATTR format_channel_string(char *ch_str, size_t ch_str_size, 
+                                   unsigned char note, unsigned char ins, 
+                                   unsigned char fxt, unsigned char fxp, 
+                                   bool use_compact, const char *note_names[12]) {
+    char note_str[4];
+    if (note > 0 && note <= 96) {
+        int note_idx = (note - 1) % 12;
+        int octave = (note - 1) / 12;
+        if (note_idx < 0) note_idx = 0;
+        if (note_idx > 11) note_idx = 11;
+        if (octave < 0) octave = 0;
+        if (octave > 9) octave = 9;
+        const char *note_name = note_names[note_idx];
+        if (use_compact) {
+            // Compact: "C4" or "C#4"
+            if (note_name[1] == '#') {
+                snprintf(note_str, sizeof(note_str), "%c#%d", note_name[0], octave);
+            } else {
+                snprintf(note_str, sizeof(note_str), "%c%d", note_name[0], octave);
+            }
+        } else {
+            // Full: "C-4" or "C#4"
+            snprintf(note_str, sizeof(note_str), "%s%d", note_name, octave);
+        }
+    } else {
+        strcpy(note_str, use_compact ? "--" : "---");
+    }
+    
+    char effect_char;
+    if (fxt == 0) {
+        effect_char = '-';
+    } else if (fxt < 10) {
+        effect_char = '0' + fxt;
+    } else if (fxt < 16) {
+        effect_char = 'A' + (fxt - 10);
+    } else {
+        effect_char = '?';
+    }
+    
+    // Always use leading zeros for consistency: "01" not "1", "02" not "2"
+    snprintf(ch_str, ch_str_size, "%s %02X %c%02X", note_str, ins, effect_char, fxp);
+}
+
 static void draw_file_browser(file_browser_t *browser) {
     const int font_scale = 2;
     const int line_height = FONT_HEIGHT * font_scale;  // 16 pixels for scale 2
     
-    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     
     int y = MARGIN_TOP;
     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, RGB565_WHITE, font_scale, "MOD file browser");
@@ -103,7 +294,7 @@ static void draw_file_browser(file_browser_t *browser) {
         int file_y = file_list_start_y + (i - start_idx) * line_height;
         if (i == browser->selected_index) {
             // Draw blue highlight - match text height exactly (16 pixels for scale 2)
-            fb_rect(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, file_y, CONTENT_WIDTH, line_height, argb32_to_rgb565(0xFF0000FF));
+            ppa_fill_rect(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, file_y, CONTENT_WIDTH, line_height, argb32_to_rgb565(0xFF0000FF));
         }
         char name[64];
         // Special handling for ".." entry - ensure it displays correctly
@@ -128,19 +319,30 @@ static void draw_file_browser(file_browser_t *browser) {
     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, FB_HEIGHT - MARGIN_BOTTOM - line_height, RGB565_WHITE, font_scale, "UP/DN: navigate  RT/ENT: select  LT: back");
 }
 
+// IRAM-safe callback for GDMA completion (no FreeRTOS APIs)
+static volatile bool gdma_copy_done = false;
+
+static bool gdma_memcpy_callback(async_memcpy_handle_t mcp_hdl, async_memcpy_event_t *event, void *cb_args) {
+    (void)mcp_hdl;
+    (void)event;
+    (void)cb_args;
+    gdma_copy_done = true;
+    return false;  // No high priority task woken
+}
+
 // Hardware-accelerated scrolling using PPA SRM with 0° rotation
-// Uses fb_rotated as temporary buffer (we don't need it during scrolling)
-static void scroll_framebuffer_ppa(uint16_t *fb_pixels, int src_y, int dst_y, int copy_height, int stride) {
-    if (!fb_pixels || !fb_rotated || !ppa_srm_handle || copy_height <= 0) {
+// Optimized: Direct copy from source to destination (no temp buffer needed)
+// Since src_y > dst_y (scrolling up), regions don't overlap, so we can copy directly
+static void IRAM_ATTR scroll_framebuffer_ppa(uint16_t *fb_pixels, int src_y, int dst_y, int copy_height, int stride) {
+    if (!fb_pixels || !ppa_srm_handle || copy_height <= 0) {
         return;
     }
     
     int copy_width = stride;  // Full width
-    size_t copy_bytes = copy_height * stride * sizeof(uint16_t);
     
-    // Step 1: Copy source region to temporary buffer (fb_rotated) using PPA SRM with 0° rotation
-    // Use full framebuffer as input picture, block_offset_y specifies source region
-    ppa_srm_oper_config_t srm_config_copy1 = {
+    // Direct copy from source region to destination using PPA SRM with 0° rotation
+    // Since we're scrolling up (src_y > dst_y), the regions don't overlap, so we can copy directly
+    ppa_srm_oper_config_t srm_config = {
         .in.buffer = fb_pixels,  // Full framebuffer as input picture
         .in.pic_w = stride,
         .in.pic_h = FB_HEIGHT,
@@ -149,12 +351,12 @@ static void scroll_framebuffer_ppa(uint16_t *fb_pixels, int src_y, int dst_y, in
         .in.block_offset_x = 0,
         .in.block_offset_y = src_y,  // Start reading from src_y
         .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        .out.buffer = fb_rotated,  // Use rotated buffer as temporary
-        .out.buffer_size = copy_bytes,
-        .out.pic_w = copy_width,
-        .out.pic_h = copy_height,
+        .out.buffer = fb_pixels,  // Same framebuffer, different region
+        .out.buffer_size = FB_HEIGHT * stride * sizeof(uint16_t),  // Full buffer size
+        .out.pic_w = stride,
+        .out.pic_h = FB_HEIGHT,
         .out.block_offset_x = 0,
-        .out.block_offset_y = 0,
+        .out.block_offset_y = dst_y,  // Write to dst_y
         .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,  // No rotation, just copy
         .scale_x = 1,
@@ -164,55 +366,125 @@ static void scroll_framebuffer_ppa(uint16_t *fb_pixels, int src_y, int dst_y, in
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
     
-    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config_copy1);
+    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
     if (ret != ESP_OK) {
         // Fallback to memmove if PPA fails
+        ESP_LOGW(TAG, "PPA scrolling failed (%s), falling back to memmove", esp_err_to_name(ret));
         uint16_t *src_ptr = fb_pixels + src_y * stride;
         uint16_t *dst_ptr = fb_pixels + dst_y * stride;
+        size_t copy_bytes = copy_height * stride * sizeof(uint16_t);
         memmove(dst_ptr, src_ptr, copy_bytes);
-        return;
     }
-    
-    // Step 2: Copy from temporary buffer to destination (non-overlapping, memcpy is fine)
-    uint16_t *dst_ptr = fb_pixels + dst_y * stride;
-    memcpy(dst_ptr, fb_rotated, copy_bytes);
 }
 
-void blit(void) {
+// Partial rotation support: if row_y >= 0, only rotate that row region (much faster)
+// For 270° CCW rotation: a horizontal row at y in logical framebuffer becomes a vertical column
+// at x = (FB_HEIGHT - 1 - y) in rotated framebuffer
+// row_height: height of the row region to rotate (typically line_height pixels)
+void IRAM_ATTR blit(int row_y, int row_height) {
     // Use PPA to rotate logical landscape framebuffer (800x480) to ST7701S native portrait (480x800)
     if (fb && fb_rotated && ppa_srm_handle && panel_handle) {
-        // Configure PPA SRM operation: rotate 270° CCW (landscape -> portrait)
-        ppa_srm_oper_config_t srm_config = {
-            .in.buffer = fb,
-            .in.pic_w = FB_WIDTH,      // 800
-            .in.pic_h = FB_HEIGHT,     // 480
-            .in.block_w = FB_WIDTH,
-            .in.block_h = FB_HEIGHT,
-            .in.block_offset_x = 0,
-            .in.block_offset_y = 0,
-            .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-            .out.buffer = fb_rotated,
-            .out.buffer_size = 480 * 800 * sizeof(uint16_t),  // Rotated size
-            .out.pic_w = 480,  // After 270° rotation: height becomes width
-            .out.pic_h = 800,  // After 270° rotation: width becomes height
-            .out.block_offset_x = 0,
-            .out.block_offset_y = 0,
-            .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-            .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,  // 270° CCW rotation
-            .scale_x = 1,
-            .scale_y = 1,
-            .rgb_swap = 0,
-            .byte_swap = 0,
-            .mode = PPA_TRANS_MODE_BLOCKING,
-        };
+        bool partial_rotation = (row_y >= 0 && row_y < FB_HEIGHT && row_height > 0);
         
-        // Perform rotation
-        esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
-        if (ret == ESP_OK) {
-            // Send rotated buffer directly to panel
-            esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 480, 800, fb_rotated);
-        } else {
-            ESP_LOGE(TAG, "PPA rotation failed: %s", esp_err_to_name(ret));
+        if (partial_rotation) {
+            // Partial rotation: only rotate the changed row region (much faster)
+            // After 270° CCW rotation: 
+            // - Row at y becomes column at x = (FB_HEIGHT - 1 - y)
+            // - Row at y+row_height-1 becomes column at x = (FB_HEIGHT - 1 - (y + row_height - 1))
+            // Since we're rotating row_height pixels, we get row_height columns in the rotated buffer
+            // The columns are in reverse order: top row becomes rightmost column
+            int rotated_col_right = FB_HEIGHT - 1 - row_y;  // Rightmost column (top of source region)
+            int rotated_col_left = FB_HEIGHT - 1 - (row_y + row_height - 1);  // Leftmost column (bottom of source region)
+            
+            // Rotate only this row region
+            ppa_srm_oper_config_t srm_config = {
+                .in.buffer = fb,
+                .in.pic_w = FB_WIDTH,      // 800
+                .in.pic_h = FB_HEIGHT,     // 480
+                .in.block_w = FB_WIDTH,    // Full width of the row
+                .in.block_h = row_height,  // Height of the row region
+                .in.block_offset_x = 0,
+                .in.block_offset_y = row_y,  // Source row in logical framebuffer
+                .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                .out.buffer = fb_rotated,
+                .out.buffer_size = 480 * 800 * sizeof(uint16_t),  // Rotated size
+                .out.pic_w = 480,  // After 270° rotation: height becomes width
+                .out.pic_h = 800,  // After 270° rotation: width becomes height
+                .out.block_offset_x = rotated_col_left,  // Leftmost column position in rotated framebuffer
+                .out.block_offset_y = 0,  // Start from top
+                .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,  // 270° CCW rotation
+                .scale_x = 1,
+                .scale_y = 1,
+                .rgb_swap = 0,
+                .byte_swap = 0,
+                .mode = PPA_TRANS_MODE_BLOCKING,
+            };
+            
+            // Perform partial rotation
+            esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
+            if (ret == ESP_OK) {
+                // Extract rotated columns to temporary buffer (columns are interleaved in rotated buffer)
+                // For esp_lcd_panel_draw_bitmap, we need contiguous row-major data
+                // The panel expects data in left-to-right order, so we extract columns from left to right
+                static uint16_t col_buffer[800 * 20];  // Static buffer for up to 20 rows (should be enough)
+                if (row_height <= 20) {
+                    // Extract each column from left to right and pack them row-major for the panel update
+                    for (int col = 0; col < row_height; col++) {
+                        int rotated_col_x = rotated_col_left + col;  // Extract from left to right
+                        for (int i = 0; i < 800; i++) {
+                            col_buffer[col * 800 + i] = fb_rotated[i * 480 + rotated_col_x];
+                        }
+                    }
+                    // Send the rotated column region to panel (partial update)
+                    // x_start = rotated_col_left, x_end = rotated_col_right + 1 (exclusive)
+                    // Width is row_height columns, height is 800 pixels
+                    esp_lcd_panel_draw_bitmap(panel_handle, rotated_col_left, 0, rotated_col_right + 1, 800, col_buffer);
+                } else {
+                    // Fallback to full rotation if row_height is too large
+                    ESP_LOGW(TAG, "Row height %d too large for partial rotation, using full rotation", row_height);
+                    partial_rotation = false;
+                }
+            } else {
+                ESP_LOGE(TAG, "PPA partial rotation failed: %s", esp_err_to_name(ret));
+                partial_rotation = false;
+            }
+        }
+        
+        if (!partial_rotation) {
+            // Full screen rotation (first render or fallback)
+            ppa_srm_oper_config_t srm_config = {
+                .in.buffer = fb,
+                .in.pic_w = FB_WIDTH,      // 800
+                .in.pic_h = FB_HEIGHT,     // 480
+                .in.block_w = FB_WIDTH,
+                .in.block_h = FB_HEIGHT,
+                .in.block_offset_x = 0,
+                .in.block_offset_y = 0,
+                .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                .out.buffer = fb_rotated,
+                .out.buffer_size = 480 * 800 * sizeof(uint16_t),  // Rotated size
+                .out.pic_w = 480,  // After 270° rotation: height becomes width
+                .out.pic_h = 800,  // After 270° rotation: width becomes height
+                .out.block_offset_x = 0,
+                .out.block_offset_y = 0,
+                .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,  // 270° CCW rotation
+                .scale_x = 1,
+                .scale_y = 1,
+                .rgb_swap = 0,
+                .byte_swap = 0,
+                .mode = PPA_TRANS_MODE_BLOCKING,
+            };
+            
+            // Perform rotation
+            esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
+            if (ret == ESP_OK) {
+                // Send rotated buffer directly to panel
+                esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 480, 800, fb_rotated);
+            } else {
+                ESP_LOGE(TAG, "PPA rotation failed: %s", esp_err_to_name(ret));
+            }
         }
     }
 }
@@ -238,7 +510,7 @@ void app_main(void) {
             },
     };
     ESP_ERROR_CHECK(bsp_device_initialize(&bsp_configuration));
-    
+
     // Get panel handle for direct PPA operations
     ESP_ERROR_CHECK(bsp_display_get_panel(&panel_handle));
     
@@ -249,6 +521,26 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
     ESP_LOGI(TAG, "PPA SRM client registered for rotation");
+    
+    // Initialize PPA Fill client for hardware-accelerated fills
+    ppa_client_config_t ppa_fill_config = {
+        .oper_type = PPA_OPERATION_FILL,
+        .max_pending_trans_num = 1,
+    };
+    ESP_ERROR_CHECK(ppa_register_client(&ppa_fill_config, &ppa_fill_handle));
+    ESP_LOGI(TAG, "PPA Fill client registered for hardware-accelerated fills");
+    
+    // Initialize AXI-GDMA async memcpy driver for hardware-accelerated memory operations
+    // AXI-GDMA supports PSRAM (unlike AHB-GDMA which only supports SRAM)
+    async_memcpy_config_t async_memcpy_config = ASYNC_MEMCPY_DEFAULT_CONFIG();
+    async_memcpy_config.backlog = 1;  // Only need one pending operation for scrolling
+    esp_err_t ret_memcpy = esp_async_memcpy_install_gdma_axi(&async_memcpy_config, &async_memcpy_handle);
+    if (ret_memcpy == ESP_OK) {
+        ESP_LOGI(TAG, "AXI-GDMA async memcpy driver installed successfully (PSRAM supported)");
+    } else {
+        ESP_LOGW(TAG, "AXI-GDMA async memcpy driver installation failed (%s), will use CPU fallback", esp_err_to_name(ret_memcpy));
+        async_memcpy_handle = NULL;  // Ensure handle is NULL on failure
+    }
 
     // Skip LED initialization for faster startup (can re-enable later if needed)
     // bsp_led_set_pixel(0, 0xFF0000);  // Red
@@ -284,12 +576,15 @@ void app_main(void) {
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
     // Initialize audio system
-    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_BLACK, 2, "Initializing audio...");
-    blit();
+    blit(-1, 0);
     res = audio_init();
     if (res == ESP_OK) {
         ESP_LOGI(TAG, "Audio initialized successfully");
+        
+        // Diagnose ES8156 codec configuration
+        audio_diagnose_es8156();
         
         // Initialize MOD player first (task will start but won't play until MOD is loaded)
         res = mod_player_init(44100);
@@ -306,9 +601,9 @@ void app_main(void) {
         }
     } else {
         ESP_LOGW(TAG, "Audio initialization failed: %s", esp_err_to_name(res));
-        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Audio init failed");
-        blit();
+        blit(-1, 0);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
@@ -316,47 +611,47 @@ void app_main(void) {
     //
     // if (wifi_remote_initialize() == ESP_OK) {
     //
-    //     fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    //     ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     //     pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Starting WiFi stack...");
-    //     blit();
+    //     blit(-1, 0);
     //     wifi_connection_init_stack();  // Start the Espressif WiFi stack
     //
-    //     fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    //     ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     //     pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Connecting to WiFi network...");
-    //     blit();
+    //     blit(-1, 0);
     //
     //     if (wifi_connect_try_all() == ESP_OK) {
-    //         fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    //         ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     //         pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Succesfully connected to WiFi network");
-    //         blit();
+    //         blit(-1, 0);
     //     } else {
     //         pax_background(&fb, RED);
     //         pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Failed to connect to WiFi network");
-    //         blit();
+    //         blit(-1, 0);
     //     }
     // } else {
     //     bsp_power_set_radio_state(BSP_POWER_RADIO_STATE_OFF);
     //     ESP_LOGE(TAG, "WiFi radio not responding, WiFi not available");
     //     pax_background(&fb, RED);
     //     pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "WiFi unavailable");
-    //     blit();
+    //     blit(-1, 0);
     // }
     //
     // vTaskDelay(pdMS_TO_TICKS(500));
 
     // Initialize SD card
-    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_BLACK, 2, "Initializing SD card...");
-    blit();
+    blit(-1, 0);
     res = sdcard_init();
     if (res == ESP_OK) {
         ESP_LOGI(TAG, "SD card initialized successfully");
     } else {
         ESP_LOGW(TAG, "SD card initialization failed: %s", esp_err_to_name(res));
-        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "SD card init failed");
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_BLACK, 2, "Continuing without SD");
-        blit();
+        blit(-1, 0);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
@@ -380,14 +675,14 @@ void app_main(void) {
         file_browser_init(&browser, "/sdcard");
         // Draw initial file browser view using helper function (with margins)
         draw_file_browser(&browser);
-        blit();
+        blit(-1, 0);
     } else {
         // No SD card - show error
-        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "SD card not mounted");
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_BLACK, 2, "Insert SD card and");
         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 36, RGB565_BLACK, 2, "restart device");
-    blit();
+    blit(-1, 0);
     }
 
     // Tracker UI state - scrolling view with one line per pattern row
@@ -404,6 +699,11 @@ void app_main(void) {
     static int last_row = -1;
     static struct xmp_module_info mod_info = {0};
     static bool mod_info_loaded = false;
+    
+    // Smooth scrolling state
+    static int smooth_scroll_offset = 0;  // Current scroll offset in pixels (0 to line_height)
+    static bool pending_new_row = false;  // True when a new row is waiting to be added
+    static struct tracker_tick pending_tick = {0};  // New row data waiting to be added
     
     // Channel colors (RGB565)
     static const uint16_t channel_colors_rgb565[XMP_MAX_CHANNELS] = {
@@ -424,6 +724,7 @@ void app_main(void) {
     };
 
     while (1) {
+        PROFILING_START(frame);
         // Check input queue FIRST with ZERO timeout for instant response (non-blocking)
         bsp_input_event_t event;
         // Process ALL pending input events before doing anything else
@@ -449,8 +750,8 @@ void app_main(void) {
                             case BSP_INPUT_NAVIGATION_KEY_LEFT:
                                 if (file_browser_back(&browser) == ESP_OK) {
                                     browser_needs_redraw = true;
-                                }
-                                break;
+                    }
+                    break;
                             case BSP_INPUT_NAVIGATION_KEY_RIGHT: {
                                 // Enter directory or select file
                                 bool is_directory = false;
@@ -494,37 +795,37 @@ void app_main(void) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
                                                         // Clear screen immediately to prevent white flash
-                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         // Tracker UI will be drawn in main loop
                                                     } else {
-                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
-                                                            blit();
+                                                            blit(-1, 0);
                                                         }
                                                     } else {
                                                         free(mod_file_data);
                                                         mod_file_data = NULL;
-                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
-                                                        blit();
+                                                        blit(-1, 0);
                                                     }
                                                 } else {
                                                     free(mod_file_data);
                                                     mod_file_data = NULL;
-                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
-                                                    blit();
+                                                    blit(-1, 0);
                                                 }
                                             } else {
                                                 fclose(f);
-                                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                 font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
-                                                blit();
+                                                blit(-1, 0);
                                             }
                                         } else {
-                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
-                        blit();
+                        blit(-1, 0);
                     }
                                     }
                                 } else if (select_res == ESP_OK) {
@@ -540,7 +841,7 @@ void app_main(void) {
                         // Redraw file browser if selection changed
                         if (browser_needs_redraw) {
                             draw_file_browser(&browser);
-                            blit();
+                            blit(-1, 0);
                         }
                         } else if (mod_player_is_playing()) {
                             // Volume control during playback
@@ -590,7 +891,7 @@ void app_main(void) {
                             file_browser_refresh(&browser);
                             // Redraw file browser
                             draw_file_browser(&browser);
-                            blit();
+                            blit(-1, 0);
                         }
                     }
                     
@@ -675,38 +976,38 @@ void app_main(void) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
                                                         // Clear screen immediately to prevent white flash
-                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         // Tracker UI will be drawn in main loop
                                                         browser_needs_redraw = false;  // Don't redraw browser, we're playing now
                                                     } else {
-                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
-                                                        blit();
+                                                        blit(-1, 0);
                                                     }
                                                 } else {
                                                     free(mod_file_data);
                                                     mod_file_data = NULL;
-                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
-                                                    blit();
+                                                    blit(-1, 0);
                                                 }
                                             } else {
                                                 free(mod_file_data);
                                                 mod_file_data = NULL;
-                                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                 font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
-                                                blit();
+                                                blit(-1, 0);
                                             }
                                         } else {
                                             fclose(f);
-                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
-                                            blit();
+                                            blit(-1, 0);
                                         }
                                     } else {
-                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
-                                        blit();
+                                        blit(-1, 0);
                                     }
                                 }
                             } else if (select_res == ESP_OK && is_directory) {
@@ -718,7 +1019,7 @@ void app_main(void) {
                         // Redraw file browser if navigation changed
                         if (browser_needs_redraw) {
                             draw_file_browser(&browser);
-                            blit();
+                            blit(-1, 0);
                         }
                     }
                     
@@ -766,37 +1067,37 @@ void app_main(void) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
                                                         // Clear screen immediately to prevent white flash
-                                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         // Tracker UI will be drawn in main loop
                                                     } else {
-                                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
-                                                    blit();
+                                                    blit(-1, 0);
                                                 }
                                             } else {
                                                 free(mod_file_data);
                                                 mod_file_data = NULL;
-                                                fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                 font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
-                                                blit();
+                                                blit(-1, 0);
                                             }
                                         } else {
                                             free(mod_file_data);
                                             mod_file_data = NULL;
-                                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                             font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
-                                            blit();
+                                            blit(-1, 0);
                                         }
                                     } else {
                                         fclose(f);
-                                        fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                         font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
-                                        blit();
+                                        blit(-1, 0);
                                     }
                                 } else {
-                                    fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                     font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
-                                    blit();
+                                    blit(-1, 0);
                                 }
                             }
                         } else if (select_res == ESP_OK && is_directory) {
@@ -807,7 +1108,7 @@ void app_main(void) {
                         // Redraw file browser if directory was entered
                         if (browser_needs_redraw) {
                             draw_file_browser(&browser);
-                            blit();
+                            blit(-1, 0);
                         }
                     }
                     
@@ -819,12 +1120,15 @@ void app_main(void) {
             }
         }  // End of while loop processing all pending input events
         
-        // Render tracker UI if playing (frame rate limited - only update on row changes)
+        // Render tracker UI if playing
+        // For smooth scrolling, we need to render every frame, not just on row changes
         if (mod_player_is_playing() && !browser_active) {
+            PROFILING_START(render);
             struct xmp_frame_info frame_info;
             if (mod_player_get_frame_info(&frame_info) == ESP_OK) {
-                // Only render when row changes (frame rate limiting)
-                if (frame_info.row != last_row) {
+                // Always render to support smooth scrolling (updates every frame during scroll)
+                // Row change detection is handled inside the render logic
+                {
                     // Load module info if not loaded
                     static bool tracker_initialized = false;  // Declare here so it persists across renders
                     if (!mod_info_loaded) {
@@ -852,9 +1156,21 @@ void app_main(void) {
                             int available_width = (int)(content_width * 0.85);
                             int ch_width_estimate = available_width / num_channels;
                             // Scale line height from 10px to 18px based on channel width
-                            cached_line_height = 10 + (ch_width_estimate - 40) * 8 / 200;
-                            if (cached_line_height < 10) cached_line_height = 10;
-                            if (cached_line_height > 18) cached_line_height = 18;
+                            int estimated_line_height = 10 + (ch_width_estimate - 40) * 8 / 200;
+                            if (estimated_line_height < 10) estimated_line_height = 10;
+                            if (estimated_line_height > 18) estimated_line_height = 18;
+                            
+                            // Calculate font_scale based on estimated line_height
+                            int font_scale = (estimated_line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
+                            if (font_scale < 1) font_scale = 1;
+                            if (font_scale > 3) font_scale = 3;
+                            
+                            // Actual rendered text height
+                            int actual_text_height = font_scale * FONT_HEIGHT;
+                            
+                            // Ensure line_height is at least as tall as the rendered text to prevent overlap
+                            cached_line_height = (estimated_line_height > actual_text_height) ? estimated_line_height : actual_text_height;
+                            
                             cached_max_rows = (int)(content_height / cached_line_height);
                             cached_ch_width = ch_width_estimate;
                             cached_num_channels = num_channels;
@@ -865,9 +1181,9 @@ void app_main(void) {
                         int ch_width = cached_ch_width;
                         
                         // Header height should align with line_height to prevent partial rows showing
-                        // Use 2 * line_height + 3 for header area (text is scaled 2x = 16px, so fits in 2 rows, plus 3px extra to prevent sliver)
-                        // Header starts at MARGIN_TOP and is 2 * line_height + 3 pixels tall
-                        int header_height = line_height * 2 + 3;
+                        // Use 1 * line_height + 3 for header area (text is scaled 2x = 16px, so fits in 1 row, plus 3px extra to prevent sliver)
+                        // Header starts at MARGIN_TOP and is 1 * line_height + 3 pixels tall
+                        int header_height = line_height * 1 + 3;
                         int header_y = MARGIN_TOP + header_height;  // First row starts immediately after header
                         
                         // Track volume changes to update header
@@ -892,9 +1208,9 @@ void app_main(void) {
                         void draw_header(void) {
                             // Always clear header area exactly (from MARGIN_TOP to header_y, which is MARGIN_TOP + header_height)
                             // This ensures no sliver of content shows below the header and prevents smudging when updating
-                            // Header area is 2 * line_height + 3 pixels tall (extra 3px to prevent sliver)
-                            int header_start = MARGIN_TOP * stride;
-                            memset(fb_pixels + header_start, 0, header_height * stride * sizeof(uint16_t));
+                            // Header area is 1 * line_height + 3 pixels tall (extra 3px to prevent sliver)
+                            // Use PPA Fill for hardware-accelerated clearing
+                            ppa_fill_rect(fb, FB_WIDTH, FB_HEIGHT, 0, MARGIN_TOP, FB_WIDTH, header_height, RGB565_BLACK);
                             
                             float header_vol = 0.0f;
                             if (audio_get_volume(&header_vol) == ESP_OK) {
@@ -918,214 +1234,356 @@ void app_main(void) {
                         // Note name lookup
                         static const char *note_names[12] = {"C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-"};
                         
-                        // Store current frame data
-                        if (tick_history_count < MAX_TRACKER_ROWS) {
-                            memcpy(tick_history[tick_history_count].channels, frame_info.channel_info, sizeof(frame_info.channel_info));
-                            tick_history[tick_history_count].pos = frame_info.pos;
-                            tick_history[tick_history_count].pattern = frame_info.pattern;
-                            tick_history[tick_history_count].row = frame_info.row;
-                            tick_history[tick_history_count].num_channels = num_channels;
-                            tick_history_count++;
-                        } else {
-                            // Shift history
-                            memmove(tick_history, tick_history + 1, (MAX_TRACKER_ROWS - 1) * sizeof(struct tracker_tick));
-                            memcpy(tick_history[MAX_TRACKER_ROWS - 1].channels, frame_info.channel_info, sizeof(frame_info.channel_info));
-                            tick_history[MAX_TRACKER_ROWS - 1].pos = frame_info.pos;
-                            tick_history[MAX_TRACKER_ROWS - 1].pattern = frame_info.pattern;
-                            tick_history[MAX_TRACKER_ROWS - 1].row = frame_info.row;
-                            tick_history[MAX_TRACKER_ROWS - 1].num_channels = num_channels;
-                        }
+                        // Determine if we need compact format based on estimated text width
+                        // Full format: "C-4 01 A02" = ~11 chars, Compact: "C4 01 A02" = ~10 chars
+                        // Separator: "|" = 1 char
+                        // Estimate: full format needs ~12 chars per channel, compact needs ~11 chars per channel
+                        // Calculate font_scale first
+                        int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
+                        if (font_scale < 1) font_scale = 1;
+                        if (font_scale > 3) font_scale = 3;
+                        int estimated_chars_per_channel_full = 12;  // "C-4 01 A02|" 
+                        int estimated_chars_per_channel_compact = 11;  // "C4 01 A02|"
+                        int estimated_total_width_full = estimated_chars_per_channel_full * num_channels * FONT_WIDTH * font_scale;
+                        int estimated_total_width_compact = estimated_chars_per_channel_compact * num_channels * FONT_WIDTH * font_scale;
+                        int available_width_pixels = CONTENT_WIDTH;  // 780 pixels
+                        bool use_compact_format = (estimated_total_width_full > available_width_pixels);
                         
                         if (!tracker_initialized) {
+                            // First render - draw empty rows from top, then first actual row at bottom
+                            // The last empty row must be exactly one line_height above the first actual row
                             // First render - full screen (fb_fill already clears all margins)
-                            fb_fill(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                            ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                             
                             // Draw header on first render (always clear to ensure exact alignment)
                             draw_header();
                             
-                            // Render all visible rows
-                            int rows_to_show = (tick_history_count < max_rows_on_screen) ? max_rows_on_screen : tick_history_count;
-                            if (rows_to_show > max_rows_on_screen) rows_to_show = max_rows_on_screen;
-                            int start_row = (tick_history_count > max_rows_on_screen) ? (tick_history_count - max_rows_on_screen) : 0;
+                            // Calculate the position of the first actual row (at the bottom)
+                            int first_actual_row_y = logical_height - MARGIN_BOTTOM - line_height;
                             
-                            for (int row_idx = 0; row_idx < rows_to_show; row_idx++) {
-                                int y = header_y + row_idx * line_height;
-                                int hist_idx = start_row + row_idx;
-                                
-                                if (hist_idx < tick_history_count) {
-                                    struct tracker_tick *tick = &tick_history[hist_idx];
+                            // Don't draw empty rows - just draw the first actual row at the bottom
+                            int y = first_actual_row_y;
+                            
+                            // Draw current frame data directly (not from history)
+                            {
+                                int x = MARGIN_LEFT;
+                                int max_x = FB_WIDTH - MARGIN_RIGHT;
+                                for (int ch = 0; ch < num_channels && ch < XMP_MAX_CHANNELS; ch++) {
+                                    if (x >= max_x) break;
                                     
-                                    int x = MARGIN_LEFT;
-                                    for (int ch = 0; ch < num_channels && ch < XMP_MAX_CHANNELS; ch++) {
-                                        struct xmp_channel_info *ci = &tick->channels[ch];
-                                        
-                                        char ch_str[64];
-                                        unsigned char note = ci->event.note;
-                                        unsigned char ins = ci->event.ins;
-                                        unsigned char fxt = ci->event.fxt;
-                                        unsigned char fxp = ci->event.fxp;
-                                        
-                                        char note_str[4];
-                                        if (note > 0 && note <= 96) {
-                                            int note_idx = (note - 1) % 12;
-                                            int octave = (note - 1) / 12;
-                                            if (note_idx < 0) note_idx = 0;
-                                            if (note_idx > 11) note_idx = 11;
-                                            if (octave < 0) octave = 0;
-                                            if (octave > 9) octave = 9;
-                                            snprintf(note_str, sizeof(note_str), "%s%d", note_names[note_idx], octave);
-                                        } else {
-                                            strcpy(note_str, "---");
-                                        }
-                                        
-                                        char effect_char;
-                                        if (fxt == 0) {
-                                            effect_char = '-';
-                                        } else if (fxt < 10) {
-                                            effect_char = '0' + fxt;
-                                        } else if (fxt < 16) {
-                                            effect_char = 'A' + (fxt - 10);
-                                        } else {
-                                            effect_char = '?';
-                                        }
-                                        
-                                        snprintf(ch_str, sizeof(ch_str), "%s %02X %c%02X", note_str, ins, effect_char, fxp);
-                                        
-                                    // Check if channel is muted (gray color for muted channels)
+                                    struct xmp_channel_info *ci = &frame_info.channel_info[ch];
+                                    
+                                    char ch_str[64];
+                                    format_channel_string(ch_str, sizeof(ch_str), 
+                                                         ci->event.note, ci->event.ins, 
+                                                         ci->event.fxt, ci->event.fxp,
+                                                         use_compact_format, note_names);
+                                    
                                     bool channel_muted = false;
                                     mod_player_get_channel_mute(ch, &channel_muted);
                                     uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
-                                    // Scale factor: line_height / FONT_HEIGHT (typically 14-18 / 8 = 1-2)
+                                    
                                     int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
                                     if (font_scale < 1) font_scale = 1;
                                     if (font_scale > 3) font_scale = 3;
-                                    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
                                     
-                                    x += ch_width;
+                                    int text_width = strlen(ch_str) * FONT_WIDTH * font_scale;
                                     
-                                    if (ch < num_channels - 1) {
-                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, "  |  ");
-                                        x += line_height * 3;
+                                    if (x < max_x) {
+                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
                                     }
-                                    }
-                                } else {
-                                    // Empty row placeholder - use same font scale as regular rows
-                                    int x = MARGIN_LEFT;
-                                    int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
-                                    if (font_scale < 1) font_scale = 1;
-                                    if (font_scale > 3) font_scale = 3;
-                                    for (int ch = 0; ch < num_channels && ch < XMP_MAX_CHANNELS; ch++) {
-                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, "--- -- ---");
-                                        x += ch_width;
-                                        if (ch < num_channels - 1) {
-                                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, "  |  ");
-                                            x += line_height * 3;
-                                        }
+                                    
+                                    x += text_width;
+                                    
+                                    if (ch < num_channels - 1 && x < max_x) {
+                                        const char *separator = use_compact_format ? "|" : "  |  ";
+                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
+                                        x += strlen(separator) * FONT_WIDTH * font_scale;
                                     }
                                 }
                             }
                             
                             tracker_initialized = true;
+                            // Initialize last_row to current row to prevent immediate scrolling on first frame
+                            last_row = frame_info.row;
+                            // Reset smooth scrolling state for clean start
+                            smooth_scroll_offset = 0;
+                            pending_new_row = false;
                             // Full screen blit on first render
-                            blit();
+                            blit(-1, 0);  // -1 means full screen, row_height ignored
                         } else {
-                            // Subsequent renders - scroll content up and only draw new row
-                            // Update header if volume changed (always clear first to prevent smudging)
-                            if (vol_changed) {
-                                draw_header();  // Always clear header area before redrawing
-                            }
+                            // Subsequent renders - smooth scrolling
+                            // NOTE: Rows are NOT added to history here - they're added when scroll completes
+                            // This prevents duplicate rows from being added every frame
                             
-                            // Scroll framebuffer content up (skip header row at top, account for margins)
+                            // Always redraw header every frame to prevent smudging from scrolling rows
+                            // This ensures the header area stays clean as rows scroll underneath
+                            draw_header();
+                            
+                            // Pattern-timed smooth scrolling: scroll one line_height over the duration of one pattern row
+                            // This keeps scrolling in sync with pattern playback
                             int scrollable_height = FB_HEIGHT - header_y - MARGIN_BOTTOM;
-                            int scroll_lines = line_height;
-                            int src_y = header_y + scroll_lines;
-                            int dst_y = header_y;
-                            int copy_height = scrollable_height - scroll_lines;
                             
-                            // Scroll the content region up using PPA SRM (hardware-accelerated)
-                            if (copy_height > 0) {
-                                scroll_framebuffer_ppa(fb_pixels, src_y, dst_y, copy_height, stride);
+                            // Track when current row started and its duration
+                            static TickType_t row_start_tick = 0;
+                            static float current_row_duration_ms = 0.0f;
+                            
+                            // Check if we have a new row - allow continuous scrolling without waiting
+                            if (frame_info.row != last_row && !pending_new_row) {
+                                // New row detected - prepare it for smooth scrolling
+                                pending_new_row = true;
+                                memcpy(pending_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
+                                pending_tick.pos = frame_info.pos;
+                                pending_tick.pattern = frame_info.pattern;
+                                pending_tick.row = frame_info.row;
+                                pending_tick.num_channels = num_channels;
+                                
+                                // Calculate row duration: speed is frames per row, frame_time is microseconds per frame
+                                // Total row duration = speed * frame_time microseconds
+                                float row_duration_us = (float)frame_info.speed * (float)frame_info.frame_time;
+                                float single_row_duration_ms = row_duration_us / 1000.0f;  // Convert to milliseconds
+                                
+                                // Scroll one line_height over multiple row durations for readability
+                                // Typical trackers scroll slower than row rate - use more rows for comfortable reading
+                                const int ROWS_PER_SCROLL = 3;  // Scroll one line_height over this many pattern rows
+                                current_row_duration_ms = single_row_duration_ms * ROWS_PER_SCROLL;
+                                
+                                row_start_tick = xTaskGetTickCount();  // Record when this row started
+                                
+                                // If we're already scrolling, continue from current offset (seamless transition)
+                                // If not scrolling, start from 0
+                                if (smooth_scroll_offset >= line_height) {
+                                    smooth_scroll_offset = 0;  // Reset if previous row just completed
+                                }
+                                // Otherwise keep current offset for seamless continuous scrolling
+                                
+                                // Debug: log row timing info (only occasionally to avoid spam)
+                                static int debug_row_count = 0;
+                                if (debug_row_count++ % 20 == 0) {
+                                    ESP_LOGI(TAG, "Row timing: speed=%d, frame_time=%d us, single_row=%.1f ms, scroll_duration=%.1f ms (over %d rows), line_height=%d", 
+                                            frame_info.speed, frame_info.frame_time, single_row_duration_ms, 
+                                            current_row_duration_ms, ROWS_PER_SCROLL, line_height);
+                                }
+                                
+                                last_row = frame_info.row;  // Update to prevent repeated detection
                             }
                             
-                            // Clear the bottom line_height rows (where new content will go, account for margin)
-                            int clear_y = FB_HEIGHT - MARGIN_BOTTOM - scroll_lines;
-                            memset(fb_pixels + clear_y * stride, 0, scroll_lines * stride * sizeof(uint16_t));
-                            
-                            // Explicitly clear the bottom margin area to prevent leftover pixels
-                            int bottom_margin_start = FB_HEIGHT - MARGIN_BOTTOM;
-                            memset(fb_pixels + bottom_margin_start * stride, 0, MARGIN_BOTTOM * stride * sizeof(uint16_t));
-                            
-                            // Only draw the new row at the bottom (account for margin)
-                            int y = logical_height - MARGIN_BOTTOM - line_height;
-                            int hist_idx = tick_history_count - 1;
-                            
-                            if (hist_idx >= 0 && hist_idx < tick_history_count) {
-                                struct tracker_tick *tick = &tick_history[hist_idx];
+                            // Calculate scroll position based on elapsed time since row started
+                            // Only scroll if we have a pending row
+                            if (pending_new_row && current_row_duration_ms > 0.0f) {
+                                TickType_t current_tick = xTaskGetTickCount();
+                                TickType_t elapsed_ticks = current_tick - row_start_tick;
+                                float elapsed_ms = (float)elapsed_ticks * (1000.0f / configTICK_RATE_HZ);
                                 
-                                int x = MARGIN_LEFT;
-                                for (int ch = 0; ch < num_channels && ch < XMP_MAX_CHANNELS; ch++) {
-                                    struct xmp_channel_info *ci = &tick->channels[ch];
+                                // Calculate scroll position: 0 to line_height over row_duration_ms
+                                // This ensures we scroll exactly one line_height over the duration of one pattern row
+                                float scroll_progress = elapsed_ms / current_row_duration_ms;
+                                if (scroll_progress > 1.0f) scroll_progress = 1.0f;  // Clamp to 1.0
+                                
+                                smooth_scroll_offset = (int)(scroll_progress * (float)line_height);
+                                
+                                // If we've completed scrolling this row, add it to history
+                                if (smooth_scroll_offset >= line_height) {
+                                    smooth_scroll_offset = line_height;  // Clamp to line_height
                                     
-                                    char ch_str[64];
-                                    unsigned char note = ci->event.note;
-                                    unsigned char ins = ci->event.ins;
-                                    unsigned char fxt = ci->event.fxt;
-                                    unsigned char fxp = ci->event.fxp;
-                                    
-                                    char note_str[4];
-                                    if (note > 0 && note <= 96) {
-                                        int note_idx = (note - 1) % 12;
-                                        int octave = (note - 1) / 12;
-                                        if (note_idx < 0) note_idx = 0;
-                                        if (note_idx > 11) note_idx = 11;
-                                        if (octave < 0) octave = 0;
-                                        if (octave > 9) octave = 9;
-                                        snprintf(note_str, sizeof(note_str), "%s%d", note_names[note_idx], octave);
+                                    // Add the row to history
+                                    if (tick_history_count < MAX_TRACKER_ROWS) {
+                                        memcpy(tick_history[tick_history_count].channels, pending_tick.channels, sizeof(pending_tick.channels));
+                                        tick_history[tick_history_count].pos = pending_tick.pos;
+                                        tick_history[tick_history_count].pattern = pending_tick.pattern;
+                                        tick_history[tick_history_count].row = pending_tick.row;
+                                        tick_history[tick_history_count].num_channels = pending_tick.num_channels;
+                                        tick_history_count++;
                                     } else {
-                                        strcpy(note_str, "---");
+                                        // Shift history
+                                        memmove(tick_history, tick_history + 1, (MAX_TRACKER_ROWS - 1) * sizeof(struct tracker_tick));
+                                        memcpy(tick_history[MAX_TRACKER_ROWS - 1].channels, pending_tick.channels, sizeof(pending_tick.channels));
+                                        tick_history[MAX_TRACKER_ROWS - 1].pos = pending_tick.pos;
+                                        tick_history[MAX_TRACKER_ROWS - 1].pattern = pending_tick.pattern;
+                                        tick_history[MAX_TRACKER_ROWS - 1].row = pending_tick.row;
+                                        tick_history[MAX_TRACKER_ROWS - 1].num_channels = pending_tick.num_channels;
                                     }
                                     
-                                    char effect_char;
-                                    if (fxt == 0) {
-                                        effect_char = '-';
-                                    } else if (fxt < 10) {
-                                        effect_char = '0' + fxt;
-                                    } else if (fxt < 16) {
-                                        effect_char = 'A' + (fxt - 10);
-                                    } else {
-                                        effect_char = '?';
-                                    }
+                                    // Row completed scrolling - add to history and prepare for next
+                                    pending_new_row = false;
+                                    smooth_scroll_offset = 0;  // Reset for next row
+                                    // last_row is already updated when we detect the new row
                                     
-                                    snprintf(ch_str, sizeof(ch_str), "%s %02X %c%02X", note_str, ins, effect_char, fxp);
-                                    
-                                    // Check if channel is muted (gray color for muted channels)
-                                    bool channel_muted = false;
-                                    mod_player_get_channel_mute(ch, &channel_muted);
-                                    uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
-                                    // Scale factor: line_height / FONT_HEIGHT (typically 14-18 / 8 = 1-2)
-                                    int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
-                                    if (font_scale < 1) font_scale = 1;
-                                    if (font_scale > 3) font_scale = 3;
-                                    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
-                                    
-                                    x += ch_width;
-                                    
-                                    if (ch < num_channels - 1) {
-                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, "  |  ");
-                                        x += line_height * 3;
+                                    // Immediately check if there's already a new row waiting
+                                    // This prevents hitching by starting the next scroll immediately
+                                    if (frame_info.row != last_row && !pending_new_row) {
+                                        // New row already available - start scrolling it immediately
+                                        pending_new_row = true;
+                                        memcpy(pending_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
+                                        pending_tick.pos = frame_info.pos;
+                                        pending_tick.pattern = frame_info.pattern;
+                                        pending_tick.row = frame_info.row;
+                                        pending_tick.num_channels = num_channels;
+                                        
+                                        float row_duration_us = (float)frame_info.speed * (float)frame_info.frame_time;
+                                        float single_row_duration_ms = row_duration_us / 1000.0f;
+                                        const int ROWS_PER_SCROLL = 3;
+                                        current_row_duration_ms = single_row_duration_ms * ROWS_PER_SCROLL;
+                                        
+                                        row_start_tick = xTaskGetTickCount();
+                                        smooth_scroll_offset = 0;
+                                        last_row = frame_info.row;
                                     }
                                 }
                             }
                             
-                            // Partial blit - use full blit for now (can optimize later with partial PPA rotation)
-                            // PPA will rotate the entire logical framebuffer and send to display
-                            blit();
+                            // Don't scroll the framebuffer - instead, redraw all visible rows at their correct positions
+                            // This prevents double movement and gives us full control
+                            
+                            // Don't clear the entire area every frame - causes flickering
+                            // Instead, we'll clear only the areas that need it as we draw rows
+                            
+                            // Redraw all visible rows from history at their correct positions
+                            // Rows in history are stored chronologically (oldest first, newest last)
+                            // We need to draw them from bottom to top, with the most recent at the bottom
+                            int num_visible_rows = (scrollable_height + line_height - 1) / line_height + 1;  // +1 for partial row
+                            
+                            for (int i = 0; i < num_visible_rows && i < tick_history_count; i++) {
+                                // Start from most recent row (last in history) and work backwards
+                                int history_idx = tick_history_count - 1 - i;
+                                if (history_idx < 0) break;
+                                
+                                // Calculate Y position: most recent row is at bottom, older rows above
+                                // Account for smooth_scroll_offset to position correctly
+                                // When smooth_scroll_offset is 0, rows are at integer line_height positions
+                                // As smooth_scroll_offset increases, rows move UP (subtract offset)
+                                int y = logical_height - MARGIN_BOTTOM - line_height - (i * line_height) - smooth_scroll_offset;
+                                
+                                // Only draw if row is fully below header (y must be >= header_y)
+                                // This prevents any pixels from being drawn into the header area
+                                if (y >= header_y && y < logical_height - MARGIN_BOTTOM) {
+                                    // Clear the row area before drawing to prevent smudging
+                                    int row_clear_y = y;
+                                    int row_clear_end = (y + line_height > logical_height - MARGIN_BOTTOM) ? (logical_height - MARGIN_BOTTOM) : (y + line_height);
+                                    if (row_clear_y < row_clear_end) {
+                                        int clear_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+                                        int clear_height = row_clear_end - row_clear_y;
+                                        ppa_fill_rect(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, row_clear_y, clear_width, clear_height, RGB565_BLACK);
+                                    }
+                                    
+                                    // Draw the row from history
+                                    struct tracker_tick *tick = &tick_history[history_idx];
+                                    int x = MARGIN_LEFT;
+                                    int max_x = FB_WIDTH - MARGIN_RIGHT;
+                                    for (int ch = 0; ch < tick->num_channels && ch < XMP_MAX_CHANNELS; ch++) {
+                                        if (x >= max_x) break;
+                                        
+                                        struct xmp_channel_info *ci = &tick->channels[ch];
+                                        
+                                        char ch_str[64];
+                                        format_channel_string(ch_str, sizeof(ch_str), 
+                                                             ci->event.note, ci->event.ins, 
+                                                             ci->event.fxt, ci->event.fxp,
+                                                             use_compact_format, note_names);
+                                        
+                                        bool channel_muted = false;
+                                        mod_player_get_channel_mute(ch, &channel_muted);
+                                        uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
+                                        
+                                        int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
+                                        if (font_scale < 1) font_scale = 1;
+                                        if (font_scale > 3) font_scale = 3;
+                                        
+                                        int text_width = strlen(ch_str) * FONT_WIDTH * font_scale;
+                                        
+                                        if (x < max_x) {
+                                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
+                                        }
+                                        
+                                        x += text_width;
+                                        
+                                        if (ch < tick->num_channels - 1 && x < max_x) {
+                                            const char *separator = use_compact_format ? "|" : "  |  ";
+                                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
+                                            x += strlen(separator) * FONT_WIDTH * font_scale;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Draw the new row progressively as it scrolls in from below
+                            // Position it so it appears to scroll up smoothly
+                            if (pending_new_row) {
+                                    // Calculate where to draw the new row (offset by remaining scroll distance)
+                                    // When smooth_scroll_offset is 0, row starts at bottom
+                                    // When smooth_scroll_offset is line_height, row is fully scrolled in
+                                    int remaining_scroll = line_height - smooth_scroll_offset;
+                                    int y = logical_height - MARGIN_BOTTOM - line_height + remaining_scroll;
+                                    
+                                    // Only draw if the row is fully below header (y must be >= header_y)
+                                    // This prevents any pixels from being drawn into the header area
+                                    if (y >= header_y && y < logical_height - MARGIN_BOTTOM) {
+                                        // Always clear the row area before drawing to ensure clean rendering
+                                        int row_clear_y = y;
+                                        int row_clear_end = (y + line_height > logical_height - MARGIN_BOTTOM) ? (logical_height - MARGIN_BOTTOM) : (y + line_height);
+                                        if (row_clear_y < row_clear_end) {
+                                            int clear_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+                                            int clear_height = row_clear_end - row_clear_y;
+                                            ppa_fill_rect(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, row_clear_y, clear_width, clear_height, RGB565_BLACK);
+                                        }
+                                        
+                                        int x = MARGIN_LEFT;
+                                        int max_x = FB_WIDTH - MARGIN_RIGHT;
+                                        for (int ch = 0; ch < num_channels && ch < XMP_MAX_CHANNELS; ch++) {
+                                            if (x >= max_x) break;
+                                            
+                                            struct xmp_channel_info *ci = &pending_tick.channels[ch];
+                                            
+                                            char ch_str[64];
+                                            format_channel_string(ch_str, sizeof(ch_str), 
+                                                                 ci->event.note, ci->event.ins, 
+                                                                 ci->event.fxt, ci->event.fxp,
+                                                                 use_compact_format, note_names);
+                                            
+                                            bool channel_muted = false;
+                                            mod_player_get_channel_mute(ch, &channel_muted);
+                                            uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
+                                            
+                                            int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
+                                            if (font_scale < 1) font_scale = 1;
+                                            if (font_scale > 3) font_scale = 3;
+                                            
+                                            int text_width = strlen(ch_str) * FONT_WIDTH * font_scale;
+                                            
+                                            if (x < max_x) {
+                                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
+                                            }
+                                            
+                                            x += text_width;
+                                            
+                                            if (ch < num_channels - 1 && x < max_x) {
+                                                const char *separator = use_compact_format ? "|" : "  |  ";
+                                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
+                                                x += strlen(separator) * FONT_WIDTH * font_scale;
+                                            }
+                                        }
+                                    }
+                            }
+                            
+                            // No need to draw empty rows - just let the background show through
+                            
+                            // Always blit to update display (smooth scrolling means we update every frame)
+                            PROFILING_START(blit);
+                            blit(-1, 0);
+                            PROFILING_END(blit, blit);
                         }
                     }
                     
-                    last_row = frame_info.row;
+                    PROFILING_END(render, render);
+                    // Note: last_row is now updated when we finish scrolling, not immediately
+                    // This allows smooth scrolling to complete before marking the row as processed
                 }
             }
+        }
+        
+        PROFILING_END_FRAME(frame);
+        if (g_profiling_stats.frame_count % 10 == 0) {
+            profiling_report();
         }
     }
 }

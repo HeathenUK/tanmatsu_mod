@@ -57,3 +57,15 @@ esp_err_t audio_get_volume(float *volume);
  * @return esp_err_t ESP_OK on success
  */
 esp_err_t audio_get_i2s_handle(void **handle);
+
+/**
+ * @brief Diagnose ES8156 codec configuration (read and log current settings)
+ */
+void audio_diagnose_es8156(void);
+
+/**
+ * @brief Optimize ES8156 codec settings for better audio quality
+ * 
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t audio_optimize_es8156(void);

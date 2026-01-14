@@ -6,6 +6,7 @@ idf_component_register(
 		"sdcard.c"
 		"file_browser.c"
 		"simple_font.c"
+		"profiling.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
