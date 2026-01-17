@@ -7,7 +7,8 @@
 #include "mod_player.h"
 #include "sdcard.h"
 #include "file_browser.h"
-#include "xmp.h"  // For xmp_frame_info, xmp_channel_info, xmp_event
+#include "xmp_compat.h"  // For xmp_frame_info, xmp_channel_info, xmp_event (structure definitions)
+#include "mod_backend.h"  // For MOD_MAX_CHANNELS and unified backend interface
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
@@ -30,6 +31,9 @@
 #include "wifi_connection.h"
 #include "wifi_remote.h"
 #include "profiling.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
 // Constants
 static char const TAG[] = "main";
@@ -58,21 +62,29 @@ static inline uint16_t argb32_to_rgb565(uint32_t argb) {
     return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
 }
 
-// Global variables
-static uint16_t *fb = NULL;  // Logical landscape framebuffer (800x480) in PSRAM
-static uint16_t *fb_rotated = NULL;  // Rotated framebuffer (480x800) for display output
-static esp_lcd_panel_handle_t panel_handle = NULL;  // Panel handle for direct drawing
+// Global variables - Simplified with BSP double buffering
+static uint16_t *fb = NULL;  // Single logical landscape framebuffer (800x480) in PSRAM
+static uint16_t *fb_rotated = NULL;  // Single rotated framebuffer (480x800) for display output
 static ppa_client_handle_t ppa_srm_handle = NULL;  // PPA SRM client for rotation
 static ppa_client_handle_t ppa_fill_handle = NULL;  // PPA Fill client for hardware-accelerated fills
-static async_memcpy_handle_t async_memcpy_handle = NULL;  // GDMA async memcpy handle
 static QueueHandle_t input_event_queue = NULL;
+static int channel_page_offset = 0;  // Channel pagination: offset for current page (0-4-8-12...)
+static bool tab_pressed_this_frame = false;  // Flag set by Tab key handler, checked during rendering
+
+// Helper macro to get framebuffer
+#define CURRENT_FB (fb)
 
 // RGB565 to ARGB8888 conversion helper for PPA Fill
 // RGB565: 0bRRRRRGGGGGGBBBBB
 // ARGB8888: 0xAARRGGBB (A=0xFF for opaque)
+// NOTE: The PPA API requires fill_argb_color in ARGB8888 format regardless of fill_cm.
+// When fill_cm is RGB565, PPA internally converts ARGB8888 -> RGB565.
+// This conversion scales RGB565 5/6/5 bits to ARGB8888 8/8/8 bits by replicating bits.
 static inline color_pixel_argb8888_data_t rgb565_to_argb8888(uint16_t rgb565) {
     color_pixel_argb8888_data_t argb;
-    // Extract RGB components from RGB565
+    // Extract RGB components from RGB565 and scale to 8-bit
+    // For 5-bit: replicate top 3 bits (multiply by 8)
+    // For 6-bit: replicate top 2 bits (multiply by 4)
     uint8_t r = ((rgb565 >> 11) & 0x1F) << 3;  // 5 bits -> 8 bits (scale by 8)
     uint8_t g = ((rgb565 >> 5) & 0x3F) << 2;   // 6 bits -> 8 bits (scale by 4)
     uint8_t b = (rgb565 & 0x1F) << 3;          // 5 bits -> 8 bits (scale by 8)
@@ -86,20 +98,20 @@ static inline color_pixel_argb8888_data_t rgb565_to_argb8888(uint16_t rgb565) {
 
 // Hardware-accelerated framebuffer fill using PPA Fill
 // Falls back to CPU fill if PPA is unavailable or operation fails
-static void IRAM_ATTR ppa_fill_framebuffer(uint16_t *fb, int width, int height, uint16_t color) {
-    if (!fb || width <= 0 || height <= 0) {
+static void IRAM_ATTR ppa_fill_framebuffer(uint16_t *fb_ptr, int width, int height, uint16_t color) {
+    if (!fb_ptr || width <= 0 || height <= 0) {
         return;
     }
     
     // Try PPA Fill first (hardware-accelerated)
-    if (ppa_fill_handle && fb) {
+    if (ppa_fill_handle && fb_ptr) {
         // Convert RGB565 to ARGB8888 for PPA
         color_pixel_argb8888_data_t fill_color = rgb565_to_argb8888(color);
         
         // Configure PPA Fill operation
         ppa_fill_oper_config_t fill_config = {
             .out = {
-                .buffer = fb,
+                .buffer = CURRENT_FB,
                 .buffer_size = width * height * sizeof(uint16_t),
                 .pic_w = width,
                 .pic_h = height,
@@ -125,17 +137,35 @@ static void IRAM_ATTR ppa_fill_framebuffer(uint16_t *fb, int width, int height, 
         ESP_LOGD(TAG, "PPA Fill handle not available, using CPU fill");
     }
     
-    // CPU fallback (original fb_fill implementation)
+    // CPU fallback: SIMD-optimized fill using multi-word writes
+    // Replicate 16-bit RGB565 color to 64-bit word for efficient filling
+    // Pattern: color|color|color|color (4 pixels per 64-bit word)
+    uint64_t color_word = ((uint64_t)color << 48) | ((uint64_t)color << 32) | 
+                          ((uint64_t)color << 16) | (uint64_t)color;
+    
     int total_pixels = width * height;
-    for (int i = 0; i < total_pixels; i++) {
-        fb[i] = color;
+    uint64_t *fb_words = (uint64_t *)fb_ptr;
+    int word_count = total_pixels / 4;  // 4 pixels per 64-bit word
+    
+    // Fill 4 pixels at a time using 64-bit writes (SIMD-friendly)
+    for (int i = 0; i < word_count; i++) {
+        fb_words[i] = color_word;
+    }
+    
+    // Handle remaining pixels (0-3 pixels)
+    int remainder = total_pixels % 4;
+    if (remainder > 0) {
+        int start_idx = word_count * 4;
+        for (int i = 0; i < remainder; i++) {
+            fb_ptr[start_idx + i] = color;
+        }
     }
 }
 
 // Hardware-accelerated rectangle fill using PPA Fill
 // Falls back to CPU fill if PPA is unavailable or operation fails
-static void IRAM_ATTR ppa_fill_rect(uint16_t *fb, int width, int height, int x, int y, int w, int h, uint16_t color) {
-    if (!fb || width <= 0 || height <= 0 || w <= 0 || h <= 0) {
+static void IRAM_ATTR ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int x, int y, int w, int h, uint16_t color) {
+    if (!fb_ptr || width <= 0 || height <= 0 || w <= 0 || h <= 0) {
         return;
     }
     
@@ -166,7 +196,7 @@ static void IRAM_ATTR ppa_fill_rect(uint16_t *fb, int width, int height, int x, 
         // Configure PPA Fill operation for the rectangle region
         ppa_fill_oper_config_t fill_config = {
             .out = {
-                .buffer = fb,
+                .buffer = fb_ptr,
                 .buffer_size = width * height * sizeof(uint16_t),
                 .pic_w = width,
                 .pic_h = height,
@@ -192,14 +222,29 @@ static void IRAM_ATTR ppa_fill_rect(uint16_t *fb, int width, int height, int x, 
         ESP_LOGD(TAG, "PPA Fill handle not available, using CPU fill for rect");
     }
     
-    // CPU fallback (original fb_rect implementation)
+    // CPU fallback: SIMD-optimized rectangle fill using multi-word writes
+    // Replicate 16-bit RGB565 color to 64-bit word for efficient row filling
+    uint64_t color_word = ((uint64_t)color << 48) | ((uint64_t)color << 32) | 
+                          ((uint64_t)color << 16) | (uint64_t)color;
+    
     for (int dy = 0; dy < h; dy++) {
         int fy = y + dy;
         if (fy >= 0 && fy < height) {
-            for (int dx = 0; dx < w; dx++) {
-                int fx = x + dx;
-                if (fx >= 0 && fx < width) {
-                    fb[fy * width + fx] = color;
+            uint16_t *row = &fb_ptr[fy * width + x];
+            int word_count = w / 4;  // 4 pixels per 64-bit word
+            uint64_t *row_words = (uint64_t *)row;
+            
+            // Fill 4 pixels at a time using 64-bit writes (SIMD-friendly)
+            for (int i = 0; i < word_count; i++) {
+                row_words[i] = color_word;
+            }
+            
+            // Handle remaining pixels in row (0-3 pixels)
+            int remainder = w % 4;
+            if (remainder > 0) {
+                int start_idx = word_count * 4;
+                for (int i = 0; i < remainder; i++) {
+                    row[start_idx + i] = color;
                 }
             }
         }
@@ -268,12 +313,12 @@ static void IRAM_ATTR format_channel_string(char *ch_str, size_t ch_str_size,
 
 static void draw_file_browser(file_browser_t *browser) {
     const int font_scale = 2;
-    const int line_height = FONT_HEIGHT * font_scale;  // 16 pixels for scale 2
+    const int line_height = FONT_HEIGHT * font_scale;  // 32 pixels for scale 2 (8x16 font)
     
-    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     
     int y = MARGIN_TOP;
-    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, RGB565_WHITE, font_scale, "MOD file browser");
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, RGB565_WHITE, font_scale, "MOD file browser");
     y += line_height;
     
     char path_text[128];
@@ -281,7 +326,7 @@ static void draw_file_browser(file_browser_t *browser) {
     if (path_len >= (int)sizeof(path_text)) {
         path_text[sizeof(path_text) - 1] = '\0';
     }
-    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, RGB565_WHITE, font_scale, path_text);
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, RGB565_WHITE, font_scale, path_text);
     y += line_height + 2;  // Small gap before file list
     
     // Draw file list (show up to 10 files, centered on selection)
@@ -293,8 +338,8 @@ static void draw_file_browser(file_browser_t *browser) {
     for (int i = start_idx; i < end_idx; i++) {
         int file_y = file_list_start_y + (i - start_idx) * line_height;
         if (i == browser->selected_index) {
-            // Draw blue highlight - match text height exactly (16 pixels for scale 2)
-            ppa_fill_rect(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, file_y, CONTENT_WIDTH, line_height, argb32_to_rgb565(0xFF0000FF));
+            // Draw blue highlight - match text height exactly (32 pixels for scale 2 with 8x16 font)
+            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, file_y, CONTENT_WIDTH, line_height, argb32_to_rgb565(0xFF0000FF));
         }
         char name[64];
         // Special handling for ".." entry - ensure it displays correctly
@@ -313,10 +358,10 @@ static void draw_file_browser(file_browser_t *browser) {
                 }
             }
         }
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + 4, file_y, RGB565_WHITE, font_scale, name);
+        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + 4, file_y, RGB565_WHITE, font_scale, name);
     }
     
-    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, FB_HEIGHT - MARGIN_BOTTOM - line_height, RGB565_WHITE, font_scale, "UP/DN: navigate  RT/ENT: select  LT: back");
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, FB_HEIGHT - MARGIN_BOTTOM - line_height, RGB565_WHITE, font_scale, "UP/DN: navigate  RT/ENT: select  LT: back");
 }
 
 // IRAM-safe callback for GDMA completion (no FreeRTOS APIs)
@@ -368,22 +413,68 @@ static void IRAM_ATTR scroll_framebuffer_ppa(uint16_t *fb_pixels, int src_y, int
     
     esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
     if (ret != ESP_OK) {
-        // Fallback to memmove if PPA fails
-        ESP_LOGW(TAG, "PPA scrolling failed (%s), falling back to memmove", esp_err_to_name(ret));
+        // Fallback: memcpy (non-overlapping regions when scrolling up: src_y > dst_y)
+        // Compiler may optimize memcpy with SIMD internally
+        ESP_LOGW(TAG, "PPA scrolling failed (%s), falling back to memcpy", esp_err_to_name(ret));
         uint16_t *src_ptr = fb_pixels + src_y * stride;
         uint16_t *dst_ptr = fb_pixels + dst_y * stride;
         size_t copy_bytes = copy_height * stride * sizeof(uint16_t);
-        memmove(dst_ptr, src_ptr, copy_bytes);
+        // Use memcpy since regions don't overlap (scrolling up: src_y > dst_y)
+        memcpy(dst_ptr, src_ptr, copy_bytes);
     }
 }
 
-// Partial rotation support: if row_y >= 0, only rotate that row region (much faster)
-// For 270° CCW rotation: a horizontal row at y in logical framebuffer becomes a vertical column
-// at x = (FB_HEIGHT - 1 - y) in rotated framebuffer
-// row_height: height of the row region to rotate (typically line_height pixels)
+// Blit function - rotates framebuffer and sends to display via BSP
+// BSP handles vsync and double buffering internally
 void IRAM_ATTR blit(int row_y, int row_height) {
+    // BSP handles double buffering, so we just rotate and blit
+    // row_y and row_height are unused - we always do full screen rotation for simplicity
+    (void)row_y;
+    (void)row_height;
+    
+    if (!fb || !fb_rotated || !ppa_srm_handle) {
+        return;
+    }
+    
+    // Rotate landscape framebuffer (800x480) to portrait (480x800) using PPA
+    ppa_srm_oper_config_t srm_config = {
+        .in.buffer = fb,
+        .in.pic_w = FB_WIDTH,
+        .in.pic_h = FB_HEIGHT,
+        .in.block_w = FB_WIDTH,
+        .in.block_h = FB_HEIGHT,
+        .in.block_offset_x = 0,
+        .in.block_offset_y = 0,
+        .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        .out.buffer = fb_rotated,
+        .out.buffer_size = 480 * 800 * sizeof(uint16_t),
+        .out.pic_w = 480,
+        .out.pic_h = 800,
+        .out.block_offset_x = 0,
+        .out.block_offset_y = 0,
+        .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
+        .scale_x = 1,
+        .scale_y = 1,
+        .rgb_swap = 0,
+        .byte_swap = 0,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    
+    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
+    if (ret == ESP_OK) {
+        // Send rotated buffer to display via BSP (handles vsync and double buffering)
+        bsp_display_blit(0, 0, 480, 800, fb_rotated);
+    } else {
+        ESP_LOGE(TAG, "PPA rotation failed: %s", esp_err_to_name(ret));
+    }
+}
+
+#if 0
+// Old blit implementation - removed, LCD task now handles rotation and display
+void IRAM_ATTR blit_old(int row_y, int row_height) {
     // Use PPA to rotate logical landscape framebuffer (800x480) to ST7701S native portrait (480x800)
-    if (fb && fb_rotated && ppa_srm_handle && panel_handle) {
+    if (CURRENT_FB && fb_rotated[current_fb_index] && ppa_srm_handle && panel_handle) {
         bool partial_rotation = (row_y >= 0 && row_y < FB_HEIGHT && row_height > 0);
         
         if (partial_rotation) {
@@ -398,7 +489,7 @@ void IRAM_ATTR blit(int row_y, int row_height) {
             
             // Rotate only this row region
             ppa_srm_oper_config_t srm_config = {
-                .in.buffer = fb,
+                .in.buffer = CURRENT_FB,
                 .in.pic_w = FB_WIDTH,      // 800
                 .in.pic_h = FB_HEIGHT,     // 480
                 .in.block_w = FB_WIDTH,    // Full width of the row
@@ -429,13 +520,17 @@ void IRAM_ATTR blit(int row_y, int row_height) {
                 // The panel expects data in left-to-right order, so we extract columns from left to right
                 static uint16_t col_buffer[800 * 20];  // Static buffer for up to 20 rows (should be enough)
                 if (row_height <= 20) {
-                    // Extract each column from left to right and pack them row-major for the panel update
-                    for (int col = 0; col < row_height; col++) {
-                        int rotated_col_x = rotated_col_left + col;  // Extract from left to right
-                        for (int i = 0; i < 800; i++) {
-                            col_buffer[col * 800 + i] = fb_rotated[i * 480 + rotated_col_x];
-                        }
+                // Extract each column from left to right and pack them row-major for the panel update
+                // Optimized: use row-major access pattern for better cache locality
+                // Access rotated buffer column-wise but pack row-major in col_buffer
+                for (int col = 0; col < row_height; col++) {
+                    int rotated_col_x = rotated_col_left + col;  // Extract from left to right
+                    uint16_t *col_buf_ptr = col_buffer + col * 800;  // Row start in destination
+                    // Access rotated buffer column (stride=480) - cache-friendly if we process multiple columns
+                    for (int i = 0; i < 800; i++) {
+                        col_buf_ptr[i] = fb_rotated[i * 480 + rotated_col_x];
                     }
+                }
                     // Send the rotated column region to panel (partial update)
                     // x_start = rotated_col_left, x_end = rotated_col_right + 1 (exclusive)
                     // Width is row_height columns, height is 800 pixels
@@ -454,7 +549,7 @@ void IRAM_ATTR blit(int row_y, int row_height) {
         if (!partial_rotation) {
             // Full screen rotation (first render or fallback)
             ppa_srm_oper_config_t srm_config = {
-                .in.buffer = fb,
+                .in.buffer = CURRENT_FB,
                 .in.pic_w = FB_WIDTH,      // 800
                 .in.pic_h = FB_HEIGHT,     // 480
                 .in.block_w = FB_WIDTH,
@@ -488,6 +583,7 @@ void IRAM_ATTR blit(int row_y, int row_height) {
         }
     }
 }
+#endif
 
 void app_main(void) {
     // Start the GPIO interrupt service
@@ -502,17 +598,15 @@ void app_main(void) {
     ESP_ERROR_CHECK(res);
 
     // Initialize the Board Support Package
+    // Use double buffering (num_fbs = 2) - BSP handles vsync and buffer swapping internally
     const bsp_configuration_t bsp_configuration = {
         .display =
             {
                 .requested_color_format = LCD_COLOR_PIXEL_FORMAT_RGB565,
-                .num_fbs                = 1,
+                .num_fbs                = 2,  // BSP handles double buffering and vsync
             },
     };
     ESP_ERROR_CHECK(bsp_device_initialize(&bsp_configuration));
-
-    // Get panel handle for direct PPA operations
-    ESP_ERROR_CHECK(bsp_display_get_panel(&panel_handle));
     
     // Initialize PPA SRM client for rotation
     ppa_client_config_t ppa_srm_config = {
@@ -529,56 +623,38 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(ppa_register_client(&ppa_fill_config, &ppa_fill_handle));
     ESP_LOGI(TAG, "PPA Fill client registered for hardware-accelerated fills");
-    
-    // Initialize AXI-GDMA async memcpy driver for hardware-accelerated memory operations
-    // AXI-GDMA supports PSRAM (unlike AHB-GDMA which only supports SRAM)
-    async_memcpy_config_t async_memcpy_config = ASYNC_MEMCPY_DEFAULT_CONFIG();
-    async_memcpy_config.backlog = 1;  // Only need one pending operation for scrolling
-    esp_err_t ret_memcpy = esp_async_memcpy_install_gdma_axi(&async_memcpy_config, &async_memcpy_handle);
-    if (ret_memcpy == ESP_OK) {
-        ESP_LOGI(TAG, "AXI-GDMA async memcpy driver installed successfully (PSRAM supported)");
-    } else {
-        ESP_LOGW(TAG, "AXI-GDMA async memcpy driver installation failed (%s), will use CPU fallback", esp_err_to_name(ret_memcpy));
-        async_memcpy_handle = NULL;  // Ensure handle is NULL on failure
-    }
 
-    // Skip LED initialization for faster startup (can re-enable later if needed)
-    // bsp_led_set_pixel(0, 0xFF0000);  // Red
-    // bsp_led_set_pixel(1, 0x00FF00);  // Green
-    // bsp_led_set_pixel(2, 0x0000FF);  // Blue
-    // bsp_led_set_pixel(3, 0xFFFF00);  // Yellow
-    // bsp_led_set_pixel(4, 0x00FFFF);  // Magenta
-    // bsp_led_set_pixel(5, 0xFF00FF);  // Cyan
-    // bsp_led_send();                  // Send data to the coprocessor
-    // bsp_led_set_mode(false);         // Take control over all LEDs by disabling automatic mode
-
-    
-    // Allocate logical landscape framebuffer (800x480) from DMA-capable PSRAM
-    // DMA requires 32-byte alignment for optimal performance
+    // Allocate single logical landscape framebuffer (800x480) from DMA-capable PSRAM
+    // Use 64-byte alignment for L2 cache line optimization (ESP32-P4 has 64-byte cache lines)
     size_t fb_size = FB_WIDTH * FB_HEIGHT * sizeof(uint16_t);  // 800x480x2 = 768000 bytes
-    fb = (uint16_t*)heap_caps_aligned_alloc(32, fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    fb = (uint16_t*)heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (fb == NULL) {
         ESP_LOGE(TAG, "Failed to allocate logical framebuffer from DMA-capable PSRAM");
         return;
     }
     ESP_LOGI(TAG, "Allocated logical framebuffer: %zu bytes (800x480)", fb_size);
     
-    // Allocate rotated framebuffer (480x800) for PPA output
+    // Allocate single rotated framebuffer (480x800) for PPA output
+    // Use 64-byte alignment for L2 cache line optimization
     size_t fb_rotated_size = 480 * 800 * sizeof(uint16_t);  // 480x800x2 = 768000 bytes
-    fb_rotated = (uint16_t*)heap_caps_aligned_alloc(32, fb_rotated_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    fb_rotated = (uint16_t*)heap_caps_aligned_alloc(64, fb_rotated_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (fb_rotated == NULL) {
         ESP_LOGE(TAG, "Failed to allocate rotated framebuffer from DMA-capable PSRAM");
         return;
     }
     ESP_LOGI(TAG, "Allocated rotated framebuffer: %zu bytes (480x800)", fb_rotated_size);
+    
+    // Initialize framebuffer to black
+    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    ESP_LOGI(TAG, "Initialized framebuffer to black");
 
     // Get input event queue from BSP
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
     // Initialize audio system
-    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_BLACK, 2, "Initializing audio...");
-    blit(-1, 0);
+    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_WHITE, 2, "Initializing audio...");
+    blit(-1, 0);  // Rotate and send to display via BSP (handles vsync and double buffering)
     res = audio_init();
     if (res == ESP_OK) {
         ESP_LOGI(TAG, "Audio initialized successfully");
@@ -601,8 +677,8 @@ void app_main(void) {
         }
     } else {
         ESP_LOGW(TAG, "Audio initialization failed: %s", esp_err_to_name(res));
-        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Audio init failed");
+        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Audio init failed");
         blit(-1, 0);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -611,17 +687,17 @@ void app_main(void) {
     //
     // if (wifi_remote_initialize() == ESP_OK) {
     //
-    //     ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    //     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     //     pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Starting WiFi stack...");
     //     blit(-1, 0);
     //     wifi_connection_init_stack();  // Start the Espressif WiFi stack
     //
-    //     ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    //     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     //     pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Connecting to WiFi network...");
     //     blit(-1, 0);
     //
     //     if (wifi_connect_try_all() == ESP_OK) {
-    //         ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    //         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     //         pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Succesfully connected to WiFi network");
     //         blit(-1, 0);
     //     } else {
@@ -640,17 +716,17 @@ void app_main(void) {
     // vTaskDelay(pdMS_TO_TICKS(500));
 
     // Initialize SD card
-    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_BLACK, 2, "Initializing SD card...");
+    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_BLACK, 2, "Initializing SD card...");
     blit(-1, 0);
     res = sdcard_init();
     if (res == ESP_OK) {
         ESP_LOGI(TAG, "SD card initialized successfully");
     } else {
         ESP_LOGW(TAG, "SD card initialization failed: %s", esp_err_to_name(res));
-        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "SD card init failed");
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_BLACK, 2, "Continuing without SD");
+        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "SD card init failed");
+        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_BLACK, 2, "Continuing without SD");
         blit(-1, 0);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -670,25 +746,20 @@ void app_main(void) {
     static char current_mod_path[MAX_FILENAME_LEN] = {0};  // Store current MOD file path for display
 
     // Start with file browser if SD card is mounted
+    // NOTE: Don't call blit() here - the main loop will render and call blit() once per frame
     if (sdcard_is_mounted()) {
         browser_active = true;
         file_browser_init(&browser, "/sdcard");
-        // Draw initial file browser view using helper function (with margins)
-        draw_file_browser(&browser);
-        blit(-1, 0);
+        // Initial file browser will be drawn in main loop when browser_rendered is false
     } else {
-        // No SD card - show error
-        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "SD card not mounted");
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_BLACK, 2, "Insert SD card and");
-        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 36, RGB565_BLACK, 2, "restart device");
-    blit(-1, 0);
+        // No SD card - show error (will be drawn in main loop)
+        browser_active = false;  // Don't show browser if no SD card
     }
 
     // Tracker UI state - scrolling view with one line per pattern row
     #define MAX_TRACKER_ROWS 60  // Maximum number of row lines to store (more than screen can display for scrolling)
     struct tracker_tick {
-        struct xmp_channel_info channels[XMP_MAX_CHANNELS];
+        struct xmp_channel_info channels[MOD_MAX_CHANNELS];
         int pos;
         int pattern;
         int row;
@@ -706,7 +777,7 @@ void app_main(void) {
     static struct tracker_tick pending_tick = {0};  // New row data waiting to be added
     
     // Channel colors (RGB565)
-    static const uint16_t channel_colors_rgb565[XMP_MAX_CHANNELS] = {
+    static const uint16_t channel_colors_rgb565[MOD_MAX_CHANNELS] = {
         0xF800, 0x07E0, 0x001F, 0xFFE0,  // Red, Green, Blue, Yellow
         0xF81F, 0x07FF, 0xFC00, 0x87E0,  // Magenta, Cyan, Orange, Lime
         0x041F, 0xF810, 0x87FF, 0xFC10,  // Light Blue, Pink, Light Cyan, Light Red
@@ -725,6 +796,11 @@ void app_main(void) {
 
     while (1) {
         PROFILING_START(frame);
+        
+        // Track if we need to render this frame
+        static bool needs_render = false;
+        bool did_render = false;  // Track if we actually rendered anything this frame
+        
         // Check input queue FIRST with ZERO timeout for instant response (non-blocking)
         bsp_input_event_t event;
         // Process ALL pending input events before doing anything else
@@ -795,36 +871,36 @@ void app_main(void) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
                                                         // Clear screen immediately to prevent white flash
-                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         // Tracker UI will be drawn in main loop
                                                     } else {
-                                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
+                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
                                                             blit(-1, 0);
                                                         }
                                                     } else {
                                                         free(mod_file_data);
                                                         mod_file_data = NULL;
-                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
+                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
                                                         blit(-1, 0);
                                                     }
                                                 } else {
                                                     free(mod_file_data);
                                                     mod_file_data = NULL;
-                                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
+                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
                                                     blit(-1, 0);
                                                 }
                                             } else {
                                                 fclose(f);
-                                                ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
                                                 blit(-1, 0);
                                             }
                                         } else {
-                                            ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
+                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
                         blit(-1, 0);
                     }
                                     }
@@ -838,10 +914,9 @@ void app_main(void) {
                     break;
                 }
                         
-                        // Redraw file browser if selection changed
+                        // Mark browser for redraw (will be rendered after input processing)
                         if (browser_needs_redraw) {
-                            draw_file_browser(&browser);
-                            blit(-1, 0);
+                            needs_render = true;
                         }
                         } else if (mod_player_is_playing()) {
                             // Volume control during playback
@@ -889,10 +964,14 @@ void app_main(void) {
                             mod_player_stop();
                             browser_active = true;
                             file_browser_refresh(&browser);
-                            // Redraw file browser
-                            draw_file_browser(&browser);
-                            blit(-1, 0);
+                            // Mark browser for redraw (will be rendered after input processing)
+                            needs_render = true;
                         }
+                    }
+                    
+                    // Handle Tab key (0x0F) for channel page switching during playback
+                    if (!browser_active && mod_player_is_playing() && sc == 0x0F) {
+                        tab_pressed_this_frame = true;  // Flag will be checked during rendering
                     }
                     
                     // Handle number keys (0-9) for channel mute toggle during playback
@@ -908,7 +987,7 @@ void app_main(void) {
                             channel = 0;
                         }
                         
-                        if (channel >= 0 && channel < XMP_MAX_CHANNELS) {
+                        if (channel >= 0 && channel < MOD_MAX_CHANNELS) {
                             // Toggle channel mute
                             esp_err_t mute_res = mod_player_toggle_channel_mute(channel);
                             if (mute_res == ESP_OK) {
@@ -976,37 +1055,37 @@ void app_main(void) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
                                                         // Clear screen immediately to prevent white flash
-                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         // Tracker UI will be drawn in main loop
                                                         browser_needs_redraw = false;  // Don't redraw browser, we're playing now
                                                     } else {
-                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
+                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
                                                         blit(-1, 0);
                                                     }
                                                 } else {
                                                     free(mod_file_data);
                                                     mod_file_data = NULL;
-                                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
+                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
                                                     blit(-1, 0);
                                                 }
                                             } else {
                                                 free(mod_file_data);
                                                 mod_file_data = NULL;
-                                                ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
                                                 blit(-1, 0);
                                             }
                                         } else {
                                             fclose(f);
-                                            ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
+                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
                                             blit(-1, 0);
                                         }
                                     } else {
-                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
+                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
                                         blit(-1, 0);
                                     }
                                 }
@@ -1016,10 +1095,9 @@ void app_main(void) {
                             }
                         }
                         
-                        // Redraw file browser if navigation changed
+                        // Mark browser for redraw (will be rendered after input processing)
                         if (browser_needs_redraw) {
-                            draw_file_browser(&browser);
-                            blit(-1, 0);
+                            needs_render = true;
                         }
                     }
                     
@@ -1067,36 +1145,36 @@ void app_main(void) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
                                                         // Clear screen immediately to prevent white flash
-                                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                         // Tracker UI will be drawn in main loop
                                                     } else {
-                                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
+                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
                                                     blit(-1, 0);
                                                 }
                                             } else {
                                                 free(mod_file_data);
                                                 mod_file_data = NULL;
-                                                ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
                                                 blit(-1, 0);
                                             }
                                         } else {
                                             free(mod_file_data);
                                             mod_file_data = NULL;
-                                            ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
+                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
                                             blit(-1, 0);
                                         }
                                     } else {
                                         fclose(f);
-                                        ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
+                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
                                         blit(-1, 0);
                                     }
                                 } else {
-                                    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                    font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
+                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
                                     blit(-1, 0);
                                 }
                             }
@@ -1105,10 +1183,9 @@ void app_main(void) {
                             browser_needs_redraw = true;
                         }
                         
-                        // Redraw file browser if directory was entered
+                        // Mark browser for redraw (will be rendered after input processing)
                         if (browser_needs_redraw) {
-                            draw_file_browser(&browser);
-                            blit(-1, 0);
+                            needs_render = true;
                         }
                     }
                     
@@ -1120,9 +1197,46 @@ void app_main(void) {
             }
         }  // End of while loop processing all pending input events
         
+        // Render file browser if needed (input handlers set needs_render flag)
+        // Also render on first loop if browser is active but hasn't been rendered yet
+        static bool browser_rendered = false;
+        if (browser_active && (needs_render || !browser_rendered)) {
+            draw_file_browser(&browser);
+            needs_render = false;  // Clear flag after rendering
+            browser_rendered = true;  // Mark as rendered
+            did_render = true;  // Mark that we rendered this frame
+        } else if (!browser_active) {
+            browser_rendered = false;  // Reset when browser becomes inactive
+        }
+        
+        // Render "no SD card" error if needed (only once, or if it changed)
+        static bool error_rendered = false;
+        static bool last_sdcard_mounted = false;
+        bool current_sdcard_mounted = sdcard_is_mounted();
+        if (!browser_active && !mod_player_is_playing() && !current_sdcard_mounted && (!error_rendered || last_sdcard_mounted != current_sdcard_mounted)) {
+            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "SD card not mounted");
+            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_WHITE, 2, "Insert SD card and");
+            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 36, RGB565_WHITE, 2, "restart device");
+            error_rendered = true;
+            did_render = true;  // Mark that we rendered this frame
+        } else if (current_sdcard_mounted && !last_sdcard_mounted) {
+            error_rendered = false;  // Reset if SD card is mounted
+        }
+        last_sdcard_mounted = current_sdcard_mounted;
+        
         // Render tracker UI if playing
         // For smooth scrolling, we need to render every frame, not just on row changes
         if (mod_player_is_playing() && !browser_active) {
+            // Track mode transitions - clear framebuffer when switching from browser to playback
+            static bool last_browser_active = true;
+            if (last_browser_active && !browser_active) {
+                // Switching from browser to playback - clear framebuffer for clean transition
+                ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                did_render = true;  // Ensure we blit to show the cleared screen
+            }
+            last_browser_active = browser_active;
+            
             PROFILING_START(render);
             struct xmp_frame_info frame_info;
             if (mod_player_get_frame_info(&frame_info) == ESP_OK) {
@@ -1138,10 +1252,32 @@ void app_main(void) {
                         tracker_initialized = false;
                         tick_history_count = 0;  // Reset tick history for new MOD
                         last_row = -1;  // Reset last_row to force first render
+                        channel_page_offset = 0;  // Reset to first page when loading new MOD
                     }
                     
                     int num_channels = mod_info.mod ? mod_info.mod->chn : 0;
-                    if (num_channels > 0 && num_channels <= XMP_MAX_CHANNELS) {
+                    if (num_channels > 0 && num_channels <= MOD_MAX_CHANNELS) {
+                        // Channel pagination: Show 4 channels per page, switch pages with Tab
+                        // Check for Tab key press flag (set by scancode handler)
+                        if (tab_pressed_this_frame) {
+                            // Cycle to next page (4 channels per page)
+                            int max_pages = (num_channels + 3) / 4;  // Round up
+                            channel_page_offset = (channel_page_offset + 4) % (max_pages * 4);
+                            if (channel_page_offset >= num_channels) {
+                                channel_page_offset = 0;  // Wrap around
+                            }
+                            tab_pressed_this_frame = false;  // Reset flag
+                        }
+                        
+                        // Calculate which channels to display (up to 4 channels per page)
+                        int channels_per_page = 4;
+                        int start_channel = channel_page_offset;
+                        int end_channel = start_channel + channels_per_page;
+                        if (end_channel > num_channels) {
+                            end_channel = num_channels;
+                        }
+                        int visible_channels = end_channel - start_channel;
+                        
                         // Calculate layout (cache for performance)
                         static int cached_line_height = 0;
                         static int cached_max_rows = 0;
@@ -1155,10 +1291,11 @@ void app_main(void) {
                             const int content_height = CONTENT_HEIGHT;  // 470 (480 - 5 - 5)
                             int available_width = (int)(content_width * 0.85);
                             int ch_width_estimate = available_width / num_channels;
-                            // Scale line height from 10px to 18px based on channel width
-                            int estimated_line_height = 10 + (ch_width_estimate - 40) * 8 / 200;
-                            if (estimated_line_height < 10) estimated_line_height = 10;
-                            if (estimated_line_height > 18) estimated_line_height = 18;
+                            // Scale line height from 16px to 32px based on channel width (8x16 font needs larger range)
+                            // This ensures font_scale of at least 1 (16px) up to 2 (32px) for 8x16 font
+                            int estimated_line_height = 16 + (ch_width_estimate - 40) * 16 / 200;
+                            if (estimated_line_height < 16) estimated_line_height = 16;
+                            if (estimated_line_height > 32) estimated_line_height = 32;
                             
                             // Calculate font_scale based on estimated line_height
                             int font_scale = (estimated_line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
@@ -1181,7 +1318,7 @@ void app_main(void) {
                         int ch_width = cached_ch_width;
                         
                         // Header height should align with line_height to prevent partial rows showing
-                        // Use 1 * line_height + 3 for header area (text is scaled 2x = 16px, so fits in 1 row, plus 3px extra to prevent sliver)
+                        // Use 1 * line_height + 3 for header area (text is scaled 2x = 32px with 8x16 font, so fits in 1 row, plus 3px extra to prevent sliver)
                         // Header starts at MARGIN_TOP and is 1 * line_height + 3 pixels tall
                         int header_height = line_height * 1 + 3;
                         int header_y = MARGIN_TOP + header_height;  // First row starts immediately after header
@@ -1199,7 +1336,7 @@ void app_main(void) {
                         
                         // Get direct framebuffer access for scrolling (RGB565 = 2 bytes per pixel)
                         // Logical landscape framebuffer: 800 pixels wide, 480 pixels tall
-                        uint16_t *fb_pixels = fb;  // Direct framebuffer access
+                        uint16_t *fb_pixels = CURRENT_FB;  // Direct framebuffer access
                         const int logical_width = FB_WIDTH;  // 800
                         const int logical_height = FB_HEIGHT;  // 480
                         int stride = logical_width;  // Pixels per row in landscape framebuffer (800)
@@ -1210,7 +1347,7 @@ void app_main(void) {
                             // This ensures no sliver of content shows below the header and prevents smudging when updating
                             // Header area is 1 * line_height + 3 pixels tall (extra 3px to prevent sliver)
                             // Use PPA Fill for hardware-accelerated clearing
-                            ppa_fill_rect(fb, FB_WIDTH, FB_HEIGHT, 0, MARGIN_TOP, FB_WIDTH, header_height, RGB565_BLACK);
+                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, MARGIN_TOP, FB_WIDTH, header_height, RGB565_BLACK);
                             
                             float header_vol = 0.0f;
                             if (audio_get_volume(&header_vol) == ESP_OK) {
@@ -1225,7 +1362,7 @@ void app_main(void) {
                                 if (header_len >= (int)sizeof(header_text)) {
                                     header_text[sizeof(header_text) - 1] = '\0';
                                 }
-                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, MARGIN_TOP, RGB565_WHITE, 2, header_text);
+                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, MARGIN_TOP, RGB565_WHITE, 2, header_text);
                             }
                         }
                         
@@ -1253,7 +1390,7 @@ void app_main(void) {
                             // First render - draw empty rows from top, then first actual row at bottom
                             // The last empty row must be exactly one line_height above the first actual row
                             // First render - full screen (fb_fill already clears all margins)
-                            ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                             
                             // Draw header on first render (always clear to ensure exact alignment)
                             draw_header();
@@ -1264,15 +1401,43 @@ void app_main(void) {
                             // Don't draw empty rows - just draw the first actual row at the bottom
                             int y = first_actual_row_y;
                             
-                            // Draw current frame data directly (not from history)
+                            // Draw current frame data directly (not from history) - with pagination and centering
                             {
-                                int x = MARGIN_LEFT;
-                                int max_x = FB_WIDTH - MARGIN_RIGHT;
-                                for (int ch = 0; ch < num_channels && ch < XMP_MAX_CHANNELS; ch++) {
-                                    if (x >= max_x) break;
-                                    
+                                int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
+                                if (font_scale < 1) font_scale = 1;
+                                if (font_scale > 3) font_scale = 3;
+                                
+                                // First pass: calculate total width of visible channels
+                                int total_width = 0;
+                                int channel_widths[4];  // Max 4 channels per page
+                                const char *separator = " ";
+                                int separator_width = strlen(separator) * FONT_WIDTH * font_scale;
+                                
+                                for (int i = 0; i < visible_channels; i++) {
+                                    int ch = start_channel + i;
                                     struct xmp_channel_info *ci = &frame_info.channel_info[ch];
-                                    
+                                    char ch_str[64];
+                                    format_channel_string(ch_str, sizeof(ch_str), 
+                                                         ci->event.note, ci->event.ins, 
+                                                         ci->event.fxt, ci->event.fxp,
+                                                         use_compact_format, note_names);
+                                    channel_widths[i] = strlen(ch_str) * FONT_WIDTH * font_scale;
+                                    total_width += channel_widths[i];
+                                    // Add separator width between channels (not after last)
+                                    if (i < visible_channels - 1) {
+                                        total_width += separator_width;
+                                    }
+                                }
+                                
+                                // Calculate starting X position to center the channels
+                                int content_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+                                int start_x = MARGIN_LEFT + (content_width - total_width) / 2;
+                                
+                                // Second pass: render channels centered
+                                int x = start_x;
+                                for (int i = 0; i < visible_channels; i++) {
+                                    int ch = start_channel + i;
+                                    struct xmp_channel_info *ci = &frame_info.channel_info[ch];
                                     char ch_str[64];
                                     format_channel_string(ch_str, sizeof(ch_str), 
                                                          ci->event.note, ci->event.ins, 
@@ -1281,24 +1446,19 @@ void app_main(void) {
                                     
                                     bool channel_muted = false;
                                     mod_player_get_channel_mute(ch, &channel_muted);
-                                    uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
+                                    uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % MOD_MAX_CHANNELS];
                                     
-                                    int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
-                                    if (font_scale < 1) font_scale = 1;
-                                    if (font_scale > 3) font_scale = 3;
+                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
+                                    x += channel_widths[i];
                                     
-                                    int text_width = strlen(ch_str) * FONT_WIDTH * font_scale;
-                                    
-                                    if (x < max_x) {
-                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
-                                    }
-                                    
-                                    x += text_width;
-                                    
-                                    if (ch < num_channels - 1 && x < max_x) {
-                                        const char *separator = use_compact_format ? "|" : "  |  ";
-                                        font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
-                                        x += strlen(separator) * FONT_WIDTH * font_scale;
+                                    // Draw separator and vertical line between channels (not after last)
+                                    if (i < visible_channels - 1) {
+                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
+                                        int line_x = x + separator_width / 2;  // Middle of the space
+                                        int line_top = header_y;  // Start from header bottom
+                                        int line_bottom = logical_height - MARGIN_BOTTOM;  // End at content bottom
+                                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, line_x, line_top, 1, line_bottom - line_top, RGB565_GRAY);
+                                        x += separator_width;
                                     }
                                 }
                             }
@@ -1463,18 +1623,47 @@ void app_main(void) {
                                     if (row_clear_y < row_clear_end) {
                                         int clear_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
                                         int clear_height = row_clear_end - row_clear_y;
-                                        ppa_fill_rect(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, row_clear_y, clear_width, clear_height, RGB565_BLACK);
+                                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, row_clear_y, clear_width, clear_height, RGB565_BLACK);
                                     }
                                     
-                                    // Draw the row from history
+                                    // Draw the row from history - with pagination and centering
                                     struct tracker_tick *tick = &tick_history[history_idx];
-                                    int x = MARGIN_LEFT;
-                                    int max_x = FB_WIDTH - MARGIN_RIGHT;
-                                    for (int ch = 0; ch < tick->num_channels && ch < XMP_MAX_CHANNELS; ch++) {
-                                        if (x >= max_x) break;
-                                        
+                                    int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
+                                    if (font_scale < 1) font_scale = 1;
+                                    if (font_scale > 3) font_scale = 3;
+                                    
+                                    // Calculate total width of visible channels
+                                    int total_width = 0;
+                                    int channel_widths[4];  // Max 4 channels per page
+                                    const char *separator = " ";
+                                    int separator_width = strlen(separator) * FONT_WIDTH * font_scale;
+                                    
+                                    for (int i = 0; i < visible_channels; i++) {
+                                        int ch = start_channel + i;
+                                        if (ch >= tick->num_channels) break;
                                         struct xmp_channel_info *ci = &tick->channels[ch];
-                                        
+                                        char ch_str[64];
+                                        format_channel_string(ch_str, sizeof(ch_str), 
+                                                             ci->event.note, ci->event.ins, 
+                                                             ci->event.fxt, ci->event.fxp,
+                                                             use_compact_format, note_names);
+                                        channel_widths[i] = strlen(ch_str) * FONT_WIDTH * font_scale;
+                                        total_width += channel_widths[i];
+                                        if (i < visible_channels - 1) {
+                                            total_width += separator_width;
+                                        }
+                                    }
+                                    
+                                    // Calculate starting X position to center the channels
+                                    int content_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+                                    int start_x = MARGIN_LEFT + (content_width - total_width) / 2;
+                                    
+                                    // Render channels centered
+                                    int x = start_x;
+                                    for (int i = 0; i < visible_channels; i++) {
+                                        int ch = start_channel + i;
+                                        if (ch >= tick->num_channels) break;
+                                        struct xmp_channel_info *ci = &tick->channels[ch];
                                         char ch_str[64];
                                         format_channel_string(ch_str, sizeof(ch_str), 
                                                              ci->event.note, ci->event.ins, 
@@ -1483,24 +1672,19 @@ void app_main(void) {
                                         
                                         bool channel_muted = false;
                                         mod_player_get_channel_mute(ch, &channel_muted);
-                                        uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
+                                        uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % MOD_MAX_CHANNELS];
                                         
-                                        int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
-                                        if (font_scale < 1) font_scale = 1;
-                                        if (font_scale > 3) font_scale = 3;
+                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
+                                        x += channel_widths[i];
                                         
-                                        int text_width = strlen(ch_str) * FONT_WIDTH * font_scale;
-                                        
-                                        if (x < max_x) {
-                                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
-                                        }
-                                        
-                                        x += text_width;
-                                        
-                                        if (ch < tick->num_channels - 1 && x < max_x) {
-                                            const char *separator = use_compact_format ? "|" : "  |  ";
-                                            font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
-                                            x += strlen(separator) * FONT_WIDTH * font_scale;
+                                        // Draw separator and vertical line between channels (not after last)
+                                        if (i < visible_channels - 1) {
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
+                                            int line_x = x + separator_width / 2;  // Middle of the space
+                                            int line_top = header_y;  // Start from header bottom
+                                            int line_bottom = logical_height - MARGIN_BOTTOM;  // End at content bottom
+                                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, line_x, line_top, 1, line_bottom - line_top, RGB565_GRAY);
+                                            x += separator_width;
                                         }
                                     }
                                 }
@@ -1524,16 +1708,44 @@ void app_main(void) {
                                         if (row_clear_y < row_clear_end) {
                                             int clear_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
                                             int clear_height = row_clear_end - row_clear_y;
-                                            ppa_fill_rect(fb, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, row_clear_y, clear_width, clear_height, RGB565_BLACK);
+                                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, row_clear_y, clear_width, clear_height, RGB565_BLACK);
                                         }
                                         
-                                        int x = MARGIN_LEFT;
-                                        int max_x = FB_WIDTH - MARGIN_RIGHT;
-                                        for (int ch = 0; ch < num_channels && ch < XMP_MAX_CHANNELS; ch++) {
-                                            if (x >= max_x) break;
-                                            
+                                        // Render pending row with pagination and centering
+                                        int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
+                                        if (font_scale < 1) font_scale = 1;
+                                        if (font_scale > 3) font_scale = 3;
+                                        
+                                        // Calculate total width of visible channels
+                                        int total_width = 0;
+                                        int channel_widths[4];  // Max 4 channels per page
+                                        const char *separator = " ";
+                                        int separator_width = strlen(separator) * FONT_WIDTH * font_scale;
+                                        
+                                        for (int i = 0; i < visible_channels; i++) {
+                                            int ch = start_channel + i;
                                             struct xmp_channel_info *ci = &pending_tick.channels[ch];
-                                            
+                                            char ch_str[64];
+                                            format_channel_string(ch_str, sizeof(ch_str), 
+                                                                 ci->event.note, ci->event.ins, 
+                                                                 ci->event.fxt, ci->event.fxp,
+                                                                 use_compact_format, note_names);
+                                            channel_widths[i] = strlen(ch_str) * FONT_WIDTH * font_scale;
+                                            total_width += channel_widths[i];
+                                            if (i < visible_channels - 1) {
+                                                total_width += separator_width;
+                                            }
+                                        }
+                                        
+                                        // Calculate starting X position to center the channels
+                                        int content_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+                                        int start_x = MARGIN_LEFT + (content_width - total_width) / 2;
+                                        
+                                        // Render channels centered
+                                        int x = start_x;
+                                        for (int i = 0; i < visible_channels; i++) {
+                                            int ch = start_channel + i;
+                                            struct xmp_channel_info *ci = &pending_tick.channels[ch];
                                             char ch_str[64];
                                             format_channel_string(ch_str, sizeof(ch_str), 
                                                                  ci->event.note, ci->event.ins, 
@@ -1542,43 +1754,40 @@ void app_main(void) {
                                             
                                             bool channel_muted = false;
                                             mod_player_get_channel_mute(ch, &channel_muted);
-                                            uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % XMP_MAX_CHANNELS];
+                                            uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % MOD_MAX_CHANNELS];
                                             
-                                            int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
-                                            if (font_scale < 1) font_scale = 1;
-                                            if (font_scale > 3) font_scale = 3;
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
+                                            x += channel_widths[i];
                                             
-                                            int text_width = strlen(ch_str) * FONT_WIDTH * font_scale;
-                                            
-                                            if (x < max_x) {
-                                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
-                                            }
-                                            
-                                            x += text_width;
-                                            
-                                            if (ch < num_channels - 1 && x < max_x) {
-                                                const char *separator = use_compact_format ? "|" : "  |  ";
-                                                font_draw_string_scaled(fb, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
-                                                x += strlen(separator) * FONT_WIDTH * font_scale;
+                                            // Draw separator and vertical line between channels (not after last)
+                                            if (i < visible_channels - 1) {
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
+                                                int line_x = x + separator_width / 2;  // Middle of the space
+                                                int line_top = header_y;  // Start from header bottom
+                                                int line_bottom = logical_height - MARGIN_BOTTOM;  // End at content bottom
+                                                ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, line_x, line_top, 1, line_bottom - line_top, RGB565_GRAY);
+                                                x += separator_width;
                                             }
                                         }
                                     }
                             }
                             
                             // No need to draw empty rows - just let the background show through
-                            
-                            // Always blit to update display (smooth scrolling means we update every frame)
-                            PROFILING_START(blit);
-                            blit(-1, 0);
-                            PROFILING_END(blit, blit);
                         }
                     }
                     
                     PROFILING_END(render, render);
                     // Note: last_row is now updated when we finish scrolling, not immediately
                     // This allows smooth scrolling to complete before marking the row as processed
+                    did_render = true;  // Tracker UI always renders (smooth scrolling)
                 }
             }
+        }
+        
+        // Only call blit() if we actually rendered something this frame
+        // This prevents unnecessary rotation and display updates when nothing has changed
+        if (did_render) {
+            blit(-1, 0);
         }
         
         PROFILING_END_FRAME(frame);
