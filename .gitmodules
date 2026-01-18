@@ -1,3 +1,10 @@
 [submodule "components/libopenmpt/libopenmpt"]
 	path = components/libopenmpt/libopenmpt
 	url = https://github.com/OpenMPT/openmpt.git
+
+[submodule "components/libxmp"]
+	path = components/libxmp
+	url = https://github.com/libxmp/libxmp.git
+[submodule "components/micromod/micromod"]
+	path = components/micromod/micromod
+	url = https://github.com/martincameron/micromod.git
