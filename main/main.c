@@ -1061,15 +1061,17 @@ void app_main(void) {
                         }
                         } else if (mod_player_is_playing()) {
                             // Volume control during playback
+                            // Actual range: 20%-100%, displayed as 0%-100%
+                            // Step: 5% displayed = 4% actual (0.05 * 0.80)
                             float current_vol = 0.0f;
                             if (audio_get_volume(&current_vol) == ESP_OK) {
                                 float new_vol = current_vol;
                                 if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_UP) {
-                                    new_vol += 0.05f;  // Increase by 5%
-                                    if (new_vol > 0.90f) new_vol = 0.90f;  // Cap at 90%
+                                    new_vol += 0.04f;  // 5% display step
+                                    if (new_vol > 1.00f) new_vol = 1.00f;  // Cap at 100%
                                 } else if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_DOWN) {
-                                    new_vol -= 0.05f;  // Decrease by 5%
-                                    if (new_vol < 0.30f) new_vol = 0.30f;  // Cap at 30%
+                                    new_vol -= 0.04f;  // 5% display step
+                                    if (new_vol < 0.20f) new_vol = 0.20f;  // Cap at 20%
                                 }
                                 audio_set_volume(new_vol);
                             }
@@ -1607,10 +1609,13 @@ void app_main(void) {
                                                     THEME_TEXT_PRIMARY, 1, mod_name);
 
                             // Draw volume right-aligned
+                            // Map actual volume (20%-100%) to display (0%-100%)
                             float header_vol = 0.0f;
                             if (audio_get_volume(&header_vol) == ESP_OK) {
                                 char vol_text[16];
-                                int vol_percent = (int)(header_vol * 100.0f);
+                                int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
+                                if (vol_percent < 0) vol_percent = 0;
+                                if (vol_percent > 100) vol_percent = 100;
                                 snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
                                 int vol_width = strlen(vol_text) * FONT_WIDTH;  // font_scale = 1
                                 int vol_x = FB_WIDTH - MARGIN_RIGHT - vol_width;
