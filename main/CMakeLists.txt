@@ -35,6 +35,10 @@ idf_component_register(
 		"file_browser.c"
 		"simple_font.c"
 		"profiling.c"
+		"ui_primitives.c"
+		"spectrum_analyzer.c"
+		"stb_image_impl.c"
+		"fkey_icons.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
@@ -46,6 +50,7 @@ idf_component_register(
 		micromod
 		esp_driver_sdmmc
 		esp_driver_ppa
+		esp-dsp
 	INCLUDE_DIRS
 		"."
 )

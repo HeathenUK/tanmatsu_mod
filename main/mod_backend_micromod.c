@@ -321,11 +321,17 @@ esp_err_t micromod_backend_get_frame_info(micromod_backend_t *ctx, micromod_fram
                 // IBXM uses separate volume column and effect, map to fxt/fxp
                 frame_info->channel_info[ch].event.fxt = fxt;
                 frame_info->channel_info[ch].event.fxp = fxp;
+                // Use volume column for VU display (IBXM provides 0-64 range)
+                // If volume is 0 and no note, use 0; otherwise scale
+                frame_info->channel_info[ch].volume = vol;
+                frame_info->channel_info[ch].period = 0;  // IBXM doesn't expose period easily
             } else {
                 frame_info->channel_info[ch].event.note = 0;
                 frame_info->channel_info[ch].event.ins = 0;
                 frame_info->channel_info[ch].event.fxt = 0;
                 frame_info->channel_info[ch].event.fxp = 0;
+                frame_info->channel_info[ch].volume = 0;
+                frame_info->channel_info[ch].period = 0;
             }
         }
     }
@@ -336,6 +342,8 @@ esp_err_t micromod_backend_get_frame_info(micromod_backend_t *ctx, micromod_fram
         frame_info->channel_info[ch].event.ins = 0;
         frame_info->channel_info[ch].event.fxt = 0;
         frame_info->channel_info[ch].event.fxp = 0;
+        frame_info->channel_info[ch].volume = 0;
+        frame_info->channel_info[ch].period = 0;
     }
 
     return ESP_OK;

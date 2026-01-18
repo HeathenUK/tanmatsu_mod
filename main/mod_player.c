@@ -6,6 +6,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <string.h>
 
 // Unified backend interface (selects libxmp or libopenmpt at compile time)
@@ -23,9 +24,11 @@ static const char *TAG = "mod_player";
 static mod_backend_t *mod_ctx = NULL;
 static i2s_chan_handle_t i2s_handle = NULL;
 static uint32_t sample_rate = MOD_CONFIG_SAMPLE_RATE;
-static bool mod_loaded = false;
-static bool mod_playing = false;
+static volatile bool mod_loaded = false;   // volatile for cross-task visibility
+static volatile bool mod_playing = false;  // volatile for cross-task visibility
+static volatile bool mod_paused = false;   // volatile for cross-task visibility
 static TaskHandle_t mod_task_handle = NULL;
+static SemaphoreHandle_t playback_mutex = NULL;  // Protects play_buffer/end_player from racing
 
 // Task stack in PSRAM (much larger than SRAM allows)
 #define MOD_TASK_STACK_SIZE MOD_CONFIG_TASK_STACK_SIZE
@@ -52,13 +55,20 @@ static void mod_playback_task(void *arg) {
     // ESP_LOGI(TAG, "MOD playback task started");  // Commented out - logging disabled
 
     while (1) {
-        // Only play if MOD is loaded, playing flag is set, and we have valid handles
-        if (mod_playing && mod_loaded && mod_ctx && i2s_handle) {
-            // Render MOD audio (format from config, 16-bit)
-            // mod_backend_play_buffer expects buffer size in bytes (samples * sizeof(int16_t))
-            int rc = mod_backend_play_buffer(mod_ctx, mono_buffer, sizeof(mono_buffer), MOD_CONFIG_DEFAULT_LOOP);
-            
-            if (rc == 0) {
+        // Only play if MOD is loaded, playing flag is set, not paused, and we have valid handles
+        if (mod_playing && !mod_paused && mod_loaded && mod_ctx && i2s_handle) {
+            // Acquire mutex before calling play_buffer to prevent race with stop()
+            if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                // Re-check mod_playing and mod_paused after acquiring mutex (stop() may have set it false while we waited)
+                int rc = -1;
+                if (mod_playing && !mod_paused) {
+                    // Render MOD audio (format from config, 16-bit)
+                    // mod_backend_play_buffer expects buffer size in bytes (samples * sizeof(int16_t))
+                    rc = mod_backend_play_buffer(mod_ctx, mono_buffer, sizeof(mono_buffer), MOD_CONFIG_DEFAULT_LOOP);
+                }
+                xSemaphoreGive(playback_mutex);
+
+                if (rc == 0) {
                 // First write after starting - logging commented out
                 // static bool first_write = true;
                 // if (first_write) {
@@ -117,13 +127,19 @@ static void mod_playback_task(void *arg) {
                     // Write 4 buffers quickly to fill DMA buffer
                     for (int j = 0; j < 4; j++) {
                         size_t temp_written = 0;
-                        i2s_channel_write(i2s_handle, stereo_buffer, sizeof(stereo_buffer), 
+                        i2s_channel_write(i2s_handle, stereo_buffer, sizeof(stereo_buffer),
                                          &temp_written, 0);  // Non-blocking for quick fill
                         if (temp_written < sizeof(stereo_buffer)) {
                             break;  // Buffer full, stop pre-filling
                         }
-                        // Get next buffer from backend for pre-fill
-                        int pre_rc = mod_backend_play_buffer(mod_ctx, mono_buffer, sizeof(mono_buffer), MOD_CONFIG_DEFAULT_LOOP);
+                        // Get next buffer from backend for pre-fill (with mutex protection)
+                        int pre_rc = -1;
+                        if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                            if (mod_playing) {
+                                pre_rc = mod_backend_play_buffer(mod_ctx, mono_buffer, sizeof(mono_buffer), MOD_CONFIG_DEFAULT_LOOP);
+                            }
+                            xSemaphoreGive(playback_mutex);
+                        }
                         if (pre_rc != 0) break;
                         for (int i = 0; i < MOD_BUFFER_SAMPLES; i++) {
                             stereo_buffer[i * 2 + 0] = mono_buffer[i];
@@ -145,12 +161,13 @@ static void mod_playback_task(void *arg) {
                 // No yield needed - blocking I2S write already handles timing
                 // Large buffer (4096 samples ~93ms) provides sufficient headroom
                 // Logging commented out - removed ret check and all logging statements
-            } else {
-                // Playback ended or error
-                // ESP_LOGI(TAG, "MOD playback ended (rc=%d) after %lu buffers", rc, buffer_count);
-                mod_playing = false;
-                buffer_count = 0;
-            }
+                } else {
+                    // Playback ended or error
+                    // ESP_LOGI(TAG, "MOD playback ended (rc=%d) after %lu buffers", rc, buffer_count);
+                    mod_playing = false;
+                    buffer_count = 0;
+                }
+            }  // xSemaphoreTake block
         } else {
             // Not playing, write silence to prevent audio glitches
             if (i2s_handle) {
@@ -178,6 +195,13 @@ esp_err_t mod_player_init(uint32_t sample_rate_in) {
     if (ret != ESP_OK || i2s_handle == NULL) {
         ESP_LOGE(TAG, "I2S handle not available - call audio_init() first");
         return ESP_ERR_INVALID_STATE;
+    }
+
+    // Create mutex to protect play_buffer/end_player from racing
+    playback_mutex = xSemaphoreCreateMutex();
+    if (playback_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create playback mutex");
+        return ESP_ERR_NO_MEM;
     }
 
     // Create backend context
@@ -332,8 +356,21 @@ esp_err_t mod_player_stop(void) {
         return ESP_OK;
     }
 
-    mod_backend_end_player(mod_ctx);
+    // Set flags FIRST to signal audio task to stop calling play_buffer
     mod_playing = false;
+    mod_paused = false;  // Reset paused state when stopping
+
+    // Acquire mutex to ensure audio task has finished any in-progress play_buffer call
+    // This guarantees we don't call end_player while play_buffer is running
+    if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        mod_backend_end_player(mod_ctx);
+        xSemaphoreGive(playback_mutex);
+    } else {
+        // Timeout - force end anyway (shouldn't happen normally)
+        ESP_LOGW(TAG, "Timeout waiting for playback mutex in stop()");
+        mod_backend_end_player(mod_ctx);
+    }
+
     ESP_LOGI(TAG, "MOD playback stopped");
     return ESP_OK;
 }
@@ -374,6 +411,8 @@ esp_err_t mod_player_get_frame_info(struct xmp_frame_info *frame_info) {
         frame_info->channel_info[ch].event.ins = mod_frame.channel_info[ch].event.ins;
         frame_info->channel_info[ch].event.fxt = mod_frame.channel_info[ch].event.fxt;
         frame_info->channel_info[ch].event.fxp = mod_frame.channel_info[ch].event.fxp;
+        frame_info->channel_info[ch].volume = mod_frame.channel_info[ch].volume;
+        frame_info->channel_info[ch].period = mod_frame.channel_info[ch].period;
     }
     
     return ESP_OK;
@@ -473,6 +512,26 @@ esp_err_t mod_player_get_order_pattern(int order, int *pattern) {
     if (mod_ctx == NULL || !mod_loaded || pattern == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    
+
     return mod_backend_get_order_pattern(mod_ctx, order, pattern);
+}
+
+esp_err_t mod_player_pause(void) {
+    if (!mod_playing) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    mod_paused = true;
+    return ESP_OK;
+}
+
+esp_err_t mod_player_resume(void) {
+    if (!mod_playing) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    mod_paused = false;
+    return ESP_OK;
+}
+
+bool mod_player_is_paused(void) {
+    return mod_paused;
 }

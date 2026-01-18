@@ -30,7 +30,8 @@ struct xmp_event {
 
 struct xmp_channel_info {
     struct xmp_event event;
-    // Add other fields as needed
+    uint8_t volume;    // Channel volume (0-64)
+    uint16_t period;   // Note period (for pitch display)
 };
 
 struct xmp_frame_info {

@@ -2,3 +2,4 @@ dependencies:
   idf: '>=5.5.0'
   badgeteam/badge-bsp: "^0.8.0"
   nicolaielectronics/tanmatsu-wifi: "^1.0.1"
+  espressif/esp-dsp: "^1.4.0"

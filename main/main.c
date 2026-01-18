@@ -35,9 +35,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "ui_theme.h"
+#include "ui_primitives.h"
+#include "ui_icons.h"
+#include "spectrum_analyzer.h"
+#include "esp_vfs_fat.h"
+#include "wear_levelling.h"
+#include "fkey_icons.h"
 
 // Constants
 static char const TAG[] = "main";
+
+// Internal flash wear levelling handle
+static wl_handle_t int_flash_wl_handle = WL_INVALID_HANDLE;
 
 // Logical landscape framebuffer dimensions (matches physical display orientation)
 // Will be rotated 270° CCW via PPA when sending to ST7701S (native 480x800 portrait)
@@ -70,6 +80,45 @@ static ppa_client_handle_t ppa_fill_handle = NULL;  // PPA Fill client for hardw
 static QueueHandle_t input_event_queue = NULL;
 static int channel_page_offset = 0;  // Channel pagination: offset for current page (0-4-8-12...)
 static bool tab_pressed_this_frame = false;  // Flag set by Tab key handler, checked during rendering
+
+// Playback view modes
+typedef enum {
+    VIEW_TRACKER,    // Normal tracker display with channel data
+    VIEW_SPECTRUM,   // FFT spectrum analyzer visualization
+    VIEW_INFO        // Module info display
+} playback_view_t;
+static playback_view_t current_view = VIEW_TRACKER;
+static bool view_key_pressed = false;  // 'V' key pressed flag for view toggle
+
+// VU meter state (volume decay tracking for smooth animation)
+static float channel_vu_levels[MOD_MAX_CHANNELS] = {0};
+static float channel_vu_peaks[MOD_MAX_CHANNELS] = {0};
+
+// VU meter layout cache (updated by tracker rendering, used by VU overlay)
+static int vu_cached_line_height = 32;   // Row height for VU meter sizing
+static int vu_start_channel = 0;         // First visible channel
+static int vu_visible_channels = 4;      // Number of visible channels
+static int vu_channel_x[4] = {0};        // X position of each visible channel column
+static int vu_channel_width[4] = {0};    // Width of each visible channel column
+static uint32_t channel_peak_hold[MOD_MAX_CHANNELS] = {0};
+#define VU_DECAY_RATE 0.08f      // Decay per frame (lower = smoother)
+#define VU_ATTACK_RATE 0.4f      // Attack per frame (lower = smoother, less flicker)
+#define MAX_MOD_FILE_SIZE (10 * 1024 * 1024)  // 10MB max file size
+#define VU_PEAK_DECAY_RATE 0.02f // Peak decay per frame
+#define VU_PEAK_HOLD_FRAMES 20   // Frames to hold peak before decay
+
+// Spectrum analyzer instance
+static spectrum_analyzer_t *spectrum = NULL;
+
+// File browser animation state
+static int browser_anim_target_y = 0;
+static int browser_anim_current_y = 0;
+static int browser_anim_start_y = 0;   // Starting Y position for animation (fixed during anim)
+static TickType_t browser_anim_start = 0;
+static int browser_last_selected = -1;
+static int browser_last_count = -1;   // Track file count to detect directory changes
+static int browser_last_start_idx = -1;  // Track scroll position to reset animation on scroll
+#define BROWSER_ANIM_DURATION_MS 100
 
 #define CURRENT_FB (fb)
 
@@ -256,61 +305,159 @@ static void IRAM_ATTR format_channel_string(char *ch_str, size_t ch_str_size,
         strcpy(note_str, use_compact ? "--" : "---");
     }
     
-    if (fxt == 0 && fxp == 0) {
-        snprintf(ch_str, ch_str_size, "%s %02X ----", note_str, ins);
+    // Format instrument: "--" if no instrument, else hex value
+    char ins_str[3];
+    if (ins == 0) {
+        strcpy(ins_str, "--");
     } else {
-        snprintf(ch_str, ch_str_size, "%s %02X %02X%02X", note_str, ins, fxt, fxp);
+        snprintf(ins_str, sizeof(ins_str), "%02X", ins);
+    }
+
+    if (fxt == 0 && fxp == 0) {
+        snprintf(ch_str, ch_str_size, "%s %s ----", note_str, ins_str);
+    } else {
+        snprintf(ch_str, ch_str_size, "%s %s %02X%02X", note_str, ins_str, fxt, fxp);
     }
 }
 
 static void draw_file_browser(file_browser_t *browser) {
     const int font_scale = 2;
-    const int line_height = FONT_HEIGHT * font_scale;
-    
-    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-    
-    int y = MARGIN_TOP;
-    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, RGB565_WHITE, font_scale, "MOD file browser");
-    y += line_height;
-    
-    char path_text[128];
-    int path_len = snprintf(path_text, sizeof(path_text), "Path: %s", browser->current_path);
+    const int row_height = THEME_ROW_HEIGHT_MD;  // 32px per row
+    const int header_height = THEME_HEADER_HEIGHT;  // 40px header
+    const int icon_size = UI_ICON_WIDTH;
+    const int icon_padding = THEME_ICON_PADDING;
+    const int text_offset_x = MARGIN_LEFT + icon_size + icon_padding * 2;
+
+    // Clear background
+    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
+
+    // Draw header with gradient
+    ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                      0, MARGIN_TOP, FB_WIDTH, header_height,
+                      THEME_BG_HEADER, THEME_BG_PRIMARY);
+
+    // Header title (centered)
+    const char *title = "Trackmatsu";
+    int title_width = strlen(title) * FONT_WIDTH * font_scale;
+    int title_x = (FB_WIDTH - title_width) / 2;
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                            title_x, MARGIN_TOP + 4,
+                            THEME_TEXT_PRIMARY, font_scale, title);
+
+    // Path display (below header)
+    int path_y = MARGIN_TOP + header_height + 2;
+    char path_text[80];
+    int path_len = snprintf(path_text, sizeof(path_text), "%s", browser->current_path);
     if (path_len >= (int)sizeof(path_text)) {
         path_text[sizeof(path_text) - 1] = '\0';
     }
-    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, RGB565_WHITE, font_scale, path_text);
-    y += line_height + 2;
-    
-    int start_idx = browser->selected_index > 5 ? browser->selected_index - 5 : 0;
-    int end_idx = start_idx + 10;
-    if (end_idx > browser->count) end_idx = browser->count;
-    
-    int file_list_start_y = y;
-    for (int i = start_idx; i < end_idx; i++) {
-        int file_y = file_list_start_y + (i - start_idx) * line_height;
-        if (i == browser->selected_index) {
-            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, file_y, CONTENT_WIDTH, line_height, argb32_to_rgb565(0xFF0000FF));
-        }
-        char name[64];
-        if (strcmp(browser->files[i].filename, "..") == 0) {
-            snprintf(name, sizeof(name), "[..]");
-        } else {
-            int name_len = snprintf(name, sizeof(name), "%s%s", browser->files[i].is_dir ? "[" : "", browser->files[i].filename);
-            if (name_len >= (int)sizeof(name)) {
-                name[sizeof(name) - 1] = '\0';
-            }
-            if (browser->files[i].is_dir) {
-                int len = strlen(name);
-                if (len < (int)sizeof(name) - 1) {
-                    name[len] = ']';
-                    name[len + 1] = '\0';
-                }
-            }
-        }
-        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT + 4, file_y, RGB565_WHITE, font_scale, name);
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                            MARGIN_LEFT, path_y,
+                            THEME_TEXT_SECONDARY, 1, path_text);
+
+    // File list area
+    int file_list_y = path_y + FONT_HEIGHT + 8;
+    int visible_rows = (FB_HEIGHT - file_list_y - MARGIN_BOTTOM - row_height) / row_height;
+    if (visible_rows > 12) visible_rows = 12;
+
+    // Calculate visible range (center selection when possible)
+    int half_visible = visible_rows / 2;
+    int start_idx = browser->selected_index - half_visible;
+    if (start_idx < 0) start_idx = 0;
+    int end_idx = start_idx + visible_rows;
+    if (end_idx > browser->count) {
+        end_idx = browser->count;
+        start_idx = end_idx - visible_rows;
+        if (start_idx < 0) start_idx = 0;
     }
-    
-    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, FB_HEIGHT - MARGIN_BOTTOM - line_height, RGB565_WHITE, font_scale, "UP/DN: navigate  RT/ENT: select  LT: back");
+
+    // Detect directory change or scroll - reset animation state
+    if (browser_last_count != browser->count || browser_last_start_idx != start_idx) {
+        browser_last_selected = -1;
+        browser_last_count = browser->count;
+        browser_last_start_idx = start_idx;
+    }
+
+    // Draw alternating row backgrounds
+    for (int i = start_idx; i < end_idx; i++) {
+        int row_idx = i - start_idx;
+        int row_y = file_list_y + row_idx * row_height;
+        uint16_t row_bg = (row_idx % 2 == 0) ? THEME_BG_PRIMARY : THEME_BG_SECONDARY;
+        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                      MARGIN_LEFT, row_y, CONTENT_WIDTH, row_height, row_bg);
+    }
+
+    // Draw icons and text (selected item uses white text)
+    for (int i = start_idx; i < end_idx; i++) {
+        int row_idx = i - start_idx;
+        int row_y = file_list_y + row_idx * row_height;
+
+        // Determine icon and color based on file type
+        bool is_parent = (strcmp(browser->files[i].filename, "..") == 0);
+        bool is_dir = browser->files[i].is_dir;
+        const char *ext = strrchr(browser->files[i].filename, '.');
+        ui_icon_id_t icon_id = ui_get_file_icon_id(ext, is_dir, is_parent);
+
+        // Icon color based on type
+        uint16_t icon_color;
+        switch (icon_id) {
+            case UI_ICON_ID_FOLDER: icon_color = THEME_ACCENT_5; break;  // Magenta
+            case UI_ICON_ID_PARENT: icon_color = THEME_ACCENT_6; break;  // Cyan
+            case UI_ICON_ID_MOD:    icon_color = THEME_ACCENT_1; break;  // Red
+            case UI_ICON_ID_XM:     icon_color = THEME_ACCENT_2; break;  // Green
+            case UI_ICON_ID_S3M:    icon_color = THEME_ACCENT_3; break;  // Blue
+            case UI_ICON_ID_IT:     icon_color = THEME_ACCENT_4; break;  // Yellow
+            default:                icon_color = THEME_TEXT_SECONDARY; break;
+        }
+
+        // Draw icon
+        int icon_y = row_y + (row_height - icon_size) / 2;
+        const uint8_t *icon_data = ui_get_icon(icon_id);
+        if (icon_data) {
+            ui_draw_icon(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                         MARGIN_LEFT + icon_padding, icon_y,
+                         icon_data, UI_ICON_WIDTH, UI_ICON_HEIGHT,
+                         icon_color);
+        }
+
+        // Draw filename
+        char name[64];
+        strncpy(name, browser->files[i].filename, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+
+        int text_y = row_y + (row_height - FONT_HEIGHT * font_scale) / 2;
+        uint16_t text_color = (i == browser->selected_index) ? THEME_TEXT_PRIMARY : THEME_TEXT_SECONDARY;
+        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                text_offset_x, text_y, text_color, font_scale, name);
+    }
+
+    // Footer hint bar (same style as playback views)
+    int hint_bar_height = 20;
+    int hint_bar_y = FB_HEIGHT - MARGIN_BOTTOM - hint_bar_height;
+    ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                  0, hint_bar_y, FB_WIDTH, hint_bar_height, THEME_BG_SECONDARY);
+
+    // Calculate total width for centering
+    // ↑↓ Nav | ⏎ Select | ← Back
+    int gap = 20;
+    int total_width = 0;
+    total_width += FONT_WIDTH * 6 + gap;   // "↑↓ Nav" (6 chars)
+    total_width += FONT_WIDTH * 8 + gap;   // "⏎ Select" (8 chars)
+    total_width += FONT_WIDTH * 6;          // "← Back" (6 chars)
+
+    int hint_x = (FB_WIDTH - total_width) / 2;
+    int text_y = hint_bar_y + (hint_bar_height - FONT_HEIGHT) / 2 + 1;
+
+    // ↑↓ Nav (chars 0x80, 0x81)
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Nav");
+    hint_x += FONT_WIDTH * 6 + gap;
+
+    // ⏎ Select (char 0x84)
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x84 Select");
+    hint_x += FONT_WIDTH * 8 + gap;
+
+    // ← Back (char 0x82)
+    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x82 Back");
 }
 
 static volatile bool gdma_copy_done = false;
@@ -679,6 +826,26 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
+    // Mount internal flash FAT filesystem for icons
+    {
+        esp_vfs_fat_mount_config_t fat_mount_config = {
+            .format_if_mount_failed = false,
+            .max_files = 5,
+            .allocation_unit_size = CONFIG_WL_SECTOR_SIZE,
+            .disk_status_check_enable = false,
+            .use_one_fat = false,
+        };
+        esp_err_t fat_res = esp_vfs_fat_spiflash_mount_rw_wl("/int", "locfd", &fat_mount_config, &int_flash_wl_handle);
+        if (fat_res != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to mount internal flash: %s", esp_err_to_name(fat_res));
+            // Continue anyway - icons won't be available
+        } else {
+            ESP_LOGI(TAG, "Internal flash mounted at /int");
+            // Initialize F-key icons (uses PSRAM for stb_image allocations)
+            fkey_icons_init();
+        }
+    }
+
     // Main section of the app
 
     // This example shows how to read from the BSP event queue to read input events
@@ -798,17 +965,27 @@ void app_main(void) {
                                             fseek(f, 0, SEEK_END);
                                             long file_size = ftell(f);
                                             fseek(f, 0, SEEK_SET);
-                                            
+
+                                            // Reject files larger than 10MB
+                                            if (file_size > MAX_MOD_FILE_SIZE) {
+                                                fclose(f);
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "File too large (>10MB)");
+                                                blit(-1, 0);
+                                                break;
+                                            }
+
                                             // Free previous MOD data if any
                                             if (mod_file_data) {
                                                 free(mod_file_data);
                                             }
-                                            
-                                            mod_file_data = (uint8_t *)malloc(file_size);
+
+                                            // Allocate file buffer in PSRAM for large tracker files
+                                            mod_file_data = (uint8_t *)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
                                             if (mod_file_data) {
                                                 size_t read = fread(mod_file_data, 1, file_size, f);
                                                 fclose(f);
-                                                
+
                                                 if (read == file_size) {
                                                     mod_file_size = file_size;
                                                     // Store file path for display
@@ -816,7 +993,7 @@ void app_main(void) {
                                                     current_mod_path[sizeof(current_mod_path) - 1] = '\0';
                                                     // Show loading message before blocking load operation
                                                     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 
+                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                                                           (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,  // Center horizontally (10 chars * 8px * 2 scale)
                                                                           (FB_HEIGHT - FONT_HEIGHT * 2) / 2,    // Center vertically (16px * 2 scale)
                                                                           RGB565_WHITE, 2, "Loading...");
@@ -827,8 +1004,15 @@ void app_main(void) {
                                                     if (res == ESP_OK) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
+                                                        current_view = VIEW_TRACKER;  // Reset to tracker view
+                                                        // Reset VU meter levels for new module
+                                                        for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
+                                                            channel_vu_levels[i] = 0.0f;
+                                                            channel_vu_peaks[i] = 0.0f;
+                                                            channel_peak_hold[i] = 0;
+                                                        }
                                                         // Clear screen immediately to prevent white flash
-                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
                                                         // Tracker UI will be drawn in main loop
                                                     } else {
                                                     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
@@ -852,7 +1036,7 @@ void app_main(void) {
                                             } else {
                                                 fclose(f);
                                                 ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of PSRAM");
                                                 blit(-1, 0);
                                             }
                                         } else {
@@ -926,11 +1110,25 @@ void app_main(void) {
                         }
                     }
                     
-                    // Handle Tab key (0x0F) for channel page switching during playback
-                    if (!browser_active && mod_player_is_playing() && sc == 0x0F) {
+                    // Handle F4 key (0x3E) for channel page switching during playback
+                    if (!browser_active && mod_player_is_playing() && sc == 0x3E) {
                         tab_pressed_this_frame = true;  // Flag will be checked during rendering
                     }
-                    
+
+                    // Handle F3 key (0x3D) for view mode toggle during playback
+                    if (!browser_active && mod_player_is_playing() && sc == 0x3D) {
+                        view_key_pressed = true;  // Flag will be checked during rendering
+                    }
+
+                    // Handle Space bar (0x39) for pause/resume during playback
+                    if (!browser_active && mod_player_is_playing() && sc == 0x39) {
+                        if (mod_player_is_paused()) {
+                            mod_player_resume();
+                        } else {
+                            mod_player_pause();
+                        }
+                    }
+
                     // Handle number keys (0-9) for channel mute toggle during playback
                     // Standard PC scancodes (Set 1): 0=0x0B, 1-9=0x02-0x0A
                     // Direct mapping: key number = channel number
@@ -990,16 +1188,26 @@ void app_main(void) {
                                         fseek(f, 0, SEEK_END);
                                         long file_size = ftell(f);
                                         fseek(f, 0, SEEK_SET);
-                                        
+
+                                        // Reject files larger than 10MB
+                                        if (file_size > MAX_MOD_FILE_SIZE) {
+                                            fclose(f);
+                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "File too large (>10MB)");
+                                            blit(-1, 0);
+                                            break;
+                                        }
+
                                         if (mod_file_data) {
                                             free(mod_file_data);
                                         }
-                                        
-                                        mod_file_data = (uint8_t *)malloc(file_size);
+
+                                        // Allocate file buffer in PSRAM for large tracker files
+                                        mod_file_data = (uint8_t *)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
                                         if (mod_file_data) {
                                             size_t read = fread(mod_file_data, 1, file_size, f);
                                             fclose(f);
-                                            
+
                                             if (read == file_size) {
                                                 mod_file_size = file_size;
                                                 // Store file path for display
@@ -1007,7 +1215,7 @@ void app_main(void) {
                                                 current_mod_path[sizeof(current_mod_path) - 1] = '\0';
                                                 // Show loading message before blocking load operation
                                                 ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                                                       (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,  // Center horizontally (10 chars * 8px * 2 scale)
                                                                       (FB_HEIGHT - FONT_HEIGHT * 2) / 2,    // Center vertically (16px * 2 scale)
                                                                       RGB565_WHITE, 2, "Loading...");
@@ -1018,8 +1226,15 @@ void app_main(void) {
                                                     if (res == ESP_OK) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
+                                                        current_view = VIEW_TRACKER;  // Reset to tracker view
+                                                        // Reset VU meter levels for new module
+                                                        for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
+                                                            channel_vu_levels[i] = 0.0f;
+                                                            channel_vu_peaks[i] = 0.0f;
+                                                            channel_peak_hold[i] = 0;
+                                                        }
                                                         // Clear screen immediately to prevent white flash
-                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
                                                         // Tracker UI will be drawn in main loop
                                                         browser_needs_redraw = false;  // Don't redraw browser, we're playing now
                                                     } else {
@@ -1087,16 +1302,26 @@ void app_main(void) {
                                     fseek(f, 0, SEEK_END);
                                     long file_size = ftell(f);
                                     fseek(f, 0, SEEK_SET);
-                                    
+
+                                    // Reject files larger than 10MB
+                                    if (file_size > MAX_MOD_FILE_SIZE) {
+                                        fclose(f);
+                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "File too large (>10MB)");
+                                        blit(-1, 0);
+                                        break;
+                                    }
+
                                     if (mod_file_data) {
                                         free(mod_file_data);
                                     }
-                                    
-                                    mod_file_data = (uint8_t *)malloc(file_size);
+
+                                    // Allocate file buffer in PSRAM for large tracker files
+                                    mod_file_data = (uint8_t *)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
                                     if (mod_file_data) {
                                         size_t read = fread(mod_file_data, 1, file_size, f);
                                         fclose(f);
-                                        
+
                                         if (read == file_size) {
                                             mod_file_size = file_size;
                                             // Store file path for display
@@ -1104,7 +1329,7 @@ void app_main(void) {
                                             current_mod_path[sizeof(current_mod_path) - 1] = '\0';
                                             // Show loading message before blocking load operation
                                             ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                                                   (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,  // Center horizontally (10 chars * 8px * 2 scale)
                                                                   (FB_HEIGHT - FONT_HEIGHT * 2) / 2,    // Center vertically (16px * 2 scale)
                                                                   RGB565_WHITE, 2, "Loading...");
@@ -1115,8 +1340,15 @@ void app_main(void) {
                                                     if (res == ESP_OK) {
                                                         browser_active = false;
                                                         mod_info_loaded = false;  // Force reload of module info
+                                                        current_view = VIEW_TRACKER;  // Reset to tracker view
+                                                        // Reset VU meter levels for new module
+                                                        for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
+                                                            channel_vu_levels[i] = 0.0f;
+                                                            channel_vu_peaks[i] = 0.0f;
+                                                            channel_peak_hold[i] = 0;
+                                                        }
                                                         // Clear screen immediately to prevent white flash
-                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
                                                         // Tracker UI will be drawn in main loop
                                                     } else {
                                                     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
@@ -1228,6 +1460,45 @@ void app_main(void) {
                     
                     int num_channels = mod_info.mod ? mod_info.mod->chn : 0;
                     if (num_channels > 0 && num_channels <= MOD_MAX_CHANNELS) {
+                        // Handle view mode toggle ('V' key)
+                        if (view_key_pressed) {
+                            current_view = (playback_view_t)((current_view + 1) % 3);  // Cycle through VIEW_TRACKER, VIEW_SPECTRUM, VIEW_INFO
+                            view_key_pressed = false;
+                            // Clear framebuffer when switching views
+                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
+                        }
+
+                        // Update VU meter decay for smooth animation
+                        for (int ch = 0; ch < num_channels; ch++) {
+                            // Get current volume from frame info
+                            float target_level = (float)frame_info.channel_info[ch].volume / 64.0f;
+
+                            // Smoothed attack and decay to reduce flicker
+                            if (target_level > channel_vu_levels[ch]) {
+                                // Smoothed attack - lerp toward target
+                                channel_vu_levels[ch] += (target_level - channel_vu_levels[ch]) * VU_ATTACK_RATE;
+                            } else {
+                                // Slow decay
+                                channel_vu_levels[ch] *= (1.0f - VU_DECAY_RATE);
+                                if (channel_vu_levels[ch] < 0.01f) {
+                                    channel_vu_levels[ch] = 0.0f;
+                                }
+                            }
+
+                            // Peak hold and decay
+                            if (target_level > channel_vu_peaks[ch]) {
+                                channel_vu_peaks[ch] = target_level;
+                                channel_peak_hold[ch] = VU_PEAK_HOLD_FRAMES;
+                            } else if (channel_peak_hold[ch] > 0) {
+                                channel_peak_hold[ch]--;
+                            } else {
+                                channel_vu_peaks[ch] *= (1.0f - VU_PEAK_DECAY_RATE);
+                                if (channel_vu_peaks[ch] < 0.01f) {
+                                    channel_vu_peaks[ch] = 0.0f;
+                                }
+                            }
+                        }
+
                         // Channel pagination: Show 4 channels per page, switch pages with Tab
                         // Check for Tab key press flag (set by scancode handler)
                         if (tab_pressed_this_frame) {
@@ -1248,7 +1519,11 @@ void app_main(void) {
                             end_channel = num_channels;
                         }
                         int visible_channels = end_channel - start_channel;
-                        
+
+                        // Update global VU meter layout cache
+                        vu_start_channel = start_channel;
+                        vu_visible_channels = visible_channels;
+
                         // Calculate layout (cache for performance)
                         static int cached_line_height = 0;
                         static int cached_max_rows = 0;
@@ -1289,11 +1564,13 @@ void app_main(void) {
                         int line_height = cached_line_height;
                         int max_rows_on_screen = cached_max_rows;
                         int ch_width = cached_ch_width;
-                        
-                        // Header height should align with line_height to prevent partial rows showing
-                        // Use 1 * line_height + 3 for header area (text is scaled 2x = 32px with 8x16 font, so fits in 1 row, plus 3px extra to prevent sliver)
-                        // Header starts at MARGIN_TOP and is 1 * line_height + 3 pixels tall
-                        int header_height = line_height * 1 + 3;
+
+                        // Update global VU line height cache
+                        vu_cached_line_height = line_height;
+
+                        // Header height: use smaller header to maximize tracker content area
+                        // Font scale 1 = 16px text height, add small padding
+                        int header_height = FONT_HEIGHT + 4;  // 20px total
                         int header_y = MARGIN_TOP + header_height;  // First row starts immediately after header
                         
                         // Track volume changes to update header
@@ -1315,26 +1592,31 @@ void app_main(void) {
                         int stride = logical_width;  // Pixels per row in landscape framebuffer (800)
                         
                         void draw_header(void) {
-                            // Always clear header area exactly (from MARGIN_TOP to header_y, which is MARGIN_TOP + header_height)
-                            // This ensures no sliver of content shows below the header and prevents smudging when updating
-                            // Header area is 1 * line_height + 3 pixels tall (extra 3px to prevent sliver)
-                            // Use PPA Fill for hardware-accelerated clearing
-                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, MARGIN_TOP, FB_WIDTH, header_height, RGB565_BLACK);
-                            
+                            // Clear header area with theme background
+                            ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                              0, MARGIN_TOP, FB_WIDTH, header_height,
+                                              THEME_BG_HEADER, THEME_BG_PRIMARY);
+
+                            // Use module metadata name instead of filename
+                            const char *mod_name = (mod_info.mod && mod_info.mod->name[0])
+                                                   ? mod_info.mod->name : "Unknown";
+
+                            // Draw song title on the left (font scale 1 for compact header)
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                    MARGIN_LEFT, MARGIN_TOP + 2,
+                                                    THEME_TEXT_PRIMARY, 1, mod_name);
+
+                            // Draw volume right-aligned
                             float header_vol = 0.0f;
                             if (audio_get_volume(&header_vol) == ESP_OK) {
-                                char header_text[128];
-                                const char *filename = strrchr(current_mod_path, '/');
-                                if (!filename) filename = current_mod_path;
-                                else filename++;
-                                if (!filename[0]) filename = "Unknown";
-                                
+                                char vol_text[16];
                                 int vol_percent = (int)(header_vol * 100.0f);
-                                int header_len = snprintf(header_text, sizeof(header_text), "%s | Vol: %d%%", filename, vol_percent);
-                                if (header_len >= (int)sizeof(header_text)) {
-                                    header_text[sizeof(header_text) - 1] = '\0';
-                                }
-                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, MARGIN_TOP, RGB565_WHITE, 2, header_text);
+                                snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
+                                int vol_width = strlen(vol_text) * FONT_WIDTH;  // font_scale = 1
+                                int vol_x = FB_WIDTH - MARGIN_RIGHT - vol_width;
+                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                        vol_x, MARGIN_TOP + 2,
+                                                        THEME_TEXT_PRIMARY, 1, vol_text);
                             }
                         }
                         
@@ -1362,7 +1644,8 @@ void app_main(void) {
                         bool use_compact_format = (estimated_total_width_full > available_width_pixels);
                         
                         // Calculate center Y position for current row (middle of visible area)
-                        int scrollable_height = FB_HEIGHT - header_y - MARGIN_BOTTOM;
+                        // Reserve line_height at bottom for VU meters
+                        int scrollable_height = FB_HEIGHT - header_y - MARGIN_BOTTOM - line_height;
                         int center_y = header_y + scrollable_height / 2 - line_height / 2;  // Center vertically, accounting for line_height
                         
                         if (!tracker_initialized) {
@@ -1433,8 +1716,8 @@ void app_main(void) {
                                     
                                     bool channel_muted = false;
                                     mod_player_get_channel_mute(ch, &channel_muted);
-                                    uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % MOD_MAX_CHANNELS];
-                                    
+                                    uint16_t ch_color = channel_muted ? THEME_TEXT_MUTED : theme_channel_color(ch);
+
                                     font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
                                     x += channel_widths[i];
                                     
@@ -1469,7 +1752,8 @@ void app_main(void) {
                             
                             // Pattern-timed smooth scrolling: scroll one line_height over the duration of one pattern row
                             // This keeps scrolling in sync with pattern playback
-                            int scrollable_height = FB_HEIGHT - header_y - MARGIN_BOTTOM;
+                            // Reserve line_height at bottom for VU meters
+                            int scrollable_height = FB_HEIGHT - header_y - MARGIN_BOTTOM - line_height;
                             
                             // Track when current row started and its duration
                             static TickType_t row_start_tick = 0;
@@ -1577,13 +1861,11 @@ void app_main(void) {
                             int rows_available = num_visible_rows - 1;  // Reserve 1 for center row
                             int rows_above_center = rows_available / 2;  // Equal split of remaining rows
                             int rows_below_center = rows_available - rows_above_center;  // Rest go below
-                            // Add one more row to pending section (may slightly overflow, that's ok)
-                            rows_below_center += 1;
-                            // Adjust num_visible_rows to account for the extra row
-                            num_visible_rows = rows_above_center + 1 + rows_below_center;  // above + center + below (including extra)
+                            // Keep symmetric: same number above and below (6 and 6 typically)
+                            // No extra rows added - keeps it balanced
+                            num_visible_rows = rows_above_center + 1 + rows_below_center;  // above + center + below
                             int center_row_idx = rows_above_center;  // Center is after all rows above
-                            // Example: 10 visible rows -> 9 available, 4 above + 1 center + 5+1=6 below = 11 total
-                            // Example: 11 visible rows -> 10 available, 5 above + 1 center + 5+1=6 below = 12 total
+                            // Example: 13 visible rows -> 12 available, 6 above + 1 center + 6 below = 13 total
                             
                             // Vertically center all rows in the available space
                             // First, calculate how many rows will actually fit (check if last row would overflow)
@@ -1679,6 +1961,26 @@ void app_main(void) {
                                     }
                                 }
                                 
+                                // Calculate text fade factor based on distance from center row
+                                // Text fades from full brightness at center to near-black at edges
+                                float text_fade = 1.0f;  // 1.0 = full brightness, 0.0 = black
+                                if (!is_current_row) {
+                                    int distance_from_center;
+                                    int max_distance;
+                                    if (row_idx < center_row_idx) {
+                                        distance_from_center = center_row_idx - row_idx;
+                                        max_distance = rows_above_center;
+                                    } else {
+                                        distance_from_center = row_idx - center_row_idx;
+                                        max_distance = rows_below_center;
+                                    }
+                                    float darkness = (max_distance > 0) ? (float)distance_from_center / (float)max_distance : 0.0f;
+                                    if (darkness > 1.0f) darkness = 1.0f;
+                                    // Linear falloff, capped at 70% darkness to keep text legible
+                                    darkness = darkness * 0.7f;
+                                    text_fade = 1.0f - darkness;
+                                }
+
                                 // Draw row if we have data
                                 if (has_data) {
                                     // Draw highlight background for current row only
@@ -1686,7 +1988,7 @@ void app_main(void) {
                                         int highlight_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
                                         ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, highlight_width, line_height, RGB565_DARK_BLUE);
                                     }
-                                    
+
                                     // Calculate font scale
                                     int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
                                     if (font_scale < 1) font_scale = 1;
@@ -1735,7 +2037,20 @@ void app_main(void) {
                                         // Calculate starting X position to center the channels
                                         int content_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
                                         int start_x = MARGIN_LEFT + (content_width - total_width) / 2;
-                                        
+
+                                        // Cache channel positions for VU meter alignment (do once per frame on current row)
+                                        if (is_current_row) {
+                                            int cache_x = start_x;
+                                            for (int i = 0; i < visible_channels && i < 4; i++) {
+                                                vu_channel_x[i] = cache_x;
+                                                vu_channel_width[i] = channel_widths[i];
+                                                cache_x += channel_widths[i];
+                                                if (i < visible_channels - 1) {
+                                                    cache_x += separator_width;
+                                                }
+                                            }
+                                        }
+
                                         // Render channels centered
                                         int x = start_x;
                                         for (int i = 0; i < visible_channels; i++) {
@@ -1759,14 +2074,25 @@ void app_main(void) {
                                             
                                             bool channel_muted = false;
                                             mod_player_get_channel_mute(ch, &channel_muted);
-                                            uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % MOD_MAX_CHANNELS];
-                                            
+                                            uint16_t ch_color = channel_muted ? THEME_TEXT_MUTED : theme_channel_color(ch);
+
+                                            // Apply text fade based on distance from center row
+                                            if (text_fade < 1.0f) {
+                                                uint8_t fade_alpha = (uint8_t)(text_fade * 255.0f);
+                                                ch_color = theme_blend_colors(ch_color, THEME_BG_PRIMARY, fade_alpha);
+                                            }
+
                                             font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
                                             x += channel_widths[i];
                                             
                                             // Draw separator and vertical line between channels (not after last)
                                             if (i < visible_channels - 1) {
-                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
+                                                uint16_t sep_color = RGB565_WHITE;
+                                                if (text_fade < 1.0f) {
+                                                    uint8_t fade_alpha = (uint8_t)(text_fade * 255.0f);
+                                                    sep_color = theme_blend_colors(sep_color, THEME_BG_PRIMARY, fade_alpha);
+                                                }
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, sep_color, font_scale, separator);
                                                 int line_x = x + separator_width / 2;  // Middle of the space
                                                 int line_top = header_y;  // Start from header bottom
                                                 int line_bottom = logical_height - MARGIN_BOTTOM;  // End at content bottom
@@ -1775,11 +2101,358 @@ void app_main(void) {
                                             }
                                         }
                                     }
+                                } else if (row_idx > center_row_idx) {
+                                    // No data for future row (beyond pattern bounds) - draw empty row
+                                    // Calculate font scale
+                                    int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
+                                    if (font_scale < 1) font_scale = 1;
+                                    if (font_scale > 3) font_scale = 3;
+
+                                    // Create empty row string "--- -- ----" for each channel
+                                    char empty_str[64];
+                                    format_channel_string(empty_str, sizeof(empty_str), 0, 0, 0, 0, use_compact_format, note_names);
+                                    int empty_width = strlen(empty_str) * FONT_WIDTH * font_scale;
+
+                                    const char *separator = " ";
+                                    int separator_width = strlen(separator) * FONT_WIDTH * font_scale;
+
+                                    int total_width = visible_channels * empty_width + (visible_channels - 1) * separator_width;
+                                    int content_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+                                    int start_x = MARGIN_LEFT + (content_width - total_width) / 2;
+
+                                    int x = start_x;
+                                    for (int i = 0; i < visible_channels; i++) {
+                                        int ch = start_channel + i;
+                                        uint16_t ch_color = theme_channel_color(ch);
+
+                                        // Apply text fade based on distance from center row
+                                        if (text_fade < 1.0f) {
+                                            uint8_t fade_alpha = (uint8_t)(text_fade * 255.0f);
+                                            ch_color = theme_blend_colors(ch_color, THEME_BG_PRIMARY, fade_alpha);
+                                        }
+
+                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, empty_str);
+                                        x += empty_width;
+
+                                        if (i < visible_channels - 1) {
+                                            uint16_t sep_color = RGB565_WHITE;
+                                            if (text_fade < 1.0f) {
+                                                uint8_t fade_alpha = (uint8_t)(text_fade * 255.0f);
+                                                sep_color = theme_blend_colors(sep_color, THEME_BG_PRIMARY, fade_alpha);
+                                            }
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, sep_color, font_scale, separator);
+                                            x += separator_width;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    
+
+                    // Draw view-dependent overlays
+                    if (current_view == VIEW_TRACKER) {
+                        // Layout: VU meters above hint bar at bottom
+                        int hint_bar_height = 20;  // Height for hint bar
+                        int vu_height = vu_cached_line_height;
+                        int hint_bar_y = FB_HEIGHT - MARGIN_BOTTOM - hint_bar_height;
+                        int vu_footer_y = hint_bar_y - vu_height;
+
+                        // Draw background for VU area
+                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                      0, vu_footer_y, FB_WIDTH, vu_height, THEME_BG_SECONDARY);
+
+                        // Draw VU meters aligned with channel columns (using cached positions)
+                        int visible_ch = vu_visible_channels;
+                        if (visible_ch < 1) visible_ch = 4;
+                        for (int i = 0; i < visible_ch && i < 4; i++) {
+                            int ch = vu_start_channel + i;
+                            if (ch >= num_channels || ch >= MOD_MAX_CHANNELS) break;
+
+                            // Use cached column positions for alignment
+                            int vu_x = vu_channel_x[i];
+                            int vu_width = vu_channel_width[i];
+                            if (vu_width < 10) vu_width = 50;  // Fallback if not cached yet
+
+                            ui_draw_vu_meter(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                             vu_x, vu_footer_y + 2, vu_width, vu_height - 4,
+                                             channel_vu_levels[ch], channel_vu_peaks[ch],
+                                             UI_VU_HORIZONTAL);
+
+                            // Draw channel number label centered horizontally and vertically
+                            char ch_label[16];
+                            snprintf(ch_label, sizeof(ch_label), "CH%d", ch + 1);
+                            int label_width = strlen(ch_label) * FONT_WIDTH;
+                            int label_x = vu_x + (vu_width - label_width) / 2;
+                            int label_y = vu_footer_y + (vu_height - FONT_HEIGHT) / 2;
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                    label_x, label_y,
+                                                    THEME_TEXT_MUTED, 1, ch_label);
+                        }
+
+                        // Draw hint bar at bottom
+                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                      0, hint_bar_y, FB_WIDTH, hint_bar_height, THEME_BG_PRIMARY);
+
+                        // Draw playback hints - get icon dimensions for proper positioning
+                        int icon_width = 0, icon_height = 0;
+                        int gap = 20;
+
+                        // Get actual icon size if available
+                        if (fkey_icon_available(3)) {
+                            fkey_icon_get_size(3, &icon_width, &icon_height);
+                        }
+                        if (icon_width == 0) icon_width = 16;
+                        if (icon_height == 0) icon_height = 16;
+
+                        // Calculate total width for centering
+                        // F3 View + F4 Channel page + F6 Exit + arrows Vol + space Pause
+                        int total_width = 0;
+                        total_width += icon_width + 4 + FONT_WIDTH * 4 + gap;   // F3 View
+                        total_width += icon_width + 4 + FONT_WIDTH * 12 + gap;  // F4 Channel page
+                        total_width += icon_width + 4 + FONT_WIDTH * 4 + gap;   // F6 Exit
+                        total_width += FONT_WIDTH * 6 + gap;                     // arrows Vol
+                        total_width += FONT_WIDTH * 8;                           // space Pause/Resume
+
+                        int hint_x = (FB_WIDTH - total_width) / 2;
+
+                        // Calculate vertical centering
+                        // Font has more bottom padding than top, so add 1px offset to visually center text with icons
+                        int icon_y = hint_bar_y + (hint_bar_height - icon_height) / 2;
+                        int text_y = hint_bar_y + (hint_bar_height - FONT_HEIGHT) / 2 + 1;
+
+                        // F3 - View
+                        if (fkey_icon_available(3)) {
+                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, icon_y, 3, 1);
+                            hint_x += icon_width + 4;
+                        } else {
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "F3");
+                            hint_x += FONT_WIDTH * 2 + 4;
+                        }
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "View");
+                        hint_x += FONT_WIDTH * 4 + gap;
+
+                        // F4 - Channel page
+                        if (fkey_icon_available(4)) {
+                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, icon_y, 4, 1);
+                            hint_x += icon_width + 4;
+                        } else {
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "F4");
+                            hint_x += FONT_WIDTH * 2 + 4;
+                        }
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "Channel page");
+                        hint_x += FONT_WIDTH * 12 + gap;
+
+                        // F6 - Exit
+                        if (fkey_icon_available(6)) {
+                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, icon_y, 6, 1);
+                            hint_x += icon_width + 4;
+                        } else {
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "F6");
+                            hint_x += FONT_WIDTH * 2 + 4;
+                        }
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "Exit");
+                        hint_x += FONT_WIDTH * 4 + gap;
+
+                        // Up/Down arrows - Vol (chars 128, 129 = 0x80, 0x81)
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
+                        hint_x += FONT_WIDTH * 6 + gap;
+
+                        // Space bar - Pause/Resume (char 133 = 0x85)
+                        const char *pause_text = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, pause_text);
+                    } else if (current_view == VIEW_SPECTRUM) {
+                        // Full-screen spectrum analyzer view
+                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_SPECTRUM_BG);
+
+                        // Draw header with song info
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, MARGIN_TOP,
+                                                THEME_TEXT_PRIMARY, 2, "SPECTRUM ANALYZER");
+
+                        // Draw spectrum bars
+                        uint8_t bands[SPECTRUM_NUM_BANDS] = {0};
+                        uint8_t peaks[SPECTRUM_NUM_BANDS] = {0};
+                        if (spectrum) {
+                            spectrum_get_bands_and_peaks(spectrum, bands, peaks, SPECTRUM_NUM_BANDS);
+                            spectrum_update_decay(spectrum);
+                        } else {
+                            // No spectrum analyzer - show simulated bars from channel volumes
+                            for (int i = 0; i < SPECTRUM_NUM_BANDS && i < num_channels; i++) {
+                                bands[i] = (uint8_t)(channel_vu_levels[i] * 255.0f);
+                                peaks[i] = (uint8_t)(channel_vu_peaks[i] * 255.0f);
+                            }
+                        }
+
+                        int hint_bar_height_spec = 20;
+                        int spec_y = MARGIN_TOP + 50;
+                        int spec_height = FB_HEIGHT - spec_y - MARGIN_BOTTOM - hint_bar_height_spec;
+                        ui_draw_spectrum_bars(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                              MARGIN_LEFT, spec_y, CONTENT_WIDTH, spec_height,
+                                              bands, SPECTRUM_NUM_BANDS, peaks, 4);
+
+                        // Footer hint bar (same style as tracker view)
+                        int spec_hint_y = FB_HEIGHT - MARGIN_BOTTOM - hint_bar_height_spec;
+                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                      0, spec_hint_y, FB_WIDTH, hint_bar_height_spec, THEME_BG_PRIMARY);
+
+                        int spec_icon_w = 16, spec_icon_h = 16;
+                        if (fkey_icon_available(3)) fkey_icon_get_size(3, &spec_icon_w, &spec_icon_h);
+                        int spec_gap = 20;
+                        int spec_total = (spec_icon_w + 4 + FONT_WIDTH * 4 + spec_gap) * 2 +  // F3 View, F6 Exit
+                                         FONT_WIDTH * 6 + spec_gap + FONT_WIDTH * 8;          // arrows Vol, space Pause
+                        int spec_hx = (FB_WIDTH - spec_total) / 2;
+                        int spec_icon_y = spec_hint_y + (hint_bar_height_spec - spec_icon_h) / 2;
+                        int spec_text_y = spec_hint_y + (hint_bar_height_spec - FONT_HEIGHT) / 2 + 1;
+
+                        // F3 View
+                        if (fkey_icon_available(3)) {
+                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_icon_y, 3, 1);
+                            spec_hx += spec_icon_w + 4;
+                        } else {
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "F3");
+                            spec_hx += FONT_WIDTH * 2 + 4;
+                        }
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "View");
+                        spec_hx += FONT_WIDTH * 4 + spec_gap;
+
+                        // F6 Exit
+                        if (fkey_icon_available(6)) {
+                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_icon_y, 6, 1);
+                            spec_hx += spec_icon_w + 4;
+                        } else {
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "F6");
+                            spec_hx += FONT_WIDTH * 2 + 4;
+                        }
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "Exit");
+                        spec_hx += FONT_WIDTH * 4 + spec_gap;
+
+                        // arrows Vol
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
+                        spec_hx += FONT_WIDTH * 6 + spec_gap;
+
+                        // space Pause
+                        const char *spec_pause = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, spec_pause);
+                    } else if (current_view == VIEW_INFO) {
+                        // Module info view
+                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
+
+                        // Header
+                        ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                          0, MARGIN_TOP, FB_WIDTH, THEME_HEADER_HEIGHT,
+                                          THEME_BG_HEADER, THEME_BG_PRIMARY);
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, MARGIN_TOP + 4,
+                                                THEME_TEXT_PRIMARY, 2, "MODULE INFO");
+
+                        int info_y = MARGIN_TOP + THEME_HEADER_HEIGHT + 20;
+                        int line_spacing = 28;
+
+                        // Module name
+                        char info_line[128];
+                        const char *mod_name = mod_info.mod ? mod_info.mod->name : "Unknown";
+                        snprintf(info_line, sizeof(info_line), "Name: %s", mod_name);
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, info_y, THEME_TEXT_PRIMARY, 2, info_line);
+                        info_y += line_spacing;
+
+                        // Channels
+                        snprintf(info_line, sizeof(info_line), "Channels: %d", num_channels);
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, info_y, THEME_TEXT_SECONDARY, 2, info_line);
+                        info_y += line_spacing;
+
+                        // Patterns
+                        int pat_count = mod_info.mod ? mod_info.mod->pat : 0;
+                        snprintf(info_line, sizeof(info_line), "Patterns: %d", pat_count);
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, info_y, THEME_TEXT_SECONDARY, 2, info_line);
+                        info_y += line_spacing;
+
+                        // Current position
+                        int song_len = mod_info.mod ? mod_info.mod->len : 0;
+                        snprintf(info_line, sizeof(info_line), "Position: %d / %d", frame_info.pos, song_len);
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, info_y, THEME_TEXT_SECONDARY, 2, info_line);
+                        info_y += line_spacing;
+
+                        // Speed/BPM
+                        snprintf(info_line, sizeof(info_line), "Speed: %d | BPM: %d", frame_info.speed, frame_info.bpm);
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, info_y, THEME_TEXT_SECONDARY, 2, info_line);
+                        info_y += line_spacing * 2;
+
+                        // Channel VU meters in a grid
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, info_y, THEME_TEXT_PRIMARY, 2, "Channel Levels:");
+                        info_y += line_spacing;
+
+                        int vu_per_row = 8;
+                        int vu_width = (CONTENT_WIDTH - (vu_per_row - 1) * 8) / vu_per_row;
+                        for (int ch = 0; ch < num_channels && ch < MOD_MAX_CHANNELS; ch++) {
+                            int row = ch / vu_per_row;
+                            int col = ch % vu_per_row;
+                            int vu_x = MARGIN_LEFT + col * (vu_width + 8);
+                            int vu_y = info_y + row * 24;
+
+                            // Channel number label
+                            char ch_label[4];
+                            snprintf(ch_label, sizeof(ch_label), "%d", ch + 1);
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                    vu_x, vu_y, THEME_TEXT_MUTED, 1, ch_label);
+
+                            // VU bar
+                            ui_draw_vu_bar(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                           vu_x + 16, vu_y + 2, vu_width - 20, 12,
+                                           channel_vu_levels[ch], THEME_VU_BG);
+                        }
+
+                        // Footer hint bar (same style as tracker view)
+                        int info_hint_h = 20;
+                        int info_hint_y = FB_HEIGHT - MARGIN_BOTTOM - info_hint_h;
+                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                      0, info_hint_y, FB_WIDTH, info_hint_h, THEME_BG_PRIMARY);
+
+                        int info_icon_w = 16, info_icon_h = 16;
+                        if (fkey_icon_available(3)) fkey_icon_get_size(3, &info_icon_w, &info_icon_h);
+                        int info_gap = 20;
+                        int info_total = (info_icon_w + 4 + FONT_WIDTH * 4 + info_gap) * 2 +
+                                         FONT_WIDTH * 6 + info_gap + FONT_WIDTH * 8;
+                        int info_hx = (FB_WIDTH - info_total) / 2;
+                        int info_icon_y = info_hint_y + (info_hint_h - info_icon_h) / 2;
+                        int info_text_y = info_hint_y + (info_hint_h - FONT_HEIGHT) / 2 + 1;
+
+                        // F3 View
+                        if (fkey_icon_available(3)) {
+                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_icon_y, 3, 1);
+                            info_hx += info_icon_w + 4;
+                        } else {
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "F3");
+                            info_hx += FONT_WIDTH * 2 + 4;
+                        }
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "View");
+                        info_hx += FONT_WIDTH * 4 + info_gap;
+
+                        // F6 Exit
+                        if (fkey_icon_available(6)) {
+                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_icon_y, 6, 1);
+                            info_hx += info_icon_w + 4;
+                        } else {
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "F6");
+                            info_hx += FONT_WIDTH * 2 + 4;
+                        }
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "Exit");
+                        info_hx += FONT_WIDTH * 4 + info_gap;
+
+                        // arrows Vol
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
+                        info_hx += FONT_WIDTH * 6 + info_gap;
+
+                        // space Pause
+                        const char *info_pause = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, info_pause);
+                    }
+
                     PROFILING_END(render, render);
                     // Note: last_row is now updated when we finish scrolling, not immediately
                     // This allows smooth scrolling to complete before marking the row as processed

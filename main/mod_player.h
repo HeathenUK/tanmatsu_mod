@@ -121,3 +121,24 @@ esp_err_t mod_player_get_pattern_num_rows(int pattern, int *num_rows);
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not loaded, ESP_ERR_INVALID_ARG if invalid order
  */
 esp_err_t mod_player_get_order_pattern(int order, int *pattern);
+
+/**
+ * @brief Pause MOD playback
+ *
+ * @return esp_err_t ESP_OK on success, ESP_ERR_INVALID_STATE if not playing
+ */
+esp_err_t mod_player_pause(void);
+
+/**
+ * @brief Resume MOD playback
+ *
+ * @return esp_err_t ESP_OK on success, ESP_ERR_INVALID_STATE if not playing
+ */
+esp_err_t mod_player_resume(void);
+
+/**
+ * @brief Check if MOD playback is paused
+ *
+ * @return true if paused, false otherwise
+ */
+bool mod_player_is_paused(void);
