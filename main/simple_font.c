@@ -7,11 +7,16 @@
 #include "vga_font_8x16.h"
 
 const uint8_t* font_get_char(char c) {
-    if (c < 32 || c > 126) {
-        return NULL;
+    unsigned char uc = (unsigned char)c;
+    if (uc >= 32 && uc <= 126) {
+        // Standard ASCII printable characters
+        return (const uint8_t*)vga_font_8x16_data[uc - 32];
+    } else if (uc >= 128 && uc <= 133) {
+        // Custom glyphs: 128=up, 129=down, 130=left, 131=right, 132=return, 133=space bar
+        return (const uint8_t*)custom_glyphs[uc - 128];
     }
-    // VGA font: 16 bytes per character (one row per byte)
-    return (const uint8_t*)vga_font_8x16_data[c - 32];
+    // Return '?' for unsupported characters
+    return (const uint8_t*)vga_font_8x16_data['?' - 32];
 }
 
 void font_draw_string(uint16_t *fb, int width, int height, int x, int y, uint16_t color, const char *text) {

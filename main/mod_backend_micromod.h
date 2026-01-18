@@ -40,6 +40,8 @@ typedef struct {
         uint8_t fxt;    // Effect type
         uint8_t fxp;    // Effect parameter
     } event;
+    uint8_t volume;    // Channel volume (0-64 for MOD/XM compatibility)
+    uint16_t period;   // Note period (for pitch display)
 } micromod_channel_info_t;
 
 typedef struct {

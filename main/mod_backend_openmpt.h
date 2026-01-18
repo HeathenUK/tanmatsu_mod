@@ -38,6 +38,8 @@ typedef struct {
         uint8_t fxt;   // Effect type (0-255)
         uint8_t fxp;   // Effect parameter (0-255)
     } event;
+    uint8_t volume;    // Channel volume (0-64 for MOD/XM compatibility)
+    uint16_t period;   // Note period (for pitch display)
 } openmpt_channel_info_t;
 
 typedef struct {

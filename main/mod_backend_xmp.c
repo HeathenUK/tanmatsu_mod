@@ -5,6 +5,7 @@
 
 #include "mod_backend_config.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -75,16 +76,62 @@ esp_err_t xmp_backend_load_module(xmp_backend_t *backend, const uint8_t *mod_dat
         backend->is_playing = false;
     }
     
+    // Debug: log heap stats before loading
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_psram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "Loading module: %zu bytes", mod_size);
+    ESP_LOGI(TAG, "Heap before: internal=%zu (largest=%zu), PSRAM=%zu (largest=%zu)",
+             free_internal, largest_internal, free_psram, largest_psram);
+
     // Load module from memory
     int ret = xmp_load_module_from_memory(backend->ctx, mod_data, (long)mod_size);
     if (ret != 0) {
+        // Debug: log heap stats after failed load
+        size_t free_internal_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        size_t free_psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         ESP_LOGE(TAG, "Failed to load module (error: %d)", ret);
+        ESP_LOGE(TAG, "Heap after fail: internal=%zu, PSRAM=%zu", free_internal_after, free_psram_after);
+        ESP_LOGE(TAG, "XMP errors: -2=INTERNAL, -3=FORMAT, -4=LOAD, -5=DEPACK, -6=SYSTEM, -7=INVALID");
         return ESP_ERR_INVALID_ARG;
     }
     
     backend->is_loaded = true;
+
+    // Validate module after loading - check for basic sanity
+    struct xmp_module_info mi;
+    xmp_get_module_info(backend->ctx, &mi);
+
+    if (mi.mod == NULL) {
+        ESP_LOGE(TAG, "Module validation failed: mod structure is NULL");
+        xmp_release_module(backend->ctx);
+        backend->is_loaded = false;
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Log module info for debugging
+    ESP_LOGI(TAG, "Module loaded: '%s'", mi.mod->name);
+    ESP_LOGI(TAG, "Format: %s, Channels: %d, Patterns: %d, Instruments: %d, Samples: %d",
+             mi.mod->type, mi.mod->chn, mi.mod->pat, mi.mod->ins, mi.mod->smp);
+
+    // Sanity checks - reject obviously broken modules
+    if (mi.mod->chn <= 0 || mi.mod->chn > 64) {
+        ESP_LOGE(TAG, "Module validation failed: invalid channel count (%d)", mi.mod->chn);
+        xmp_release_module(backend->ctx);
+        backend->is_loaded = false;
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (mi.mod->pat <= 0 || mi.mod->pat > 256) {
+        ESP_LOGE(TAG, "Module validation failed: invalid pattern count (%d)", mi.mod->pat);
+        xmp_release_module(backend->ctx);
+        backend->is_loaded = false;
+        return ESP_ERR_INVALID_ARG;
+    }
+
     ESP_LOGI(TAG, "Module loaded successfully (%zu bytes)", mod_size);
-    
+
     return ESP_OK;
 }
 
@@ -163,7 +210,7 @@ int xmp_backend_play_buffer(xmp_backend_t *backend, int16_t *buffer, size_t buff
 }
 
 esp_err_t xmp_backend_get_frame_info(xmp_backend_t *backend, xmp_backend_frame_info_t *frame_info) {
-    if (backend == NULL || backend->ctx == NULL || !backend->is_loaded || frame_info == NULL) {
+    if (backend == NULL || backend->ctx == NULL || !backend->is_loaded || !backend->is_playing || frame_info == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     
@@ -195,6 +242,9 @@ esp_err_t xmp_backend_get_frame_info(xmp_backend_t *backend, xmp_backend_frame_i
         frame_info->channel_info[ch].event.ins = xmp_frame.channel_info[ch].event.ins;
         frame_info->channel_info[ch].event.fxt = xmp_frame.channel_info[ch].event.fxt;
         frame_info->channel_info[ch].event.fxp = xmp_frame.channel_info[ch].event.fxp;
+        // Extract channel volume for VU meter display (libxmp provides 0-64 range)
+        frame_info->channel_info[ch].volume = (uint8_t)xmp_frame.channel_info[ch].volume;
+        frame_info->channel_info[ch].period = (uint16_t)xmp_frame.channel_info[ch].period;
     }
     
     return ESP_OK;

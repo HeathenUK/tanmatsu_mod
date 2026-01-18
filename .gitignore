@@ -52,3 +52,28 @@ shell.nix
 *.bak
 *.old
 main/kbelf_lib.c
+
+# AI assistant files
+.claude/
+.cursorrules
+.cursor/
+.aider*
+.github/copilot/
+.copilot/
+CLAUDE.md
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Core dumps
+core
+*.core
+*.dmp
+
+# Merge conflict files
+*.orig
+
+# Language server caches
+.ccls-cache/
+compile_commands.json

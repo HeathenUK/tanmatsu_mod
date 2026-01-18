@@ -349,12 +349,17 @@ esp_err_t openmpt_backend_get_frame_info(openmpt_backend_t *ctx, openmpt_frame_i
         uint8_t fxp = openmpt_module_get_pattern_row_channel_command(
             ctx->mod, frame_info->pattern, frame_info->row, ch, OPENMPT_MODULE_COMMAND_PARAMETER);
         
-        // Map to channel_info structure
         // Map to channel_info structure (note the 'event' nested struct)
         frame_info->channel_info[ch].event.note = note;
         frame_info->channel_info[ch].event.ins = ins;
         frame_info->channel_info[ch].event.fxt = fxt;
         frame_info->channel_info[ch].event.fxp = fxp;
+
+        // Get channel volume for VU meter display
+        // libopenmpt provides volume in 0.0-1.0 range, convert to 0-64
+        double vol = openmpt_module_get_current_channel_vu_mono(ctx->mod, ch);
+        frame_info->channel_info[ch].volume = (uint8_t)(vol * 64.0);
+        frame_info->channel_info[ch].period = 0;  // libopenmpt doesn't expose period directly
     }
     
     // Zero out remaining channels to prevent garbage data
@@ -363,6 +368,8 @@ esp_err_t openmpt_backend_get_frame_info(openmpt_backend_t *ctx, openmpt_frame_i
         frame_info->channel_info[ch].event.ins = 0;
         frame_info->channel_info[ch].event.fxt = 0;
         frame_info->channel_info[ch].event.fxp = 0;
+        frame_info->channel_info[ch].volume = 0;
+        frame_info->channel_info[ch].period = 0;
     }
     
     return ESP_OK;
