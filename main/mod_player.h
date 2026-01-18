@@ -4,7 +4,11 @@
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "xmp.h"  // For xmp_frame_info
+// Forward declarations for compatibility structures
+// These match libxmp's structures but are provided by our wrapper
+struct xmp_frame_info;
+struct xmp_module_info;
+struct xmp_module;
 
 /**
  * @brief Initialize MOD player
@@ -83,3 +87,37 @@ esp_err_t mod_player_toggle_channel_mute(int channel);
  * @return esp_err_t ESP_OK on success, ESP_ERR_INVALID_STATE if not playing, ESP_ERR_INVALID_ARG if invalid channel
  */
 esp_err_t mod_player_get_channel_mute(int channel, bool *is_muted);
+
+/**
+ * @brief Get pattern row data for a specific channel (for previewing future rows)
+ * 
+ * @param pattern Pattern index
+ * @param row Row index within pattern
+ * @param channel Channel number (0-based)
+ * @param note Output: Note value (0 = no note, 1-96 = note)
+ * @param ins Output: Instrument number (0 = no instrument, 1+ = instrument)
+ * @param fxt Output: Effect type (0-255)
+ * @param fxp Output: Effect parameter (0-255)
+ * @return esp_err_t ESP_OK on success, ESP_ERR_INVALID_STATE if not loaded, ESP_ERR_INVALID_ARG if invalid pattern/row/channel, ESP_ERR_NOT_SUPPORTED if pattern access not available (e.g., libxmp limitation)
+ */
+esp_err_t mod_player_get_pattern_row_channel(int pattern, int row, int channel, 
+                                              uint8_t *note, uint8_t *ins, 
+                                              uint8_t *fxt, uint8_t *fxp);
+
+/**
+ * @brief Get number of rows in a pattern
+ * 
+ * @param pattern Pattern index
+ * @param num_rows Output: Number of rows in the pattern
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not loaded, ESP_ERR_INVALID_ARG if invalid pattern
+ */
+esp_err_t mod_player_get_pattern_num_rows(int pattern, int *num_rows);
+
+/**
+ * @brief Get pattern number for a given order position
+ * 
+ * @param order Order position (0-based)
+ * @param pattern Output: Pattern number at this order position
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not loaded, ESP_ERR_INVALID_ARG if invalid order
+ */
+esp_err_t mod_player_get_order_pattern(int order, int *pattern);

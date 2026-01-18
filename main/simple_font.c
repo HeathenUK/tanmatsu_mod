@@ -1,207 +1,17 @@
 #include "simple_font.h"
 #include <string.h>
+#include <stdbool.h>
 
-// 6x8 bitmap font data (6 bytes per character, columns from left to right)
-// Each byte represents a column, bit 0 is top pixel, bit 7 is bottom pixel
-// Characters 32-126 (ASCII printable)
-static const uint8_t font_data[] = {
-    // 32: space
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    // 33: !
-    0x00, 0x5E, 0x00, 0x00, 0x00, 0x00,
-    // 34: "
-    0x06, 0x00, 0x06, 0x00, 0x00, 0x00,
-    // 35: #
-    0x28, 0x7C, 0x28, 0x7C, 0x28, 0x00,
-    // 36: $
-    0x24, 0x2A, 0x7F, 0x2A, 0x12, 0x00,
-    // 37: %
-    0x62, 0x64, 0x08, 0x13, 0x23, 0x00,
-    // 38: &
-    0x36, 0x49, 0x55, 0x22, 0x50, 0x00,
-    // 39: '
-    0x00, 0x05, 0x03, 0x00, 0x00, 0x00,
-    // 40: (
-    0x00, 0x1C, 0x22, 0x41, 0x00, 0x00,
-    // 41: )
-    0x00, 0x41, 0x22, 0x1C, 0x00, 0x00,
-    // 42: *
-    0x14, 0x08, 0x3E, 0x08, 0x14, 0x00,
-    // 43: +
-    0x08, 0x08, 0x3E, 0x08, 0x08, 0x00,
-    // 44: ,
-    0x00, 0x00, 0x50, 0x30, 0x00, 0x00,
-    // 45: -
-    0x08, 0x08, 0x08, 0x08, 0x08, 0x00,
-    // 46: .
-    0x00, 0x60, 0x60, 0x00, 0x00, 0x00,
-    // 47: /
-    0x20, 0x10, 0x08, 0x04, 0x02, 0x00,
-    // 48: 0
-    0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00,
-    // 49: 1
-    0x00, 0x42, 0x7F, 0x40, 0x00, 0x00,
-    // 50: 2
-    0x42, 0x61, 0x51, 0x49, 0x46, 0x00,
-    // 51: 3
-    0x21, 0x41, 0x45, 0x4B, 0x31, 0x00,
-    // 52: 4
-    0x18, 0x14, 0x12, 0x7F, 0x10, 0x00,
-    // 53: 5
-    0x27, 0x45, 0x45, 0x45, 0x39, 0x00,
-    // 54: 6
-    0x3C, 0x4A, 0x49, 0x49, 0x30, 0x00,
-    // 55: 7
-    0x01, 0x71, 0x09, 0x05, 0x03, 0x00,
-    // 56: 8
-    0x36, 0x49, 0x49, 0x49, 0x36, 0x00,
-    // 57: 9
-    0x06, 0x49, 0x49, 0x29, 0x1E, 0x00,
-    // 58: :
-    0x00, 0x36, 0x36, 0x00, 0x00, 0x00,
-    // 59: ;
-    0x00, 0x56, 0x36, 0x00, 0x00, 0x00,
-    // 60: <
-    0x08, 0x14, 0x22, 0x41, 0x00, 0x00,
-    // 61: =
-    0x14, 0x14, 0x14, 0x14, 0x14, 0x00,
-    // 62: >
-    0x00, 0x41, 0x22, 0x14, 0x08, 0x00,
-    // 63: ?
-    0x02, 0x01, 0x51, 0x09, 0x06, 0x00,
-    // 64: @
-    0x32, 0x49, 0x59, 0x51, 0x3E, 0x00,
-    // 65: A
-    0x7C, 0x12, 0x11, 0x12, 0x7C, 0x00,
-    // 66: B
-    0x7F, 0x49, 0x49, 0x49, 0x36, 0x00,
-    // 67: C
-    0x3E, 0x41, 0x41, 0x41, 0x22, 0x00,
-    // 68: D
-    0x7F, 0x41, 0x41, 0x22, 0x1C, 0x00,
-    // 69: E
-    0x7F, 0x49, 0x49, 0x49, 0x41, 0x00,
-    // 70: F
-    0x7F, 0x09, 0x09, 0x09, 0x01, 0x00,
-    // 71: G
-    0x3E, 0x41, 0x49, 0x49, 0x7A, 0x00,
-    // 72: H
-    0x7F, 0x08, 0x08, 0x08, 0x7F, 0x00,
-    // 73: I
-    0x00, 0x41, 0x7F, 0x41, 0x00, 0x00,
-    // 74: J
-    0x20, 0x40, 0x41, 0x3F, 0x01, 0x00,
-    // 75: K
-    0x7F, 0x08, 0x14, 0x22, 0x41, 0x00,
-    // 76: L
-    0x7F, 0x40, 0x40, 0x40, 0x40, 0x00,
-    // 77: M
-    0x7F, 0x02, 0x0C, 0x02, 0x7F, 0x00,
-    // 78: N
-    0x7F, 0x04, 0x08, 0x10, 0x7F, 0x00,
-    // 79: O
-    0x3E, 0x41, 0x41, 0x41, 0x3E, 0x00,
-    // 80: P
-    0x7F, 0x09, 0x09, 0x09, 0x06, 0x00,
-    // 81: Q
-    0x3E, 0x41, 0x51, 0x21, 0x5E, 0x00,
-    // 82: R
-    0x7F, 0x09, 0x19, 0x29, 0x46, 0x00,
-    // 83: S
-    0x46, 0x49, 0x49, 0x49, 0x31, 0x00,
-    // 84: T
-    0x01, 0x01, 0x7F, 0x01, 0x01, 0x00,
-    // 85: U
-    0x3F, 0x40, 0x40, 0x40, 0x3F, 0x00,
-    // 86: V
-    0x1F, 0x20, 0x40, 0x20, 0x1F, 0x00,
-    // 87: W
-    0x3F, 0x40, 0x38, 0x40, 0x3F, 0x00,
-    // 88: X
-    0x63, 0x14, 0x08, 0x14, 0x63, 0x00,
-    // 89: Y
-    0x07, 0x08, 0x70, 0x08, 0x07, 0x00,
-    // 90: Z
-    0x61, 0x51, 0x49, 0x45, 0x43, 0x00,
-    // 91: [
-    0x00, 0x7F, 0x41, 0x41, 0x00, 0x00,
-    // 92: backslash
-    0x02, 0x04, 0x08, 0x10, 0x20, 0x00,
-    // 93: ]
-    0x00, 0x41, 0x41, 0x7F, 0x00, 0x00,
-    // 94: ^
-    0x04, 0x02, 0x01, 0x02, 0x04, 0x00,
-    // 95: _
-    0x40, 0x40, 0x40, 0x40, 0x40, 0x00,
-    // 96: `
-    0x00, 0x01, 0x02, 0x04, 0x00, 0x00,
-    // 97: a
-    0x20, 0x54, 0x54, 0x54, 0x78, 0x00,
-    // 98: b
-    0x7F, 0x48, 0x44, 0x44, 0x38, 0x00,
-    // 99: c
-    0x38, 0x44, 0x44, 0x44, 0x20, 0x00,
-    // 100: d
-    0x38, 0x44, 0x44, 0x48, 0x7F, 0x00,
-    // 101: e
-    0x38, 0x54, 0x54, 0x54, 0x18, 0x00,
-    // 102: f
-    0x08, 0x7E, 0x09, 0x01, 0x02, 0x00,
-    // 103: g
-    0x18, 0xA4, 0xA4, 0xA4, 0x7C, 0x00,
-    // 104: h
-    0x7F, 0x08, 0x04, 0x04, 0x78, 0x00,
-    // 105: i
-    0x00, 0x44, 0x7D, 0x40, 0x00, 0x00,
-    // 106: j
-    0x40, 0x80, 0x84, 0x7D, 0x00, 0x00,
-    // 107: k
-    0x7F, 0x10, 0x28, 0x44, 0x00, 0x00,
-    // 108: l
-    0x00, 0x41, 0x7F, 0x40, 0x00, 0x00,
-    // 109: m
-    0x7C, 0x04, 0x18, 0x04, 0x78, 0x00,
-    // 110: n
-    0x7C, 0x08, 0x04, 0x04, 0x78, 0x00,
-    // 111: o
-    0x38, 0x44, 0x44, 0x44, 0x38, 0x00,
-    // 112: p
-    0xFC, 0x24, 0x24, 0x24, 0x18, 0x00,
-    // 113: q
-    0x18, 0x24, 0x24, 0x18, 0xFC, 0x00,
-    // 114: r
-    0x7C, 0x08, 0x04, 0x04, 0x08, 0x00,
-    // 115: s
-    0x48, 0x54, 0x54, 0x54, 0x20, 0x00,
-    // 116: t
-    0x04, 0x3F, 0x44, 0x40, 0x20, 0x00,
-    // 117: u
-    0x3C, 0x40, 0x40, 0x20, 0x7C, 0x00,
-    // 118: v
-    0x1C, 0x20, 0x40, 0x20, 0x1C, 0x00,
-    // 119: w
-    0x3C, 0x40, 0x30, 0x40, 0x3C, 0x00,
-    // 120: x
-    0x44, 0x28, 0x10, 0x28, 0x44, 0x00,
-    // 121: y
-    0x1C, 0xA0, 0xA0, 0xA0, 0x7C, 0x00,
-    // 122: z
-    0x44, 0x64, 0x54, 0x4C, 0x44, 0x00,
-    // 123: {
-    0x00, 0x08, 0x36, 0x41, 0x00, 0x00,
-    // 124: |
-    0x00, 0x00, 0x7F, 0x00, 0x00, 0x00,
-    // 125: }
-    0x00, 0x41, 0x36, 0x08, 0x00, 0x00,
-    // 126: ~
-    0x10, 0x08, 0x08, 0x10, 0x08, 0x00,
-};
+// Include VGA 8x16 bitmap font data
+// Format: 16 bytes per character (one byte per row, MSB is left pixel)
+#include "vga_font_8x16.h"
 
 const uint8_t* font_get_char(char c) {
     if (c < 32 || c > 126) {
         return NULL;
     }
-    return &font_data[(c - 32) * FONT_WIDTH];
+    // VGA font: 16 bytes per character (one row per byte)
+    return (const uint8_t*)vga_font_8x16_data[c - 32];
 }
 
 void font_draw_string(uint16_t *fb, int width, int height, int x, int y, uint16_t color, const char *text) {
@@ -221,15 +31,18 @@ void font_draw_string(uint16_t *fb, int width, int height, int x, int y, uint16_
         }
         
         if (char_data) {
-            // Draw character
-            for (int col = 0; col < FONT_WIDTH; col++) {
-                uint8_t column = char_data[col];
-                for (int row = 0; row < FONT_HEIGHT; row++) {
-                    if (column & (1 << row)) {
-                        int fx = px + col;
-                        int fy = py + row;
-                        if (fx >= 0 && fx < width && fy >= 0 && fy < height) {
-                            fb[fy * width + fx] = color;
+            // Draw character - VGA font: row-based format (each byte is a row, MSB is left pixel)
+            for (int row = 0; row < FONT_HEIGHT; row++) {
+                uint8_t row_data = char_data[row];
+                int fy = py + row;
+                if (fy >= 0 && fy < height) {
+                    // Draw row: iterate over 8 bits (pixels) from left to right (MSB to LSB)
+                    for (int col = 0; col < FONT_WIDTH; col++) {
+                        if (row_data & (0x80 >> col)) {  // Check bit from MSB (left) to LSB (right)
+                            int fx = px + col;
+                            if (fx >= 0 && fx < width) {
+                                fb[fy * width + fx] = color;
+                            }
                         }
                     }
                 }
@@ -240,34 +53,72 @@ void font_draw_string(uint16_t *fb, int width, int height, int x, int y, uint16_
 }
 
 void fb_fill(uint16_t *fb, int width, int height, uint16_t color) {
+    // SIMD-optimized fill using multi-word writes
+    uint64_t color_word = ((uint64_t)color << 48) | ((uint64_t)color << 32) | 
+                          ((uint64_t)color << 16) | (uint64_t)color;
     int total_pixels = width * height;
-    for (int i = 0; i < total_pixels; i++) {
-        fb[i] = color;
+    uint64_t *fb_words = (uint64_t *)fb;
+    int word_count = total_pixels / 4;
+    
+    for (int i = 0; i < word_count; i++) {
+        fb_words[i] = color_word;
+    }
+    
+    int remainder = total_pixels % 4;
+    if (remainder > 0) {
+        int start_idx = word_count * 4;
+        for (int i = 0; i < remainder; i++) {
+            fb[start_idx + i] = color;
+        }
     }
 }
 
 void fb_rect(uint16_t *fb, int width, int height, int x, int y, int w, int h, uint16_t color) {
+    // SIMD-optimized rectangle fill using multi-word writes
+    uint64_t color_word = ((uint64_t)color << 48) | ((uint64_t)color << 32) | 
+                          ((uint64_t)color << 16) | (uint64_t)color;
+    
     for (int dy = 0; dy < h; dy++) {
         int fy = y + dy;
         if (fy >= 0 && fy < height) {
-            for (int dx = 0; dx < w; dx++) {
-                int fx = x + dx;
-                if (fx >= 0 && fx < width) {
-                    fb[fy * width + fx] = color;
+            uint16_t *row = &fb[fy * width + x];
+            int word_count = w / 4;
+            uint64_t *row_words = (uint64_t *)row;
+            
+            // Fill 4 pixels at a time
+            for (int i = 0; i < word_count; i++) {
+                row_words[i] = color_word;
+            }
+            
+            int remainder = w % 4;
+            if (remainder > 0) {
+                int start_idx = word_count * 4;
+                for (int i = 0; i < remainder; i++) {
+                    row[start_idx + i] = color;
                 }
             }
         }
     }
 }
 
-void font_draw_string_scaled(uint16_t *fb, int width, int height, int x, int y, uint16_t color, int scale, const char *text) {
+void IRAM_ATTR font_draw_string_scaled(uint16_t *fb, int width, int height, int x, int y, uint16_t color, int scale, const char *text) {
     int px = x;
     int py = y;
+    
+    // Pre-calculate character bounds for early exit optimization
+    int char_width = FONT_WIDTH * scale;
+    int char_height = FONT_HEIGHT * scale;
     
     for (const char *p = text; *p != '\0'; p++) {
         if (*p == '\n') {
             px = x;
             py += FONT_HEIGHT * scale;
+            continue;
+        }
+        
+        // Early exit: skip character if completely outside bounds
+        if (px + char_width < 0 || px >= width || py + char_height < 0 || py >= height) {
+            px += char_width;
             continue;
         }
         
@@ -277,25 +128,133 @@ void font_draw_string_scaled(uint16_t *fb, int width, int height, int x, int y, 
         }
         
         if (char_data) {
-            // Draw character scaled
-            for (int col = 0; col < FONT_WIDTH; col++) {
-                uint8_t column = char_data[col];
+            // Pre-calculate bounds for this character (clamped to framebuffer)
+            int char_x_min = (px < 0) ? 0 : px;
+            int char_x_max = (px + char_width > width) ? width : px + char_width;
+            int char_y_min = (py < 0) ? 0 : py;
+            int char_y_max = (py + char_height > height) ? height : py + char_height;
+            
+            // VGA font: row-based format (each byte is a row, MSB is left pixel)
+            // Optimize for common scale values
+            if (scale == 1) {
+                // Fast path for scale=1: no scaling needed
                 for (int row = 0; row < FONT_HEIGHT; row++) {
-                    if (column & (1 << row)) {
-                        // Draw scale x scale block for this pixel
-                        for (int sy = 0; sy < scale; sy++) {
-                            for (int sx = 0; sx < scale; sx++) {
-                                int fx = px + col * scale + sx;
-                                int fy = py + row * scale + sy;
-                                if (fx >= 0 && fx < width && fy >= 0 && fy < height) {
-                                    fb[fy * width + fx] = color;
+                    uint8_t row_data = char_data[row];
+                    int fy = py + row;
+                    if (fy >= char_y_min && fy < char_y_max) {
+                        uint16_t *fb_row = fb + fy * width;
+                        // Draw row: iterate over 8 bits (pixels) from left to right (MSB to LSB)
+                        for (int col = 0; col < FONT_WIDTH; col++) {
+                            if (row_data & (0x80 >> col)) {  // Check bit from MSB (left) to LSB (right)
+                                int fx = px + col;
+                                if (fx >= char_x_min && fx < char_x_max) {
+                                    fb_row[fx] = color;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (scale == 2) {
+                // Optimized path for scale=2: unroll inner loops, bounds already checked
+                for (int row = 0; row < FONT_HEIGHT; row++) {
+                    uint8_t row_data = char_data[row];
+                    int row_base_y = py + row * 2;
+                    // Check if this row overlaps with visible area
+                    if (row_base_y + 2 > char_y_min && row_base_y < char_y_max) {
+                        for (int col = 0; col < FONT_WIDTH; col++) {
+                            if (row_data & (0x80 >> col)) {  // Check bit from MSB (left) to LSB (right)
+                                int col_base_x = px + col * 2;
+                                // Check if this column overlaps with visible area
+                                if (col_base_x + 2 > char_x_min && col_base_x < char_x_max) {
+                                    // Unroll 2x2 block - bounds already verified above
+                                    int fx0 = col_base_x;
+                                    int fx1 = col_base_x + 1;
+                                    int fy0 = row_base_y;
+                                    int fy1 = row_base_y + 1;
+                                    
+                                    // Only check individual pixels if block might be partially clipped
+                                    bool fully_visible = (fx0 >= char_x_min && fx1 < char_x_max && 
+                                                          fy0 >= char_y_min && fy1 < char_y_max);
+                                    if (fully_visible) {
+                                        // Fast path: all 4 pixels visible, no bounds checks needed
+                                        fb[fy0 * width + fx0] = color;
+                                        fb[fy0 * width + fx1] = color;
+                                        fb[fy1 * width + fx0] = color;
+                                        fb[fy1 * width + fx1] = color;
+                                    } else {
+                                        // Clipped path: check each pixel
+                                        if (fx0 >= char_x_min && fx0 < char_x_max && fy0 >= char_y_min && fy0 < char_y_max) {
+                                            fb[fy0 * width + fx0] = color;
+                                        }
+                                        if (fx1 >= char_x_min && fx1 < char_x_max && fy0 >= char_y_min && fy0 < char_y_max) {
+                                            fb[fy0 * width + fx1] = color;
+                                        }
+                                        if (fx0 >= char_x_min && fx0 < char_x_max && fy1 >= char_y_min && fy1 < char_y_max) {
+                                            fb[fy1 * width + fx0] = color;
+                                        }
+                                        if (fx1 >= char_x_min && fx1 < char_x_max && fy1 >= char_y_min && fy1 < char_y_max) {
+                                            fb[fy1 * width + fx1] = color;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // General case for scale >= 3: optimized with pre-calculated bounds and cache-friendly access
+                // Use row-major access pattern for better cache locality
+                for (int row = 0; row < FONT_HEIGHT; row++) {
+                    uint8_t row_data = char_data[row];
+                    int row_base_y = py + row * scale;
+                    // Check if this row overlaps with visible area
+                    if (row_base_y + scale > char_y_min && row_base_y < char_y_max) {
+                        for (int col = 0; col < FONT_WIDTH; col++) {
+                            if (row_data & (0x80 >> col)) {  // Check bit from MSB (left) to LSB (right)
+                                int col_base_x = px + col * scale;
+                                // Check if this column overlaps with visible area
+                                if (col_base_x + scale > char_x_min && col_base_x < char_x_max) {
+                                    // Draw scale x scale block with optimized bounds
+                                    // Clamp to visible area for cache-friendly row-major access
+                                    int sx_start = (char_x_min > col_base_x) ? (char_x_min - col_base_x) : 0;
+                                    int sx_end = (char_x_max < col_base_x + scale) ? (char_x_max - col_base_x) : scale;
+                                    int sy_start = (char_y_min > row_base_y) ? (char_y_min - row_base_y) : 0;
+                                    int sy_end = (char_y_max < row_base_y + scale) ? (char_y_max - row_base_y) : scale;
+                                    
+                                    // General case: SIMD-optimized with multi-word writes for horizontal fills
+                                    // Replicate color to 64-bit word for efficient filling (4 pixels per word)
+                                    uint64_t color_word = ((uint64_t)color << 48) | ((uint64_t)color << 32) | 
+                                                          ((uint64_t)color << 16) | (uint64_t)color;
+                                    
+                                    int block_width = sx_end - sx_start;
+                                    for (int sy = sy_start; sy < sy_end; sy++) {
+                                        int fy = row_base_y + sy;
+                                        uint16_t *fb_row = fb + fy * width;
+                                        int row_start_x = col_base_x + sx_start;
+                                        
+                                        // Fill 4 pixels at a time using 64-bit writes (SIMD-friendly)
+                                        int word_count = block_width / 4;
+                                        uint64_t *row_words = (uint64_t *)(fb_row + row_start_x);
+                                        for (int i = 0; i < word_count; i++) {
+                                            row_words[i] = color_word;
+                                        }
+                                        
+                                        // Handle remaining pixels (0-3 pixels)
+                                        int remainder = block_width % 4;
+                                        if (remainder > 0) {
+                                            int remainder_start = row_start_x + word_count * 4;
+                                            for (int i = 0; i < remainder; i++) {
+                                                fb_row[remainder_start + i] = color;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            px += FONT_WIDTH * scale;
+            px += char_width;
         }
     }
 }

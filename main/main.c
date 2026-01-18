@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include "audio.h"
 #include "mod_player.h"
+#include "mod_backend_config.h"  // For MOD_CONFIG_SAMPLE_RATE
 #include "sdcard.h"
 #include "file_browser.h"
 #include "xmp_compat.h"  // For xmp_frame_info, xmp_channel_info, xmp_event (structure definitions)
@@ -53,7 +54,6 @@ static char const TAG[] = "main";
 #define CONTENT_WIDTH  (FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT)   // 780
 #define CONTENT_HEIGHT (FB_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM)  // 470
 
-// RGB565 color conversion helper (ARGB32 to RGB565)
 // Format: ARGB32 = 0xAARRGGBB, RGB565 = 0bRRRRRGGGGGGBBBBB
 static inline uint16_t argb32_to_rgb565(uint32_t argb) {
     uint8_t r = (argb >> 16) & 0xFF;
@@ -71,24 +71,14 @@ static QueueHandle_t input_event_queue = NULL;
 static int channel_page_offset = 0;  // Channel pagination: offset for current page (0-4-8-12...)
 static bool tab_pressed_this_frame = false;  // Flag set by Tab key handler, checked during rendering
 
-// Helper macro to get framebuffer
 #define CURRENT_FB (fb)
 
-// RGB565 to ARGB8888 conversion helper for PPA Fill
-// RGB565: 0bRRRRRGGGGGGBBBBB
-// ARGB8888: 0xAARRGGBB (A=0xFF for opaque)
-// NOTE: The PPA API requires fill_argb_color in ARGB8888 format regardless of fill_cm.
-// When fill_cm is RGB565, PPA internally converts ARGB8888 -> RGB565.
-// This conversion scales RGB565 5/6/5 bits to ARGB8888 8/8/8 bits by replicating bits.
+// PPA API requires fill_argb_color in ARGB8888 format regardless of output format
 static inline color_pixel_argb8888_data_t rgb565_to_argb8888(uint16_t rgb565) {
     color_pixel_argb8888_data_t argb;
-    // Extract RGB components from RGB565 and scale to 8-bit
-    // For 5-bit: replicate top 3 bits (multiply by 8)
-    // For 6-bit: replicate top 2 bits (multiply by 4)
     uint8_t r = ((rgb565 >> 11) & 0x1F) << 3;  // 5 bits -> 8 bits (scale by 8)
     uint8_t g = ((rgb565 >> 5) & 0x3F) << 2;   // 6 bits -> 8 bits (scale by 4)
     uint8_t b = (rgb565 & 0x1F) << 3;          // 5 bits -> 8 bits (scale by 8)
-    // Set ARGB8888 (A=0xFF for opaque)
     argb.a = 0xFF;
     argb.r = r;
     argb.g = g;
@@ -96,16 +86,12 @@ static inline color_pixel_argb8888_data_t rgb565_to_argb8888(uint16_t rgb565) {
     return argb;
 }
 
-// Hardware-accelerated framebuffer fill using PPA Fill
-// Falls back to CPU fill if PPA is unavailable or operation fails
 static void IRAM_ATTR ppa_fill_framebuffer(uint16_t *fb_ptr, int width, int height, uint16_t color) {
     if (!fb_ptr || width <= 0 || height <= 0) {
         return;
     }
     
-    // Try PPA Fill first (hardware-accelerated)
     if (ppa_fill_handle && fb_ptr) {
-        // Convert RGB565 to ARGB8888 for PPA
         color_pixel_argb8888_data_t fill_color = rgb565_to_argb8888(color);
         
         // Configure PPA Fill operation
@@ -128,31 +114,24 @@ static void IRAM_ATTR ppa_fill_framebuffer(uint16_t *fb_ptr, int width, int heig
         
         esp_err_t ret = ppa_do_fill(ppa_fill_handle, &fill_config);
         if (ret == ESP_OK) {
-            return;  // Success - hardware fill completed
+            return;
         }
-        // Log fallback to CPU fill
         ESP_LOGW(TAG, "PPA Fill failed (%s), falling back to CPU fill", esp_err_to_name(ret));
     } else {
-        // PPA Fill handle not available
         ESP_LOGD(TAG, "PPA Fill handle not available, using CPU fill");
     }
     
-    // CPU fallback: SIMD-optimized fill using multi-word writes
-    // Replicate 16-bit RGB565 color to 64-bit word for efficient filling
-    // Pattern: color|color|color|color (4 pixels per 64-bit word)
     uint64_t color_word = ((uint64_t)color << 48) | ((uint64_t)color << 32) | 
                           ((uint64_t)color << 16) | (uint64_t)color;
     
     int total_pixels = width * height;
     uint64_t *fb_words = (uint64_t *)fb_ptr;
-    int word_count = total_pixels / 4;  // 4 pixels per 64-bit word
+    int word_count = total_pixels / 4;
     
-    // Fill 4 pixels at a time using 64-bit writes (SIMD-friendly)
     for (int i = 0; i < word_count; i++) {
         fb_words[i] = color_word;
     }
     
-    // Handle remaining pixels (0-3 pixels)
     int remainder = total_pixels % 4;
     if (remainder > 0) {
         int start_idx = word_count * 4;
@@ -162,14 +141,11 @@ static void IRAM_ATTR ppa_fill_framebuffer(uint16_t *fb_ptr, int width, int heig
     }
 }
 
-// Hardware-accelerated rectangle fill using PPA Fill
-// Falls back to CPU fill if PPA is unavailable or operation fails
 static void IRAM_ATTR ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int x, int y, int w, int h, uint16_t color) {
     if (!fb_ptr || width <= 0 || height <= 0 || w <= 0 || h <= 0) {
         return;
     }
     
-    // Clamp rectangle to framebuffer bounds
     if (x < 0) {
         w += x;
         x = 0;
@@ -185,27 +161,24 @@ static void IRAM_ATTR ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int
         h = height - y;
     }
     if (w <= 0 || h <= 0) {
-        return;  // Rectangle is completely outside framebuffer
+        return;
     }
     
-    // Try PPA Fill first (hardware-accelerated)
     if (ppa_fill_handle) {
-        // Convert RGB565 to ARGB8888 for PPA
         color_pixel_argb8888_data_t fill_color = rgb565_to_argb8888(color);
         
-        // Configure PPA Fill operation for the rectangle region
         ppa_fill_oper_config_t fill_config = {
             .out = {
                 .buffer = fb_ptr,
                 .buffer_size = width * height * sizeof(uint16_t),
                 .pic_w = width,
                 .pic_h = height,
-                .block_offset_x = x,  // Rectangle X position
-                .block_offset_y = y,  // Rectangle Y position
-                .fill_cm = PPA_FILL_COLOR_MODE_RGB565,  // Output format is RGB565
+                .block_offset_x = x,
+                .block_offset_y = y,
+                .fill_cm = PPA_FILL_COLOR_MODE_RGB565,
             },
-            .fill_block_w = w,  // Rectangle width
-            .fill_block_h = h,  // Rectangle height
+            .fill_block_w = w,
+            .fill_block_h = h,
             .fill_argb_color = fill_color,
             .mode = PPA_TRANS_MODE_BLOCKING,
             .user_data = NULL,
@@ -213,17 +186,13 @@ static void IRAM_ATTR ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int
         
         esp_err_t ret = ppa_do_fill(ppa_fill_handle, &fill_config);
         if (ret == ESP_OK) {
-            return;  // Success - hardware fill completed
+            return;
         }
-        // Log fallback to CPU fill
         ESP_LOGW(TAG, "PPA Fill rect failed (%s), falling back to CPU fill", esp_err_to_name(ret));
     } else {
-        // PPA Fill handle not available
         ESP_LOGD(TAG, "PPA Fill handle not available, using CPU fill for rect");
     }
     
-    // CPU fallback: SIMD-optimized rectangle fill using multi-word writes
-    // Replicate 16-bit RGB565 color to 64-bit word for efficient row filling
     uint64_t color_word = ((uint64_t)color << 48) | ((uint64_t)color << 32) | 
                           ((uint64_t)color << 16) | (uint64_t)color;
     
@@ -231,15 +200,13 @@ static void IRAM_ATTR ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int
         int fy = y + dy;
         if (fy >= 0 && fy < height) {
             uint16_t *row = &fb_ptr[fy * width + x];
-            int word_count = w / 4;  // 4 pixels per 64-bit word
+            int word_count = w / 4;
             uint64_t *row_words = (uint64_t *)row;
             
-            // Fill 4 pixels at a time using 64-bit writes (SIMD-friendly)
             for (int i = 0; i < word_count; i++) {
                 row_words[i] = color_word;
             }
             
-            // Handle remaining pixels in row (0-3 pixels)
             int remainder = w % 4;
             if (remainder > 0) {
                 int start_idx = word_count * 4;
@@ -251,7 +218,6 @@ static void IRAM_ATTR ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int
     }
 }
 
-// RGB565 color constants
 #define RGB565_BLACK   0x0000
 #define RGB565_WHITE   0xFFFF
 #define RGB565_RED     0xF800
@@ -260,14 +226,8 @@ static void IRAM_ATTR ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int
 #define RGB565_YELLOW  0xFFE0
 #define RGB565_MAGENTA 0xF81F
 #define RGB565_CYAN    0x07FF
-#define RGB565_GRAY    0x8410  // Medium gray for muted channels (50% brightness)
-
-// KAMI support removed - Tanmatsu only
-
-// Helper function to draw file browser view
-// Helper function to format channel string consistently
-// use_compact: true for compact format (C4 01 A02), false for full format (C-4 01 A02)
-// Always uses leading zeros for consistency
+#define RGB565_GRAY    0x8410
+#define RGB565_DARK_BLUE 0x1084
 static void IRAM_ATTR format_channel_string(char *ch_str, size_t ch_str_size, 
                                    unsigned char note, unsigned char ins, 
                                    unsigned char fxt, unsigned char fxp, 
@@ -296,24 +256,16 @@ static void IRAM_ATTR format_channel_string(char *ch_str, size_t ch_str_size,
         strcpy(note_str, use_compact ? "--" : "---");
     }
     
-    char effect_char;
-    if (fxt == 0) {
-        effect_char = '-';
-    } else if (fxt < 10) {
-        effect_char = '0' + fxt;
-    } else if (fxt < 16) {
-        effect_char = 'A' + (fxt - 10);
+    if (fxt == 0 && fxp == 0) {
+        snprintf(ch_str, ch_str_size, "%s %02X ----", note_str, ins);
     } else {
-        effect_char = '?';
+        snprintf(ch_str, ch_str_size, "%s %02X %02X%02X", note_str, ins, fxt, fxp);
     }
-    
-    // Always use leading zeros for consistency: "01" not "1", "02" not "2"
-    snprintf(ch_str, ch_str_size, "%s %02X %c%02X", note_str, ins, effect_char, fxp);
 }
 
 static void draw_file_browser(file_browser_t *browser) {
     const int font_scale = 2;
-    const int line_height = FONT_HEIGHT * font_scale;  // 32 pixels for scale 2 (8x16 font)
+    const int line_height = FONT_HEIGHT * font_scale;
     
     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     
@@ -327,9 +279,8 @@ static void draw_file_browser(file_browser_t *browser) {
         path_text[sizeof(path_text) - 1] = '\0';
     }
     font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, RGB565_WHITE, font_scale, path_text);
-    y += line_height + 2;  // Small gap before file list
+    y += line_height + 2;
     
-    // Draw file list (show up to 10 files, centered on selection)
     int start_idx = browser->selected_index > 5 ? browser->selected_index - 5 : 0;
     int end_idx = start_idx + 10;
     if (end_idx > browser->count) end_idx = browser->count;
@@ -338,11 +289,9 @@ static void draw_file_browser(file_browser_t *browser) {
     for (int i = start_idx; i < end_idx; i++) {
         int file_y = file_list_start_y + (i - start_idx) * line_height;
         if (i == browser->selected_index) {
-            // Draw blue highlight - match text height exactly (32 pixels for scale 2 with 8x16 font)
             ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, file_y, CONTENT_WIDTH, line_height, argb32_to_rgb565(0xFF0000FF));
         }
         char name[64];
-        // Special handling for ".." entry - ensure it displays correctly
         if (strcmp(browser->files[i].filename, "..") == 0) {
             snprintf(name, sizeof(name), "[..]");
         } else {
@@ -364,7 +313,6 @@ static void draw_file_browser(file_browser_t *browser) {
     font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, FB_HEIGHT - MARGIN_BOTTOM - line_height, RGB565_WHITE, font_scale, "UP/DN: navigate  RT/ENT: select  LT: back");
 }
 
-// IRAM-safe callback for GDMA completion (no FreeRTOS APIs)
 static volatile bool gdma_copy_done = false;
 
 static bool gdma_memcpy_callback(async_memcpy_handle_t mcp_hdl, async_memcpy_event_t *event, void *cb_args) {
@@ -663,7 +611,7 @@ void app_main(void) {
         audio_diagnose_es8156();
         
         // Initialize MOD player first (task will start but won't play until MOD is loaded)
-        res = mod_player_init(44100);
+        res = mod_player_init(MOD_CONFIG_SAMPLE_RATE);
         
         // Small delay to let MOD player task initialize
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -756,7 +704,7 @@ void app_main(void) {
         browser_active = false;  // Don't show browser if no SD card
     }
 
-    // Tracker UI state - scrolling view with one line per pattern row
+    // Tracker UI state - center-based scrolling view with one line per pattern row
     #define MAX_TRACKER_ROWS 60  // Maximum number of row lines to store (more than screen can display for scrolling)
     struct tracker_tick {
         struct xmp_channel_info channels[MOD_MAX_CHANNELS];
@@ -765,16 +713,18 @@ void app_main(void) {
         int row;
         int num_channels;
     };
-    static struct tracker_tick tick_history[MAX_TRACKER_ROWS] = {0};
+    static struct tracker_tick tick_history[MAX_TRACKER_ROWS] = {0};  // Rows above center (already played)
     static int tick_history_count = 0;
+    static struct tracker_tick current_tick = {0};  // Current row at center (being played)
+    static bool current_tick_valid = false;  // True if current_tick contains valid data
     static int last_row = -1;
     static struct xmp_module_info mod_info = {0};
     static bool mod_info_loaded = false;
     
-    // Smooth scrolling state
-    static int smooth_scroll_offset = 0;  // Current scroll offset in pixels (0 to line_height)
-    static bool pending_new_row = false;  // True when a new row is waiting to be added
-    static struct tracker_tick pending_tick = {0};  // New row data waiting to be added
+    // Smooth scrolling state - center-based scrolling
+    static int smooth_scroll_offset = 0;  // Current scroll offset in pixels (0 to line_height) - rows scroll into center from below
+    static bool pending_new_row = false;  // True when a new row is waiting to be added (below center)
+    static struct tracker_tick pending_tick = {0};  // New row data waiting to scroll into center
     
     // Channel colors (RGB565)
     static const uint16_t channel_colors_rgb565[MOD_MAX_CHANNELS] = {
@@ -864,6 +814,13 @@ void app_main(void) {
                                                     // Store file path for display
                                                     strncpy(current_mod_path, selected_path, sizeof(current_mod_path) - 1);
                                                     current_mod_path[sizeof(current_mod_path) - 1] = '\0';
+                                                    // Show loading message before blocking load operation
+                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 
+                                                                          (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,  // Center horizontally (10 chars * 8px * 2 scale)
+                                                                          (FB_HEIGHT - FONT_HEIGHT * 2) / 2,    // Center vertically (16px * 2 scale)
+                                                                          RGB565_WHITE, 2, "Loading...");
+                                                    blit(-1, 0);
                                                     res = mod_player_load(mod_file_data, mod_file_size);
                                                     if (res == ESP_OK) {
                                                         res = mod_player_start();
@@ -1048,6 +1005,13 @@ void app_main(void) {
                                                 // Store file path for display
                                                 strncpy(current_mod_path, selected_path, sizeof(current_mod_path) - 1);
                                                 current_mod_path[sizeof(current_mod_path) - 1] = '\0';
+                                                // Show loading message before blocking load operation
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 
+                                                                      (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,  // Center horizontally (10 chars * 8px * 2 scale)
+                                                                      (FB_HEIGHT - FONT_HEIGHT * 2) / 2,    // Center vertically (16px * 2 scale)
+                                                                      RGB565_WHITE, 2, "Loading...");
+                                                blit(-1, 0);
                                                 res = mod_player_load(mod_file_data, mod_file_size);
                                                 if (res == ESP_OK) {
                                                     res = mod_player_start();
@@ -1138,6 +1102,13 @@ void app_main(void) {
                                             // Store file path for display
                                             strncpy(current_mod_path, selected_path, sizeof(current_mod_path) - 1);
                                             current_mod_path[sizeof(current_mod_path) - 1] = '\0';
+                                            // Show loading message before blocking load operation
+                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 
+                                                                  (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,  // Center horizontally (10 chars * 8px * 2 scale)
+                                                                  (FB_HEIGHT - FONT_HEIGHT * 2) / 2,    // Center vertically (16px * 2 scale)
+                                                                  RGB565_WHITE, 2, "Loading...");
+                                            blit(-1, 0);
                                             res = mod_player_load(mod_file_data, mod_file_size);
                                             if (res == ESP_OK) {
                                                 res = mod_player_start();
@@ -1285,32 +1256,34 @@ void app_main(void) {
                         static int cached_num_channels = 0;
                         
                         // Recalculate if channel count changed
-                        if (cached_num_channels != num_channels) {
+                        // Use channels_per_page (4) for layout since we paginate channel display
+                        int layout_channels = (visible_channels < channels_per_page) ? visible_channels : channels_per_page;
+                        if (cached_num_channels != layout_channels) {
                             // Dynamic text scaling to use ~85% of content width (after margins: 780px)
                             const int content_width = CONTENT_WIDTH;  // 780 (800 - 10 - 10)
                             const int content_height = CONTENT_HEIGHT;  // 470 (480 - 5 - 5)
                             int available_width = (int)(content_width * 0.85);
-                            int ch_width_estimate = available_width / num_channels;
+                            int ch_width_estimate = available_width / layout_channels;
                             // Scale line height from 16px to 32px based on channel width (8x16 font needs larger range)
                             // This ensures font_scale of at least 1 (16px) up to 2 (32px) for 8x16 font
                             int estimated_line_height = 16 + (ch_width_estimate - 40) * 16 / 200;
                             if (estimated_line_height < 16) estimated_line_height = 16;
                             if (estimated_line_height > 32) estimated_line_height = 32;
-                            
+
                             // Calculate font_scale based on estimated line_height
                             int font_scale = (estimated_line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
                             if (font_scale < 1) font_scale = 1;
                             if (font_scale > 3) font_scale = 3;
-                            
+
                             // Actual rendered text height
                             int actual_text_height = font_scale * FONT_HEIGHT;
-                            
+
                             // Ensure line_height is at least as tall as the rendered text to prevent overlap
                             cached_line_height = (estimated_line_height > actual_text_height) ? estimated_line_height : actual_text_height;
-                            
+
                             cached_max_rows = (int)(content_height / cached_line_height);
                             cached_ch_width = ch_width_estimate;
-                            cached_num_channels = num_channels;
+                            cached_num_channels = layout_channels;
                         }
                         
                         int line_height = cached_line_height;
@@ -1341,7 +1314,6 @@ void app_main(void) {
                         const int logical_height = FB_HEIGHT;  // 480
                         int stride = logical_width;  // Pixels per row in landscape framebuffer (800)
                         
-                        // Helper function to draw header (defined here so it can use variables from outer scope)
                         void draw_header(void) {
                             // Always clear header area exactly (from MARGIN_TOP to header_y, which is MARGIN_TOP + header_height)
                             // This ensures no sliver of content shows below the header and prevents smudging when updating
@@ -1372,36 +1344,51 @@ void app_main(void) {
                         static const char *note_names[12] = {"C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-"};
                         
                         // Determine if we need compact format based on estimated text width
-                        // Full format: "C-4 01 A02" = ~11 chars, Compact: "C4 01 A02" = ~10 chars
-                        // Separator: "|" = 1 char
-                        // Estimate: full format needs ~12 chars per channel, compact needs ~11 chars per channel
+                        // Full format: "C-4 01 0F02" = 11 chars, Compact: "C4 01 0F02" = 10 chars
+                        // Separator: " " = 1 char
+                        // Estimate: full format needs 12 chars per channel, compact needs 11 chars per channel
                         // Calculate font_scale first
                         int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
                         if (font_scale < 1) font_scale = 1;
                         if (font_scale > 3) font_scale = 3;
-                        int estimated_chars_per_channel_full = 12;  // "C-4 01 A02|" 
-                        int estimated_chars_per_channel_compact = 11;  // "C4 01 A02|"
-                        int estimated_total_width_full = estimated_chars_per_channel_full * num_channels * FONT_WIDTH * font_scale;
-                        int estimated_total_width_compact = estimated_chars_per_channel_compact * num_channels * FONT_WIDTH * font_scale;
+                        int estimated_chars_per_channel_full = 12;  // "C-4 01 0F02 "
+                        int estimated_chars_per_channel_compact = 11;  // "C4 01 0F02 "
+                        // Use channels_per_page (4) instead of num_channels for width calculation
+                        // since we only show 4 channels at a time with pagination
+                        int channels_for_width = (visible_channels < 4) ? visible_channels : 4;
+                        int estimated_total_width_full = estimated_chars_per_channel_full * channels_for_width * FONT_WIDTH * font_scale;
+                        int estimated_total_width_compact = estimated_chars_per_channel_compact * channels_for_width * FONT_WIDTH * font_scale;
                         int available_width_pixels = CONTENT_WIDTH;  // 780 pixels
                         bool use_compact_format = (estimated_total_width_full > available_width_pixels);
                         
+                        // Calculate center Y position for current row (middle of visible area)
+                        int scrollable_height = FB_HEIGHT - header_y - MARGIN_BOTTOM;
+                        int center_y = header_y + scrollable_height / 2 - line_height / 2;  // Center vertically, accounting for line_height
+                        
                         if (!tracker_initialized) {
-                            // First render - draw empty rows from top, then first actual row at bottom
-                            // The last empty row must be exactly one line_height above the first actual row
+                            // First render - draw current row at center with highlight
                             // First render - full screen (fb_fill already clears all margins)
                             ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                             
                             // Draw header on first render (always clear to ensure exact alignment)
                             draw_header();
                             
-                            // Calculate the position of the first actual row (at the bottom)
-                            int first_actual_row_y = logical_height - MARGIN_BOTTOM - line_height;
+                            // Initialize current tick with first frame data
+                            memcpy(current_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
+                            current_tick.pos = frame_info.pos;
+                            current_tick.pattern = frame_info.pattern;
+                            current_tick.row = frame_info.row;
+                            current_tick.num_channels = num_channels;
+                            current_tick_valid = true;
                             
-                            // Don't draw empty rows - just draw the first actual row at the bottom
-                            int y = first_actual_row_y;
+                            // Draw current row at center with highlight background
+                            int y = center_y;
                             
-                            // Draw current frame data directly (not from history) - with pagination and centering
+                            // Draw highlight background for current row (full width of content area)
+                            int highlight_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, highlight_width, line_height, RGB565_DARK_BLUE);
+                            
+                            // Draw current frame data at center (from current_tick) - with pagination and centering
                             {
                                 int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
                                 if (font_scale < 1) font_scale = 1;
@@ -1465,7 +1452,7 @@ void app_main(void) {
                             
                             tracker_initialized = true;
                             // Initialize last_row to current row to prevent immediate scrolling on first frame
-                            last_row = frame_info.row;
+                            last_row = current_tick.row;
                             // Reset smooth scrolling state for clean start
                             smooth_scroll_offset = 0;
                             pending_new_row = false;
@@ -1487,6 +1474,41 @@ void app_main(void) {
                             // Track when current row started and its duration
                             static TickType_t row_start_tick = 0;
                             static float current_row_duration_ms = 0.0f;
+                            
+                            // Fixed grid approach: update history immediately when row changes
+                            // This keeps history and future rows in sync (both update based on current position)
+                            if (frame_info.row != last_row) {
+                                // Immediately add current row to history when it changes (for fixed grid)
+                                // This ensures history rows appear at the same rate as future rows disappear
+                                if (current_tick_valid && last_row >= 0) {
+                                    // Move previous row to history immediately
+                                    if (tick_history_count < MAX_TRACKER_ROWS) {
+                                        memcpy(tick_history[tick_history_count].channels, current_tick.channels, sizeof(current_tick.channels));
+                                        tick_history[tick_history_count].pos = current_tick.pos;
+                                        tick_history[tick_history_count].pattern = current_tick.pattern;
+                                        tick_history[tick_history_count].row = current_tick.row;
+                                        tick_history[tick_history_count].num_channels = current_tick.num_channels;
+                                        tick_history_count++;
+                                    } else {
+                                        // Shift history (oldest first, so remove oldest)
+                                        memmove(tick_history, tick_history + 1, (MAX_TRACKER_ROWS - 1) * sizeof(struct tracker_tick));
+                                        memcpy(tick_history[MAX_TRACKER_ROWS - 1].channels, current_tick.channels, sizeof(current_tick.channels));
+                                        tick_history[MAX_TRACKER_ROWS - 1].pos = current_tick.pos;
+                                        tick_history[MAX_TRACKER_ROWS - 1].pattern = current_tick.pattern;
+                                        tick_history[MAX_TRACKER_ROWS - 1].row = current_tick.row;
+                                        tick_history[MAX_TRACKER_ROWS - 1].num_channels = current_tick.num_channels;
+                                    }
+                                }
+                                // Update current tick with new row data immediately
+                                memcpy(current_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
+                                current_tick.pos = frame_info.pos;
+                                current_tick.pattern = frame_info.pattern;
+                                current_tick.row = frame_info.row;
+                                current_tick.num_channels = num_channels;
+                                current_tick_valid = true;
+                                
+                                last_row = frame_info.row;
+                            }
                             
                             // Check if we have a new row - allow continuous scrolling without waiting
                             if (frame_info.row != last_row && !pending_new_row) {
@@ -1531,8 +1553,8 @@ void app_main(void) {
                             // Calculate scroll position based on elapsed time since row started
                             // Only scroll if we have a pending row
                             if (pending_new_row && current_row_duration_ms > 0.0f) {
-                                TickType_t current_tick = xTaskGetTickCount();
-                                TickType_t elapsed_ticks = current_tick - row_start_tick;
+                                TickType_t current_time = xTaskGetTickCount();
+                                TickType_t elapsed_ticks = current_time - row_start_tick;
                                 float elapsed_ms = (float)elapsed_ticks * (1000.0f / configTICK_RATE_HZ);
                                 
                                 // Calculate scroll position: 0 to line_height over row_duration_ms
@@ -1542,92 +1564,130 @@ void app_main(void) {
                                 
                                 smooth_scroll_offset = (int)(scroll_progress * (float)line_height);
                                 
-                                // If we've completed scrolling this row, add it to history
-                                if (smooth_scroll_offset >= line_height) {
-                                    smooth_scroll_offset = line_height;  // Clamp to line_height
-                                    
-                                    // Add the row to history
-                                    if (tick_history_count < MAX_TRACKER_ROWS) {
-                                        memcpy(tick_history[tick_history_count].channels, pending_tick.channels, sizeof(pending_tick.channels));
-                                        tick_history[tick_history_count].pos = pending_tick.pos;
-                                        tick_history[tick_history_count].pattern = pending_tick.pattern;
-                                        tick_history[tick_history_count].row = pending_tick.row;
-                                        tick_history[tick_history_count].num_channels = pending_tick.num_channels;
-                                        tick_history_count++;
-                                    } else {
-                                        // Shift history
-                                        memmove(tick_history, tick_history + 1, (MAX_TRACKER_ROWS - 1) * sizeof(struct tracker_tick));
-                                        memcpy(tick_history[MAX_TRACKER_ROWS - 1].channels, pending_tick.channels, sizeof(pending_tick.channels));
-                                        tick_history[MAX_TRACKER_ROWS - 1].pos = pending_tick.pos;
-                                        tick_history[MAX_TRACKER_ROWS - 1].pattern = pending_tick.pattern;
-                                        tick_history[MAX_TRACKER_ROWS - 1].row = pending_tick.row;
-                                        tick_history[MAX_TRACKER_ROWS - 1].num_channels = pending_tick.num_channels;
-                                    }
-                                    
-                                    // Row completed scrolling - add to history and prepare for next
-                                    pending_new_row = false;
-                                    smooth_scroll_offset = 0;  // Reset for next row
-                                    // last_row is already updated when we detect the new row
-                                    
-                                    // Immediately check if there's already a new row waiting
-                                    // This prevents hitching by starting the next scroll immediately
-                                    if (frame_info.row != last_row && !pending_new_row) {
-                                        // New row already available - start scrolling it immediately
-                                        pending_new_row = true;
-                                        memcpy(pending_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
-                                        pending_tick.pos = frame_info.pos;
-                                        pending_tick.pattern = frame_info.pattern;
-                                        pending_tick.row = frame_info.row;
-                                        pending_tick.num_channels = num_channels;
-                                        
-                                        float row_duration_us = (float)frame_info.speed * (float)frame_info.frame_time;
-                                        float single_row_duration_ms = row_duration_us / 1000.0f;
-                                        const int ROWS_PER_SCROLL = 3;
-                                        current_row_duration_ms = single_row_duration_ms * ROWS_PER_SCROLL;
-                                        
-                                        row_start_tick = xTaskGetTickCount();
-                                        smooth_scroll_offset = 0;
-                                        last_row = frame_info.row;
-                                    }
-                                }
+                                // Note: In fixed grid mode, history is updated immediately when frame_info.row changes
+                                // (handled above), so we don't need to move rows here. The smooth_scroll_offset
+                                // is kept for potential future use but doesn't affect the fixed grid display.
                             }
                             
-                            // Don't scroll the framebuffer - instead, redraw all visible rows at their correct positions
-                            // This prevents double movement and gives us full control
+                            // Fixed row grid approach: calculate how many rows fit on screen
+                            // Divide screen into fixed row positions, update data on row changes
+                            int num_visible_rows = scrollable_height / line_height;  // How many complete rows fit
+                            // Calculate center row index: reserve one row for center, split rest above/below
+                            // This ensures center row is always visible and not overwritten
+                            int rows_available = num_visible_rows - 1;  // Reserve 1 for center row
+                            int rows_above_center = rows_available / 2;  // Equal split of remaining rows
+                            int rows_below_center = rows_available - rows_above_center;  // Rest go below
+                            // Add one more row to pending section (may slightly overflow, that's ok)
+                            rows_below_center += 1;
+                            // Adjust num_visible_rows to account for the extra row
+                            num_visible_rows = rows_above_center + 1 + rows_below_center;  // above + center + below (including extra)
+                            int center_row_idx = rows_above_center;  // Center is after all rows above
+                            // Example: 10 visible rows -> 9 available, 4 above + 1 center + 5+1=6 below = 11 total
+                            // Example: 11 visible rows -> 10 available, 5 above + 1 center + 5+1=6 below = 12 total
                             
-                            // Don't clear the entire area every frame - causes flickering
-                            // Instead, we'll clear only the areas that need it as we draw rows
+                            // Vertically center all rows in the available space
+                            // First, calculate how many rows will actually fit (check if last row would overflow)
+                            int max_row_y = header_y + (num_visible_rows - 1) * line_height + line_height;
+                            int actual_rows_count = num_visible_rows;
+                            if (max_row_y > logical_height - MARGIN_BOTTOM) {
+                                // Last row would overflow, so we'll skip it - adjust count for centering
+                                actual_rows_count = num_visible_rows - 1;
+                            }
                             
-                            // Redraw all visible rows from history at their correct positions
-                            // Rows in history are stored chronologically (oldest first, newest last)
-                            // We need to draw them from bottom to top, with the most recent at the bottom
-                            int num_visible_rows = (scrollable_height + line_height - 1) / line_height + 1;  // +1 for partial row
+                            // Calculate total height needed for rows that will actually be drawn
+                            int total_rows_height = actual_rows_count * line_height;
+                            // Calculate vertical offset to center the rows in scrollable_height
+                            int vertical_offset = (scrollable_height - total_rows_height) / 2;
+                            // Calculate starting Y position (header_y + offset to center rows)
+                            int rows_start_y = header_y + vertical_offset;
                             
-                            for (int i = 0; i < num_visible_rows && i < tick_history_count; i++) {
-                                // Start from most recent row (last in history) and work backwards
-                                int history_idx = tick_history_count - 1 - i;
-                                if (history_idx < 0) break;
+                            // Calculate actual center Y position based on center_row_idx
+                            // This matches the fixed grid - center_y for first render will be recalculated if needed
+                            int actual_center_y = rows_start_y + (center_row_idx * line_height);
+                            center_y = actual_center_y;  // Update center_y to match fixed grid
+                            
+                            // Clear content area before drawing
+                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, header_y, 
+                                         FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT, scrollable_height, RGB565_BLACK);
+                            
+                            // Draw all visible rows at fixed positions (vertically centered)
+                            for (int row_idx = 0; row_idx < num_visible_rows; row_idx++) {
+                                int y = rows_start_y + (row_idx * line_height);  // Fixed position for this row, vertically centered
                                 
-                                // Calculate Y position: most recent row is at bottom, older rows above
-                                // Account for smooth_scroll_offset to position correctly
-                                // When smooth_scroll_offset is 0, rows are at integer line_height positions
-                                // As smooth_scroll_offset increases, rows move UP (subtract offset)
-                                int y = logical_height - MARGIN_BOTTOM - line_height - (i * line_height) - smooth_scroll_offset;
+                                // Skip rows that would overflow below the visible area
+                                // This prevents the extra pending row from showing remnants at the bottom
+                                if (y + line_height > logical_height - MARGIN_BOTTOM) {
+                                    continue;  // Skip this row - it's partially or fully off-screen
+                                }
                                 
-                                // Only draw if row is fully below header (y must be >= header_y)
-                                // This prevents any pixels from being drawn into the header area
-                                if (y >= header_y && y < logical_height - MARGIN_BOTTOM) {
-                                    // Clear the row area before drawing to prevent smudging
-                                    int row_clear_y = y;
-                                    int row_clear_end = (y + line_height > logical_height - MARGIN_BOTTOM) ? (logical_height - MARGIN_BOTTOM) : (y + line_height);
-                                    if (row_clear_y < row_clear_end) {
-                                        int clear_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
-                                        int clear_height = row_clear_end - row_clear_y;
-                                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, row_clear_y, clear_width, clear_height, RGB565_BLACK);
+                                // Determine which data to draw for this row index
+                                struct tracker_tick *tick = NULL;
+                                bool is_current_row = false;
+                                
+                                if (row_idx < center_row_idx) {
+                                    // Rows above center: history rows (most recent closest to center)
+                                    int history_offset = center_row_idx - row_idx - 1;  // 0 = most recent, 1 = older, etc.
+                                    if (history_offset < tick_history_count) {
+                                        int history_idx = tick_history_count - 1 - history_offset;  // Most recent is last in history
+                                        if (history_idx >= 0) {
+                                            tick = &tick_history[history_idx];
+                                        }
+                                    }
+                                } else if (row_idx == center_row_idx) {
+                                    // Center row: ALWAYS use frame_info (current playing row)
+                                    is_current_row = true;
+                                    tick = NULL;  // Always use frame_info for current row
+                                } else {
+                                    // Rows below center: future rows from pattern
+                                    tick = NULL;  // Will fetch from pattern
+                                }
+                                
+                                // Now draw this row at fixed position y
+                                // Get row data - either from tick, frame_info (for current), or pattern (for future)
+                                struct xmp_channel_info row_channels[MOD_MAX_CHANNELS];
+                                bool has_data = false;
+                                int future_row_num = -1;
+                                int future_pattern = -1;  // Pattern to use for future rows (may differ from current pattern)
+                                
+                                if (tick != NULL) {
+                                    // Use tick data (history rows)
+                                    memcpy(row_channels, tick->channels, sizeof(tick->channels));
+                                    has_data = true;
+                                } else if (is_current_row) {
+                                    // Current row - ALWAYS use frame_info (what's actually playing now)
+                                    memcpy(row_channels, frame_info.channel_info, sizeof(frame_info.channel_info));
+                                    has_data = true;
+                                } else if (row_idx > center_row_idx) {
+                                    // Future row - fetch from current pattern only (no peek-ahead to next pattern)
+                                    int future_offset = row_idx - center_row_idx - 1;  // 0 = next row, 1 = row after, etc.
+                                    int target_row = frame_info.row + future_offset + 1;  // +1 because next row is after current
+                                    
+                                    // Try to fetch from current pattern at target row
+                                    uint8_t test_note = 0;
+                                    esp_err_t test_ret = mod_player_get_pattern_row_channel(frame_info.pattern, target_row, 0, &test_note, NULL, NULL, NULL);
+                                    
+                                    if (test_ret == ESP_OK) {
+                                        // Pattern access works - will fetch all channels
+                                        future_pattern = frame_info.pattern;
+                                        future_row_num = target_row;
+                                        has_data = true;
+                                    } else {
+                                        // Pattern access failed (out of bounds) - show empty row
+                                        has_data = false;
+                                        future_row_num = -1;
+                                        future_pattern = -1;
+                                    }
+                                }
+                                
+                                // Draw row if we have data
+                                if (has_data) {
+                                    // Draw highlight background for current row only
+                                    if (is_current_row) {
+                                        int highlight_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+                                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, highlight_width, line_height, RGB565_DARK_BLUE);
                                     }
                                     
-                                    // Draw the row from history - with pagination and centering
-                                    struct tracker_tick *tick = &tick_history[history_idx];
+                                    // Calculate font scale
                                     int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
                                     if (font_scale < 1) font_scale = 1;
                                     if (font_scale > 3) font_scale = 3;
@@ -1640,13 +1700,29 @@ void app_main(void) {
                                     
                                     for (int i = 0; i < visible_channels; i++) {
                                         int ch = start_channel + i;
-                                        if (ch >= tick->num_channels) break;
-                                        struct xmp_channel_info *ci = &tick->channels[ch];
+                                        if (ch >= num_channels) break;
+                                        
+                                        uint8_t note = 0, ins = 0, fxt = 0, fxp = 0;
+                                        
+                                        if (future_row_num >= 0) {
+                                            // Future row - fetch from pattern (may be from next pattern if we're at end of current)
+                                            int pattern_to_use = (future_pattern >= 0) ? future_pattern : frame_info.pattern;
+                                            esp_err_t pat_ret = mod_player_get_pattern_row_channel(pattern_to_use, future_row_num, ch, &note, &ins, &fxt, &fxp);
+                                            if (pat_ret != ESP_OK) {
+                                                // Pattern access failed - skip this row
+                                                has_data = false;
+                                                break;
+                                            }
+                                        } else {
+                                            // Use row_channels data
+                                            note = row_channels[ch].event.note;
+                                            ins = row_channels[ch].event.ins;
+                                            fxt = row_channels[ch].event.fxt;
+                                            fxp = row_channels[ch].event.fxp;
+                                        }
+                                        
                                         char ch_str[64];
-                                        format_channel_string(ch_str, sizeof(ch_str), 
-                                                             ci->event.note, ci->event.ins, 
-                                                             ci->event.fxt, ci->event.fxp,
-                                                             use_compact_format, note_names);
+                                        format_channel_string(ch_str, sizeof(ch_str), note, ins, fxt, fxp, use_compact_format, note_names);
                                         channel_widths[i] = strlen(ch_str) * FONT_WIDTH * font_scale;
                                         total_width += channel_widths[i];
                                         if (i < visible_channels - 1) {
@@ -1654,89 +1730,8 @@ void app_main(void) {
                                         }
                                     }
                                     
-                                    // Calculate starting X position to center the channels
-                                    int content_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
-                                    int start_x = MARGIN_LEFT + (content_width - total_width) / 2;
-                                    
-                                    // Render channels centered
-                                    int x = start_x;
-                                    for (int i = 0; i < visible_channels; i++) {
-                                        int ch = start_channel + i;
-                                        if (ch >= tick->num_channels) break;
-                                        struct xmp_channel_info *ci = &tick->channels[ch];
-                                        char ch_str[64];
-                                        format_channel_string(ch_str, sizeof(ch_str), 
-                                                             ci->event.note, ci->event.ins, 
-                                                             ci->event.fxt, ci->event.fxp,
-                                                             use_compact_format, note_names);
-                                        
-                                        bool channel_muted = false;
-                                        mod_player_get_channel_mute(ch, &channel_muted);
-                                        uint16_t ch_color = channel_muted ? RGB565_GRAY : channel_colors_rgb565[ch % MOD_MAX_CHANNELS];
-                                        
-                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, ch_color, font_scale, ch_str);
-                                        x += channel_widths[i];
-                                        
-                                        // Draw separator and vertical line between channels (not after last)
-                                        if (i < visible_channels - 1) {
-                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
-                                            int line_x = x + separator_width / 2;  // Middle of the space
-                                            int line_top = header_y;  // Start from header bottom
-                                            int line_bottom = logical_height - MARGIN_BOTTOM;  // End at content bottom
-                                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, line_x, line_top, 1, line_bottom - line_top, RGB565_GRAY);
-                                            x += separator_width;
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Draw the new row progressively as it scrolls in from below
-                            // Position it so it appears to scroll up smoothly
-                            if (pending_new_row) {
-                                    // Calculate where to draw the new row (offset by remaining scroll distance)
-                                    // When smooth_scroll_offset is 0, row starts at bottom
-                                    // When smooth_scroll_offset is line_height, row is fully scrolled in
-                                    int remaining_scroll = line_height - smooth_scroll_offset;
-                                    int y = logical_height - MARGIN_BOTTOM - line_height + remaining_scroll;
-                                    
-                                    // Only draw if the row is fully below header (y must be >= header_y)
-                                    // This prevents any pixels from being drawn into the header area
-                                    if (y >= header_y && y < logical_height - MARGIN_BOTTOM) {
-                                        // Always clear the row area before drawing to ensure clean rendering
-                                        int row_clear_y = y;
-                                        int row_clear_end = (y + line_height > logical_height - MARGIN_BOTTOM) ? (logical_height - MARGIN_BOTTOM) : (y + line_height);
-                                        if (row_clear_y < row_clear_end) {
-                                            int clear_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
-                                            int clear_height = row_clear_end - row_clear_y;
-                                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, row_clear_y, clear_width, clear_height, RGB565_BLACK);
-                                        }
-                                        
-                                        // Render pending row with pagination and centering
-                                        int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
-                                        if (font_scale < 1) font_scale = 1;
-                                        if (font_scale > 3) font_scale = 3;
-                                        
-                                        // Calculate total width of visible channels
-                                        int total_width = 0;
-                                        int channel_widths[4];  // Max 4 channels per page
-                                        const char *separator = " ";
-                                        int separator_width = strlen(separator) * FONT_WIDTH * font_scale;
-                                        
-                                        for (int i = 0; i < visible_channels; i++) {
-                                            int ch = start_channel + i;
-                                            struct xmp_channel_info *ci = &pending_tick.channels[ch];
-                                            char ch_str[64];
-                                            format_channel_string(ch_str, sizeof(ch_str), 
-                                                                 ci->event.note, ci->event.ins, 
-                                                                 ci->event.fxt, ci->event.fxp,
-                                                                 use_compact_format, note_names);
-                                            channel_widths[i] = strlen(ch_str) * FONT_WIDTH * font_scale;
-                                            total_width += channel_widths[i];
-                                            if (i < visible_channels - 1) {
-                                                total_width += separator_width;
-                                            }
-                                        }
-                                        
+                                    // Only draw if we successfully got data for all channels
+                                    if (has_data) {
                                         // Calculate starting X position to center the channels
                                         int content_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
                                         int start_x = MARGIN_LEFT + (content_width - total_width) / 2;
@@ -1745,12 +1740,22 @@ void app_main(void) {
                                         int x = start_x;
                                         for (int i = 0; i < visible_channels; i++) {
                                             int ch = start_channel + i;
-                                            struct xmp_channel_info *ci = &pending_tick.channels[ch];
+                                            if (ch >= num_channels) break;
+                                            
+                                            uint8_t note = 0, ins = 0, fxt = 0, fxp = 0;
+                                            if (future_row_num >= 0) {
+                                                // Future row - use future_pattern if we're at end of current pattern
+                                                int pattern_to_use = (future_pattern >= 0) ? future_pattern : frame_info.pattern;
+                                                mod_player_get_pattern_row_channel(pattern_to_use, future_row_num, ch, &note, &ins, &fxt, &fxp);
+                                            } else {
+                                                note = row_channels[ch].event.note;
+                                                ins = row_channels[ch].event.ins;
+                                                fxt = row_channels[ch].event.fxt;
+                                                fxp = row_channels[ch].event.fxp;
+                                            }
+                                            
                                             char ch_str[64];
-                                            format_channel_string(ch_str, sizeof(ch_str), 
-                                                                 ci->event.note, ci->event.ins, 
-                                                                 ci->event.fxt, ci->event.fxp,
-                                                                 use_compact_format, note_names);
+                                            format_channel_string(ch_str, sizeof(ch_str), note, ins, fxt, fxp, use_compact_format, note_names);
                                             
                                             bool channel_muted = false;
                                             mod_player_get_channel_mute(ch, &channel_muted);
@@ -1770,9 +1775,8 @@ void app_main(void) {
                                             }
                                         }
                                     }
+                                }
                             }
-                            
-                            // No need to draw empty rows - just let the background show through
                         }
                     }
                     

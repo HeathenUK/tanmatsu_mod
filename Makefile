@@ -119,7 +119,9 @@ checkbuildenv:
 
 .PHONY: build
 build: checkbuildenv submodules
-	source "$(IDF_PATH)/export.sh" >/dev/null && idf.py -B $(BUILD) build -DDEVICE=$(DEVICE)
+	export IDF_TOOLS_PATH="$(IDF_TOOLS_PATH)" && \
+	source "$(IDF_PATH)/export.sh" >/dev/null && \
+	idf.py -B $(BUILD) build -DDEVICE=$(DEVICE)
 
 # Hardware
 
@@ -190,7 +192,9 @@ badgelink:
 .PHONY: install
 install: build
 install:
-	cd badgelink/tools; ./badgelink.sh appfs upload application "Trackmatsu" 0 ../../build/tanmatsu/application.bin
+	export IDF_TOOLS_PATH="$(IDF_TOOLS_PATH)" && \
+	source "$(IDF_PATH)/export.sh" >/dev/null && \
+	cd badgelink/tools && ./badgelink.sh appfs upload application "Trackmatsu" 0 ../../build/tanmatsu/application.bin
 
 .PHONY: run
 run:
