@@ -1,20 +1,54 @@
+# Build outputs
 build/
+*.o
+*.a
+*.elf
+*.bin
+*.map
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 tags
-main/kbelf_lib.c
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+tools/__pycache__/
+
+# ESP-IDF SDK and tools (submodules or downloaded)
+esp-idf/
+esp-idf-tools/
+
+# ESP-IDF managed components (downloaded dependencies)
+managed_components/
+
+# Badgelink (if it's a submodule or external dependency)
+badgelink/
+
+# Build configuration (generated, but keep defaults)
+sdkconfig
 sdkconfig.old
-*.bak
-*.old
-.vscode
-tools/__pycache__
-.cache
-esp-idf
-esp-idf-tools
+sdkconfig.ci
+sdkconfig_*
 dependencies.lock
-managed_components
+
+# Environment files
 .IDF_PATH
 .IDF_TOOLS_PATH
-shell.nix
-sdkconfig*
+env
+.cache
 .submodules_update_done
-badgelink
-sdkconfig_*
+
+# Platform-specific ignores
+shell.nix
+
+# Temporary files
+*.bak
+*.old
+main/kbelf_lib.c
