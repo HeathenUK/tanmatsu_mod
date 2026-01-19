@@ -302,45 +302,6 @@ void app_main(void) {
     // of ticks to wait, for example pdMS_TO_TICKS(1000)
 
     // File browser state (static to avoid stack overflow)
-    static file_browser_t browser = {0};
-    static bool browser_active = false;
-    static uint8_t *mod_file_data = NULL;
-    static size_t mod_file_size = 0;
-    static char current_mod_path[MAX_FILENAME_LEN] = {0};  // Store current MOD file path for display
-
-    // Start with file browser if SD card is mounted
-    // NOTE: Don't call blit() here - the main loop will render and call blit() once per frame
-    if (sdcard_is_mounted()) {
-        browser_active = true;
-        file_browser_init(&browser, "/sdcard");
-        // Initial file browser will be drawn in main loop when browser_rendered is false
-    } else {
-        // No SD card - show error (will be drawn in main loop)
-        browser_active = false;  // Don't show browser if no SD card
-    }
-
-    // Tracker UI state - center-based scrolling view with one line per pattern row
-    #define MAX_TRACKER_ROWS 60  // Maximum number of row lines to store (more than screen can display for scrolling)
-    struct tracker_tick {
-        struct xmp_channel_info channels[MOD_MAX_CHANNELS];
-        int pos;
-        int pattern;
-        int row;
-        int num_channels;
-    };
-    static struct tracker_tick tick_history[MAX_TRACKER_ROWS] = {0};  // Rows above center (already played)
-    static int tick_history_count = 0;
-    static struct tracker_tick current_tick = {0};  // Current row at center (being played)
-    static bool current_tick_valid = false;  // True if current_tick contains valid data
-    static int last_row = -1;
-    static struct xmp_module_info mod_info = {0};
-    static bool mod_info_loaded = false;
-    
-    // Smooth scrolling state - center-based scrolling
-    static int smooth_scroll_offset = 0;  // Current scroll offset in pixels (0 to line_height) - rows scroll into center from below
-    static bool pending_new_row = false;  // True when a new row is waiting to be added (below center)
-    static struct tracker_tick pending_tick = {0};  // New row data waiting to scroll into center
-    
     // Channel colors (RGB565)
     static const uint16_t channel_colors_rgb565[MOD_MAX_CHANNELS] = {
         0xF800, 0x07E0, 0x001F, 0xFFE0,  // Red, Green, Blue, Yellow
@@ -359,6 +320,17 @@ void app_main(void) {
         0xFC1F, 0x87FF, 0xFFF0, 0x8410,
     };
 
+    // Start with file browser if SD card is mounted
+    // NOTE: Don't call blit() here - the main loop will render and call blit() once per frame
+    if (sdcard_is_mounted()) {
+        state->browser_active = true;
+        file_browser_init(&state->browser, "/sdcard");
+        // Initial file browser will be drawn in main loop when browser_rendered is false
+    } else {
+        // No SD card - show error (will be drawn in main loop)
+        state->browser_active = false;  // Don't show browser if no SD card
+    }
+
     while (1) {
         PROFILING_START(frame);
         
@@ -371,14 +343,14 @@ void app_main(void) {
         
         // Set up input handler context
         input_handler_context_t input_ctx = {
-            .browser = &browser,
-            .browser_active = &browser_active,
+            .browser = &state->browser,
+            .browser_active = &state->browser_active,
             .playing = mod_player_is_playing(),
             .paused = mod_player_is_paused(),
             .current_volume = 0.0f,
-            .current_view = current_view,
-            .tab_pressed = &tab_pressed_this_frame,
-            .view_key_pressed = &view_key_pressed,
+            .current_view = state->current_view,
+            .tab_pressed = &state->tab_pressed_this_frame,
+            .view_key_pressed = &state->view_key_pressed,
         };
         audio_get_volume(&input_ctx.current_volume);
         
@@ -412,20 +384,20 @@ void app_main(void) {
                             }
 
                             // Free previous MOD data if any
-                            if (mod_file_data) {
-                                free(mod_file_data);
+                            if (state->mod_file.data) {
+                                free(state->mod_file.data);
                             }
 
                             // Allocate file buffer in PSRAM
-                            mod_file_data = (uint8_t *)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-                            if (mod_file_data) {
-                                size_t read = fread(mod_file_data, 1, file_size, f);
+                            state->mod_file.data = (uint8_t *)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+                            if (state->mod_file.data) {
+                                size_t read = fread(state->mod_file.data, 1, file_size, f);
                                 fclose(f);
 
                                 if (read == file_size) {
-                                    mod_file_size = file_size;
-                                    strncpy(current_mod_path, action_result.data.load_mod.path, sizeof(current_mod_path) - 1);
-                                    current_mod_path[sizeof(current_mod_path) - 1] = '\0';
+                                    state->mod_file.size = file_size;
+                                    strncpy(state->mod_file.path, action_result.data.load_mod.path, sizeof(state->mod_file.path) - 1);
+                                    state->mod_file.path[sizeof(state->mod_file.path) - 1] = '\0';
                                     
                                     // Show loading message
                                     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
@@ -435,19 +407,19 @@ void app_main(void) {
                                                           RGB565_WHITE, 2, "Loading...");
                                     blit(-1, 0);
                                     
-                                    res = mod_player_load(mod_file_data, mod_file_size);
+                                    res = mod_player_load(state->mod_file.data, state->mod_file.size);
                                     if (res == ESP_OK) {
                                         res = mod_player_start();
                                         if (res == ESP_OK) {
-                                            browser_active = false;
-                                            mod_info_loaded = false;
-                                            current_view = VIEW_TRACKER;
+                                            state->browser_active = false;
+                                            state->tracker.mod_info_loaded = false;
+                                            state->current_view = APP_VIEW_TRACKER;
                                             
                                             // Reset VU meter levels
                                             for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
-                                                channel_vu_levels[i] = 0.0f;
-                                                channel_vu_peaks[i] = 0.0f;
-                                                channel_peak_hold[i] = 0;
+                                                state->vu_state.levels[i] = 0.0f;
+                                                state->vu_state.peaks[i] = 0.0f;
+                                                state->vu_state.peak_hold[i] = 0;
                                             }
                                             
                                             ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
@@ -457,15 +429,15 @@ void app_main(void) {
                                             blit(-1, 0);
                                         }
                                     } else {
-                                        free(mod_file_data);
-                                        mod_file_data = NULL;
+                                        free(state->mod_file.data);
+                                        state->mod_file.data = NULL;
                                         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
                                         blit(-1, 0);
                                     }
                                 } else {
-                                    free(mod_file_data);
-                                    mod_file_data = NULL;
+                                    free(state->mod_file.data);
+                                    state->mod_file.data = NULL;
                                     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                     font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
                                     blit(-1, 0);
@@ -496,8 +468,8 @@ void app_main(void) {
                         
                     case INPUT_ACTION_RETURN_TO_BROWSER:
                         mod_player_stop();
-                        browser_active = true;
-                        file_browser_refresh(&browser);
+                        state->browser_active = true;
+                        file_browser_refresh(&state->browser);
                         needs_render = true;
                         break;
                         
@@ -529,12 +501,12 @@ void app_main(void) {
         // Render file browser if needed (input handlers set needs_render flag)
         // Also render on first loop if browser is active but hasn't been rendered yet
         static bool browser_rendered = false;
-        if (browser_active && (needs_render || !browser_rendered)) {
-            draw_file_browser(&browser);
+        if (state->browser_active && (needs_render || !browser_rendered)) {
+            draw_file_browser(&state->browser);
             needs_render = false;  // Clear flag after rendering
             browser_rendered = true;  // Mark as rendered
             did_render = true;  // Mark that we rendered this frame
-        } else if (!browser_active) {
+        } else if (!state->browser_active) {
             browser_rendered = false;  // Reset when browser becomes inactive
         }
         
@@ -542,7 +514,7 @@ void app_main(void) {
         static bool error_rendered = false;
         static bool last_sdcard_mounted = false;
         bool current_sdcard_mounted = sdcard_is_mounted();
-        if (!browser_active && !mod_player_is_playing() && !current_sdcard_mounted && (!error_rendered || last_sdcard_mounted != current_sdcard_mounted)) {
+        if (!state->browser_active && !mod_player_is_playing() && !current_sdcard_mounted && (!error_rendered || last_sdcard_mounted != current_sdcard_mounted)) {
             ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
             font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "SD card not mounted");
             font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 18, RGB565_WHITE, 2, "Insert SD card and");
@@ -556,15 +528,15 @@ void app_main(void) {
         
         // Render tracker UI if playing
         // For smooth scrolling, we need to render every frame, not just on row changes
-        if (mod_player_is_playing() && !browser_active) {
+        if (mod_player_is_playing() && !state->browser_active) {
             // Track mode transitions - clear framebuffer when switching from browser to playback
             static bool last_browser_active = true;
-            if (last_browser_active && !browser_active) {
+            if (last_browser_active && !state->browser_active) {
                 // Switching from browser to playback - clear framebuffer for clean transition
                 ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                 did_render = true;  // Ensure we blit to show the cleared screen
             }
-            last_browser_active = browser_active;
+            last_browser_active = state->browser_active;
             
             PROFILING_START(render);
             struct xmp_frame_info frame_info;
@@ -574,22 +546,22 @@ void app_main(void) {
                 {
                     // Load module info if not loaded
                     static bool tracker_initialized = false;  // Declare here so it persists across renders
-                    if (!mod_info_loaded) {
-                        mod_player_get_module_info(&mod_info);
-                        mod_info_loaded = true;
+                    if (!state->tracker.mod_info_loaded) {
+                        mod_player_get_module_info(&state->tracker.mod_info);
+                        state->tracker.mod_info_loaded = true;
                         // Reset tracker_initialized when module info is reloaded (new MOD started)
                         tracker_initialized = false;
-                        tick_history_count = 0;  // Reset tick history for new MOD
-                        last_row = -1;  // Reset last_row to force first render
-                        channel_page_offset = 0;  // Reset to first page when loading new MOD
+                        state->tracker.tick_history_count = 0;  // Reset tick history for new MOD
+                        state->tracker.last_row = -1;  // Reset state->tracker.last_row to force first render
+                        state->channel_page_offset = 0;  // Reset to first page when loading new MOD
                     }
                     
-                    int num_channels = mod_info.mod ? mod_info.mod->chn : 0;
+                    int num_channels = state->tracker.mod_info.mod ? state->tracker.mod_info.mod->chn : 0;
                     if (num_channels > 0 && num_channels <= MOD_MAX_CHANNELS) {
                         // Handle view mode toggle ('V' key)
-                        if (view_key_pressed) {
-                            current_view = (playback_view_t)((current_view + 1) % 3);  // Cycle through VIEW_TRACKER, VIEW_SPECTRUM, VIEW_INFO
-                            view_key_pressed = false;
+                        if (state->view_key_pressed) {
+                            state->current_view = (app_playback_view_t)((state->current_view + 1) % 3);  // Cycle through APP_VIEW_TRACKER, APP_VIEW_SPECTRUM, APP_VIEW_INFO
+                            state->view_key_pressed = false;
                             // Clear framebuffer when switching views
                             ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
                         }
@@ -600,46 +572,46 @@ void app_main(void) {
                             float target_level = (float)frame_info.channel_info[ch].volume / 64.0f;
 
                             // Smoothed attack and decay to reduce flicker
-                            if (target_level > channel_vu_levels[ch]) {
+                            if (target_level > state->vu_state.levels[ch]) {
                                 // Smoothed attack - lerp toward target
-                                channel_vu_levels[ch] += (target_level - channel_vu_levels[ch]) * VU_ATTACK_RATE;
+                                state->vu_state.levels[ch] += (target_level - state->vu_state.levels[ch]) * VU_ATTACK_RATE;
                             } else {
                                 // Slow decay
-                                channel_vu_levels[ch] *= (1.0f - VU_DECAY_RATE);
-                                if (channel_vu_levels[ch] < 0.01f) {
-                                    channel_vu_levels[ch] = 0.0f;
+                                state->vu_state.levels[ch] *= (1.0f - VU_DECAY_RATE);
+                                if (state->vu_state.levels[ch] < 0.01f) {
+                                    state->vu_state.levels[ch] = 0.0f;
                                 }
                             }
 
                             // Peak hold and decay
-                            if (target_level > channel_vu_peaks[ch]) {
-                                channel_vu_peaks[ch] = target_level;
-                                channel_peak_hold[ch] = VU_PEAK_HOLD_FRAMES;
-                            } else if (channel_peak_hold[ch] > 0) {
-                                channel_peak_hold[ch]--;
+                            if (target_level > state->vu_state.peaks[ch]) {
+                                state->vu_state.peaks[ch] = target_level;
+                                state->vu_state.peak_hold[ch] = VU_PEAK_HOLD_FRAMES;
+                            } else if (state->vu_state.peak_hold[ch] > 0) {
+                                state->vu_state.peak_hold[ch]--;
                             } else {
-                                channel_vu_peaks[ch] *= (1.0f - VU_PEAK_DECAY_RATE);
-                                if (channel_vu_peaks[ch] < 0.01f) {
-                                    channel_vu_peaks[ch] = 0.0f;
+                                state->vu_state.peaks[ch] *= (1.0f - VU_PEAK_DECAY_RATE);
+                                if (state->vu_state.peaks[ch] < 0.01f) {
+                                    state->vu_state.peaks[ch] = 0.0f;
                                 }
                             }
                         }
 
                         // Channel pagination: Show 4 channels per page, switch pages with Tab
                         // Check for Tab key press flag (set by scancode handler)
-                        if (tab_pressed_this_frame) {
+                        if (state->tab_pressed_this_frame) {
                             // Cycle to next page (4 channels per page)
                             int max_pages = (num_channels + 3) / 4;  // Round up
-                            channel_page_offset = (channel_page_offset + 4) % (max_pages * 4);
-                            if (channel_page_offset >= num_channels) {
-                                channel_page_offset = 0;  // Wrap around
+                            state->channel_page_offset = (state->channel_page_offset + 4) % (max_pages * 4);
+                            if (state->channel_page_offset >= num_channels) {
+                                state->channel_page_offset = 0;  // Wrap around
                             }
-                            tab_pressed_this_frame = false;  // Reset flag
+                            state->tab_pressed_this_frame = false;  // Reset flag
                         }
                         
                         // Calculate which channels to display (up to 4 channels per page)
                         int channels_per_page = 4;
-                        int start_channel = channel_page_offset;
+                        int start_channel = state->channel_page_offset;
                         int end_channel = start_channel + channels_per_page;
                         if (end_channel > num_channels) {
                             end_channel = num_channels;
@@ -647,8 +619,8 @@ void app_main(void) {
                         int visible_channels = end_channel - start_channel;
 
                         // Update global VU meter layout cache
-                        vu_start_channel = start_channel;
-                        vu_visible_channels = visible_channels;
+                        state->vu_state.start_channel = start_channel;
+                        state->vu_state.visible_channels = visible_channels;
 
                         // Calculate layout (cache for performance)
                         static int cached_line_height = 0;
@@ -724,8 +696,8 @@ void app_main(void) {
                                               THEME_BG_HEADER, THEME_BG_PRIMARY);
 
                             // Use module metadata name instead of filename
-                            const char *mod_name = (mod_info.mod && mod_info.mod->name[0])
-                                                   ? mod_info.mod->name : "Unknown";
+                            const char *mod_name = (state->tracker.mod_info.mod && state->tracker.mod_info.mod->name[0])
+                                                   ? state->tracker.mod_info.mod->name : "Unknown";
 
                             // Draw song title on the left (font scale 1 for compact header)
                             font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
@@ -786,12 +758,12 @@ void app_main(void) {
                             draw_header();
                             
                             // Initialize current tick with first frame data
-                            memcpy(current_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
-                            current_tick.pos = frame_info.pos;
-                            current_tick.pattern = frame_info.pattern;
-                            current_tick.row = frame_info.row;
-                            current_tick.num_channels = num_channels;
-                            current_tick_valid = true;
+                            memcpy(state->tracker.current_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
+                            state->tracker.current_tick.pos = frame_info.pos;
+                            state->tracker.current_tick.pattern = frame_info.pattern;
+                            state->tracker.current_tick.row = frame_info.row;
+                            state->tracker.current_tick.num_channels = num_channels;
+                            state->tracker.current_tick_valid = true;
                             
                             // Draw current row at center with highlight background
                             int y = center_y;
@@ -800,7 +772,7 @@ void app_main(void) {
                             int highlight_width = FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
                             ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, MARGIN_LEFT, y, highlight_width, line_height, RGB565_DARK_BLUE);
                             
-                            // Draw current frame data at center (from current_tick) - with pagination and centering
+                            // Draw current frame data at center (from state->tracker.current_tick) - with pagination and centering
                             {
                                 int font_scale = (line_height + FONT_HEIGHT - 1) / FONT_HEIGHT;
                                 if (font_scale < 1) font_scale = 1;
@@ -863,11 +835,11 @@ void app_main(void) {
                             }
                             
                             tracker_initialized = true;
-                            // Initialize last_row to current row to prevent immediate scrolling on first frame
-                            last_row = current_tick.row;
+                            // Initialize state->tracker.last_row to current row to prevent immediate scrolling on first frame
+                            state->tracker.last_row = state->tracker.current_tick.row;
                             // Reset smooth scrolling state for clean start
-                            smooth_scroll_offset = 0;
-                            pending_new_row = false;
+                            state->tracker.smooth_scroll_offset = 0;
+                            state->tracker.pending_new_row = false;
                             // Full screen blit on first render
                             blit(-1, 0);  // -1 means full screen, row_height ignored
                         } else {
@@ -890,48 +862,48 @@ void app_main(void) {
                             
                             // Fixed grid approach: update history immediately when row changes
                             // This keeps history and future rows in sync (both update based on current position)
-                            if (frame_info.row != last_row) {
+                            if (frame_info.row != state->tracker.last_row) {
                                 // Immediately add current row to history when it changes (for fixed grid)
                                 // This ensures history rows appear at the same rate as future rows disappear
-                                if (current_tick_valid && last_row >= 0) {
+                                if (state->tracker.current_tick_valid && state->tracker.last_row >= 0) {
                                     // Move previous row to history immediately
-                                    if (tick_history_count < MAX_TRACKER_ROWS) {
-                                        memcpy(tick_history[tick_history_count].channels, current_tick.channels, sizeof(current_tick.channels));
-                                        tick_history[tick_history_count].pos = current_tick.pos;
-                                        tick_history[tick_history_count].pattern = current_tick.pattern;
-                                        tick_history[tick_history_count].row = current_tick.row;
-                                        tick_history[tick_history_count].num_channels = current_tick.num_channels;
-                                        tick_history_count++;
+                                    if (state->tracker.tick_history_count < MAX_TRACKER_ROWS) {
+                                        memcpy(state->tracker.tick_history[state->tracker.tick_history_count].channels, state->tracker.current_tick.channels, sizeof(state->tracker.current_tick.channels));
+                                        state->tracker.tick_history[state->tracker.tick_history_count].pos = state->tracker.current_tick.pos;
+                                        state->tracker.tick_history[state->tracker.tick_history_count].pattern = state->tracker.current_tick.pattern;
+                                        state->tracker.tick_history[state->tracker.tick_history_count].row = state->tracker.current_tick.row;
+                                        state->tracker.tick_history[state->tracker.tick_history_count].num_channels = state->tracker.current_tick.num_channels;
+                                        state->tracker.tick_history_count++;
                                     } else {
                                         // Shift history (oldest first, so remove oldest)
                                         memmove(tick_history, tick_history + 1, (MAX_TRACKER_ROWS - 1) * sizeof(struct tracker_tick));
-                                        memcpy(tick_history[MAX_TRACKER_ROWS - 1].channels, current_tick.channels, sizeof(current_tick.channels));
-                                        tick_history[MAX_TRACKER_ROWS - 1].pos = current_tick.pos;
-                                        tick_history[MAX_TRACKER_ROWS - 1].pattern = current_tick.pattern;
-                                        tick_history[MAX_TRACKER_ROWS - 1].row = current_tick.row;
-                                        tick_history[MAX_TRACKER_ROWS - 1].num_channels = current_tick.num_channels;
+                                        memcpy(state->tracker.tick_history[MAX_TRACKER_ROWS - 1].channels, state->tracker.current_tick.channels, sizeof(state->tracker.current_tick.channels));
+                                        state->tracker.tick_history[MAX_TRACKER_ROWS - 1].pos = state->tracker.current_tick.pos;
+                                        state->tracker.tick_history[MAX_TRACKER_ROWS - 1].pattern = state->tracker.current_tick.pattern;
+                                        state->tracker.tick_history[MAX_TRACKER_ROWS - 1].row = state->tracker.current_tick.row;
+                                        state->tracker.tick_history[MAX_TRACKER_ROWS - 1].num_channels = state->tracker.current_tick.num_channels;
                                     }
                                 }
                                 // Update current tick with new row data immediately
-                                memcpy(current_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
-                                current_tick.pos = frame_info.pos;
-                                current_tick.pattern = frame_info.pattern;
-                                current_tick.row = frame_info.row;
-                                current_tick.num_channels = num_channels;
-                                current_tick_valid = true;
+                                memcpy(state->tracker.current_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
+                                state->tracker.current_tick.pos = frame_info.pos;
+                                state->tracker.current_tick.pattern = frame_info.pattern;
+                                state->tracker.current_tick.row = frame_info.row;
+                                state->tracker.current_tick.num_channels = num_channels;
+                                state->tracker.current_tick_valid = true;
                                 
-                                last_row = frame_info.row;
+                                state->tracker.last_row = frame_info.row;
                             }
                             
                             // Check if we have a new row - allow continuous scrolling without waiting
-                            if (frame_info.row != last_row && !pending_new_row) {
+                            if (frame_info.row != state->tracker.last_row && !state->tracker.pending_new_row) {
                                 // New row detected - prepare it for smooth scrolling
-                                pending_new_row = true;
-                                memcpy(pending_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
-                                pending_tick.pos = frame_info.pos;
-                                pending_tick.pattern = frame_info.pattern;
-                                pending_tick.row = frame_info.row;
-                                pending_tick.num_channels = num_channels;
+                                state->tracker.pending_new_row = true;
+                                memcpy(state->tracker.pending_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
+                                state->tracker.pending_tick.pos = frame_info.pos;
+                                state->tracker.pending_tick.pattern = frame_info.pattern;
+                                state->tracker.pending_tick.row = frame_info.row;
+                                state->tracker.pending_tick.num_channels = num_channels;
                                 
                                 // Calculate row duration: speed is frames per row, frame_time is microseconds per frame
                                 // Total row duration = speed * frame_time microseconds
@@ -947,8 +919,8 @@ void app_main(void) {
                                 
                                 // If we're already scrolling, continue from current offset (seamless transition)
                                 // If not scrolling, start from 0
-                                if (smooth_scroll_offset >= line_height) {
-                                    smooth_scroll_offset = 0;  // Reset if previous row just completed
+                                if (state->tracker.smooth_scroll_offset >= line_height) {
+                                    state->tracker.smooth_scroll_offset = 0;  // Reset if previous row just completed
                                 }
                                 // Otherwise keep current offset for seamless continuous scrolling
                                 
@@ -960,12 +932,12 @@ void app_main(void) {
                                             current_row_duration_ms, ROWS_PER_SCROLL, line_height);
                                 }
                                 
-                                last_row = frame_info.row;  // Update to prevent repeated detection
+                                state->tracker.last_row = frame_info.row;  // Update to prevent repeated detection
                             }
                             
                             // Calculate scroll position based on elapsed time since row started
                             // Only scroll if we have a pending row
-                            if (pending_new_row && current_row_duration_ms > 0.0f) {
+                            if (state->tracker.pending_new_row && current_row_duration_ms > 0.0f) {
                                 TickType_t current_time = xTaskGetTickCount();
                                 TickType_t elapsed_ticks = current_time - row_start_tick;
                                 float elapsed_ms = (float)elapsed_ticks * (1000.0f / configTICK_RATE_HZ);
@@ -975,10 +947,10 @@ void app_main(void) {
                                 float scroll_progress = elapsed_ms / current_row_duration_ms;
                                 if (scroll_progress > 1.0f) scroll_progress = 1.0f;  // Clamp to 1.0
                                 
-                                smooth_scroll_offset = (int)(scroll_progress * (float)line_height);
+                                state->tracker.smooth_scroll_offset = (int)(scroll_progress * (float)line_height);
                                 
                                 // Note: In fixed grid mode, history is updated immediately when frame_info.row changes
-                                // (handled above), so we don't need to move rows here. The smooth_scroll_offset
+                                // (handled above), so we don't need to move rows here. The state->tracker.smooth_scroll_offset
                                 // is kept for potential future use but doesn't affect the fixed grid display.
                             }
                             
@@ -1038,10 +1010,10 @@ void app_main(void) {
                                 if (row_idx < center_row_idx) {
                                     // Rows above center: history rows (most recent closest to center)
                                     int history_offset = center_row_idx - row_idx - 1;  // 0 = most recent, 1 = older, etc.
-                                    if (history_offset < tick_history_count) {
-                                        int history_idx = tick_history_count - 1 - history_offset;  // Most recent is last in history
+                                    if (history_offset < state->tracker.tick_history_count) {
+                                        int history_idx = state->tracker.tick_history_count - 1 - history_offset;  // Most recent is last in history
                                         if (history_idx >= 0) {
-                                            tick = &tick_history[history_idx];
+                                            tick = &state->tracker.tick_history[history_idx];
                                         }
                                     }
                                 } else if (row_idx == center_row_idx) {
@@ -1279,7 +1251,7 @@ void app_main(void) {
                     }
 
                     // Draw view-dependent overlays
-                    if (current_view == VIEW_TRACKER) {
+                    if (state->current_view == APP_VIEW_TRACKER) {
                         // Layout: VU meters above hint bar at bottom
                         int hint_bar_height = 20;  // Height for hint bar
                         int vu_height = vu_cached_line_height;
@@ -1291,10 +1263,10 @@ void app_main(void) {
                                       0, vu_footer_y, FB_WIDTH, vu_height, THEME_BG_SECONDARY);
 
                         // Draw VU meters aligned with channel columns (using cached positions)
-                        int visible_ch = vu_visible_channels;
+                        int visible_ch = state->vu_state.visible_channels;
                         if (visible_ch < 1) visible_ch = 4;
                         for (int i = 0; i < visible_ch && i < 4; i++) {
-                            int ch = vu_start_channel + i;
+                            int ch = state->vu_state.start_channel + i;
                             if (ch >= num_channels || ch >= MOD_MAX_CHANNELS) break;
 
                             // Use cached column positions for alignment
@@ -1304,7 +1276,7 @@ void app_main(void) {
 
                             ui_draw_vu_meter(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                              vu_x, vu_footer_y + 2, vu_width, vu_height - 4,
-                                             channel_vu_levels[ch], channel_vu_peaks[ch],
+                                             state->vu_state.levels[ch], state->vu_state.peaks[ch],
                                              UI_VU_HORIZONTAL);
 
                             // Draw channel number label centered horizontally and vertically
@@ -1389,7 +1361,7 @@ void app_main(void) {
                         // Space bar - Pause/Resume (char 133 = 0x85)
                         const char *pause_text = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, pause_text);
-                    } else if (current_view == VIEW_SPECTRUM) {
+                    } else if (state->current_view == APP_VIEW_SPECTRUM) {
                         // Full-screen spectrum analyzer view
                         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_SPECTRUM_BG);
 
@@ -1407,8 +1379,8 @@ void app_main(void) {
                         } else {
                             // No spectrum analyzer - show simulated bars from channel volumes
                             for (int i = 0; i < SPECTRUM_NUM_BANDS && i < num_channels; i++) {
-                                bands[i] = (uint8_t)(channel_vu_levels[i] * 255.0f);
-                                peaks[i] = (uint8_t)(channel_vu_peaks[i] * 255.0f);
+                                bands[i] = (uint8_t)(state->vu_state.levels[i] * 255.0f);
+                                peaks[i] = (uint8_t)(state->vu_state.peaks[i] * 255.0f);
                             }
                         }
 
@@ -1462,7 +1434,7 @@ void app_main(void) {
                         // space Pause
                         const char *spec_pause = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, spec_pause);
-                    } else if (current_view == VIEW_INFO) {
+                    } else if (state->current_view == APP_VIEW_INFO) {
                         // Module info view
                         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
 
@@ -1479,7 +1451,7 @@ void app_main(void) {
 
                         // Module name
                         char info_line[128];
-                        const char *mod_name = mod_info.mod ? mod_info.mod->name : "Unknown";
+                        const char *mod_name = state->tracker.mod_info.mod ? state->tracker.mod_info.mod->name : "Unknown";
                         snprintf(info_line, sizeof(info_line), "Name: %s", mod_name);
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                                 MARGIN_LEFT, info_y, THEME_TEXT_PRIMARY, 2, info_line);
@@ -1492,14 +1464,14 @@ void app_main(void) {
                         info_y += line_spacing;
 
                         // Patterns
-                        int pat_count = mod_info.mod ? mod_info.mod->pat : 0;
+                        int pat_count = state->tracker.mod_info.mod ? state->tracker.mod_info.mod->pat : 0;
                         snprintf(info_line, sizeof(info_line), "Patterns: %d", pat_count);
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                                 MARGIN_LEFT, info_y, THEME_TEXT_SECONDARY, 2, info_line);
                         info_y += line_spacing;
 
                         // Current position
-                        int song_len = mod_info.mod ? mod_info.mod->len : 0;
+                        int song_len = state->tracker.mod_info.mod ? state->tracker.mod_info.mod->len : 0;
                         snprintf(info_line, sizeof(info_line), "Position: %d / %d", frame_info.pos, song_len);
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                                 MARGIN_LEFT, info_y, THEME_TEXT_SECONDARY, 2, info_line);
@@ -1533,7 +1505,7 @@ void app_main(void) {
                             // VU bar
                             ui_draw_vu_bar(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                            vu_x + 16, vu_y + 2, vu_width - 20, 12,
-                                           channel_vu_levels[ch], THEME_VU_BG);
+                                           state->vu_state.levels[ch], THEME_VU_BG);
                         }
 
                         // Footer hint bar (same style as tracker view)
@@ -1583,7 +1555,7 @@ void app_main(void) {
                     }
 
                     PROFILING_END(render, render);
-                    // Note: last_row is now updated when we finish scrolling, not immediately
+                    // Note: state->tracker.last_row is now updated when we finish scrolling, not immediately
                     // This allows smooth scrolling to complete before marking the row as processed
                     did_render = true;  // Tracker UI always renders (smooth scrolling)
                 }
