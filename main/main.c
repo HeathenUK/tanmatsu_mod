@@ -53,13 +53,6 @@ static char const TAG[] = "main";
 // Internal flash wear levelling handle
 static wl_handle_t int_flash_wl_handle = WL_INVALID_HANDLE;
 
-// Global framebuffers and hardware handles
-static uint16_t *fb = NULL;  // Logical landscape framebuffer (800x480)
-static uint16_t *fb_rotated = NULL;  // Rotated framebuffer (480x800)
-static ppa_client_handle_t ppa_srm_handle = NULL;  // PPA SRM client
-static ppa_client_handle_t ppa_fill_handle = NULL;  // PPA Fill client
-static QueueHandle_t input_event_queue = NULL;  // Input event queue
-
 // Framebuffer dimensions (use module constants)
 #define FB_WIDTH  HW_ACCEL_FB_WIDTH
 #define FB_HEIGHT HW_ACCEL_FB_HEIGHT
@@ -90,9 +83,7 @@ static app_state_t *state = NULL;
 #define MAX_TRACKER_ROWS    APP_STATE_MAX_TRACKER_ROWS
 
 // Convenience accessors
-#define CURRENT_FB (fb)
-
-
+#define CURRENT_FB (state->fb)
 
 #define RGB565_BLACK   0x0000
 #define RGB565_WHITE   0xFFFF
@@ -120,11 +111,11 @@ static inline void scroll_framebuffer_ppa(uint16_t *fb_pixels, int src_y, int ds
 }
 
 static inline void blit(int row_y, int row_height) {
-    hw_accel_blit(NULL, fb, fb_rotated, row_y, row_height);
+    hw_accel_blit(NULL, state->fb, state->fb_rotated, row_y, row_height);
 }
 
 static inline void draw_file_browser(file_browser_t *browser) {
-    ui_draw_file_browser(fb, FB_WIDTH, FB_HEIGHT, browser);
+    ui_draw_file_browser(state->fb, FB_WIDTH, FB_HEIGHT, browser);
 }
 
 static inline void format_channel_string(char *ch_str, size_t ch_str_size,
@@ -267,6 +258,13 @@ void IRAM_ATTR blit_old(int row_y, int row_height) {
 #endif
 
 void app_main(void) {
+    // Initialize application state
+    state = app_state_init();
+    if (!state) {
+        ESP_LOGE(TAG, "Failed to initialize application state");
+        return;
+    }
+
     // Start the GPIO interrupt service
     gpio_install_isr_service(0);
 
@@ -291,35 +289,35 @@ void app_main(void) {
 
     // Initialize hardware acceleration module
     ESP_ERROR_CHECK(hw_accel_init());
-    ppa_srm_handle = hw_accel_get_srm_handle();
-    ppa_fill_handle = hw_accel_get_fill_handle();
+    state->ppa_srm_handle = hw_accel_get_srm_handle();
+    state->ppa_fill_handle = hw_accel_get_fill_handle();
 
     // Allocate single logical landscape framebuffer (800x480) from DMA-capable PSRAM
     // Use 64-byte alignment for L2 cache line optimization (ESP32-P4 has 64-byte cache lines)
     size_t fb_size = FB_WIDTH * FB_HEIGHT * sizeof(uint16_t);  // 800x480x2 = 768000 bytes
-    fb = (uint16_t*)heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (fb == NULL) {
+    state->fb = (uint16_t*)heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (state->fb == NULL) {
         ESP_LOGE(TAG, "Failed to allocate logical framebuffer from DMA-capable PSRAM");
         return;
     }
     ESP_LOGI(TAG, "Allocated logical framebuffer: %zu bytes (800x480)", fb_size);
-    
+
     // Allocate single rotated framebuffer (480x800) for PPA output
     // Use 64-byte alignment for L2 cache line optimization
     size_t fb_rotated_size = 480 * 800 * sizeof(uint16_t);  // 480x800x2 = 768000 bytes
-    fb_rotated = (uint16_t*)heap_caps_aligned_alloc(64, fb_rotated_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (fb_rotated == NULL) {
+    state->fb_rotated = (uint16_t*)heap_caps_aligned_alloc(64, fb_rotated_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (state->fb_rotated == NULL) {
         ESP_LOGE(TAG, "Failed to allocate rotated framebuffer from DMA-capable PSRAM");
         return;
     }
     ESP_LOGI(TAG, "Allocated rotated framebuffer: %zu bytes (480x800)", fb_rotated_size);
-    
+
     // Initialize framebuffer to black
-    ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+    ppa_fill_framebuffer(state->fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
     ESP_LOGI(TAG, "Initialized framebuffer to black");
 
     // Get input event queue from BSP
-    ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
+    ESP_ERROR_CHECK(bsp_input_get_queue(&state->input_event_queue));
 
     // Initialize audio system
     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
@@ -510,7 +508,7 @@ void app_main(void) {
         audio_get_volume(&input_ctx.current_volume);
         
         // Process ALL pending input events before doing anything else
-        while (xQueueReceive(input_event_queue, &event, 0) == pdTRUE) {
+        while (xQueueReceive(state->input_event_queue, &event, 0) == pdTRUE) {
             input_action_result_t action_result;
             
             // Process input event
