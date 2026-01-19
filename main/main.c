@@ -495,486 +495,162 @@ void app_main(void) {
         
         // Check input queue FIRST with ZERO timeout for instant response (non-blocking)
         bsp_input_event_t event;
+        
+        // Set up input handler context
+        input_handler_context_t input_ctx = {
+            .browser = &browser,
+            .browser_active = &browser_active,
+            .playing = mod_player_is_playing(),
+            .paused = mod_player_is_paused(),
+            .current_volume = 0.0f,
+            .current_view = current_view,
+            .tab_pressed = &tab_pressed_this_frame,
+            .view_key_pressed = &view_key_pressed,
+        };
+        audio_get_volume(&input_ctx.current_volume);
+        
         // Process ALL pending input events before doing anything else
         while (xQueueReceive(input_event_queue, &event, 0) == pdTRUE) {
-            // Process input immediately
-            switch (event.type) {
-                case INPUT_EVENT_TYPE_NAVIGATION: {
-                    // Handle navigation keys (UP/DOWN/LEFT/RIGHT) for file browser and volume control
-                    if (event.args_navigation.state) {
-                        // Only process key press (not release)
-                        if (browser_active) {
-                            bool browser_needs_redraw = false;
-                            
-                            switch (event.args_navigation.key) {
-                                case BSP_INPUT_NAVIGATION_KEY_UP:
-                                    file_browser_up(&browser);
-                                    browser_needs_redraw = true;
-                                    break;
-                                case BSP_INPUT_NAVIGATION_KEY_DOWN:
-                                    file_browser_down(&browser);
-                                    browser_needs_redraw = true;
-                                    break;
-                            case BSP_INPUT_NAVIGATION_KEY_LEFT:
-                                if (file_browser_back(&browser) == ESP_OK) {
-                                    browser_needs_redraw = true;
-                    }
-                    break;
-                            case BSP_INPUT_NAVIGATION_KEY_RIGHT: {
-                                // Enter directory or select file
-                                bool is_directory = false;
-                                if (browser.selected_index < browser.count) {
-                                    is_directory = browser.files[browser.selected_index].is_dir;
-                                }
-                                
-                                static char selected_path[MAX_FILENAME_LEN];
-                                esp_err_t select_res = file_browser_select(&browser, selected_path, sizeof(selected_path));
-                                if (select_res == ESP_OK && !is_directory) {
-                                    // File selected - check if it's a MOD file
-                                    const char *ext = strrchr(selected_path, '.');
-                                    if (ext && (strcasecmp(ext, ".mod") == 0 || strcasecmp(ext, ".xm") == 0 ||
-                                                strcasecmp(ext, ".s3m") == 0 || strcasecmp(ext, ".it") == 0)) {
-                                        // Valid MOD file - load it
-                                        FILE *f = fopen(selected_path, "rb");
-                                        if (f) {
-                                            fseek(f, 0, SEEK_END);
-                                            long file_size = ftell(f);
-                                            fseek(f, 0, SEEK_SET);
+            input_action_result_t action_result;
+            
+            // Process input event
+            if (ui_input_handle_event(&event, &input_ctx, &action_result) == ESP_OK) {
+                // Execute action based on result
+                switch (action_result.action) {
+                    case INPUT_ACTION_REDRAW_BROWSER:
+                        needs_render = true;
+                        break;
+                        
+                    case INPUT_ACTION_LOAD_MOD_FILE: {
+                        // Load MOD file
+                        FILE *f = fopen(action_result.data.load_mod.path, "rb");
+                        if (f) {
+                            fseek(f, 0, SEEK_END);
+                            long file_size = ftell(f);
+                            fseek(f, 0, SEEK_SET);
 
-                                            // Reject files larger than 10MB
-                                            if (file_size > MAX_MOD_FILE_SIZE) {
-                                                fclose(f);
-                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "File too large (>10MB)");
-                                                blit(-1, 0);
-                                                break;
-                                            }
-
-                                            // Free previous MOD data if any
-                                            if (mod_file_data) {
-                                                free(mod_file_data);
-                                            }
-
-                                            // Allocate file buffer in PSRAM for large tracker files
-                                            mod_file_data = (uint8_t *)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-                                            if (mod_file_data) {
-                                                size_t read = fread(mod_file_data, 1, file_size, f);
-                                                fclose(f);
-
-                                                if (read == file_size) {
-                                                    mod_file_size = file_size;
-                                                    // Store file path for display
-                                                    strncpy(current_mod_path, selected_path, sizeof(current_mod_path) - 1);
-                                                    current_mod_path[sizeof(current_mod_path) - 1] = '\0';
-                                                    // Show loading message before blocking load operation
-                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                                          (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,  // Center horizontally (10 chars * 8px * 2 scale)
-                                                                          (FB_HEIGHT - FONT_HEIGHT * 2) / 2,    // Center vertically (16px * 2 scale)
-                                                                          RGB565_WHITE, 2, "Loading...");
-                                                    blit(-1, 0);
-                                                    res = mod_player_load(mod_file_data, mod_file_size);
-                                                    if (res == ESP_OK) {
-                                                        res = mod_player_start();
-                                                    if (res == ESP_OK) {
-                                                        browser_active = false;
-                                                        mod_info_loaded = false;  // Force reload of module info
-                                                        current_view = VIEW_TRACKER;  // Reset to tracker view
-                                                        // Reset VU meter levels for new module
-                                                        for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
-                                                            channel_vu_levels[i] = 0.0f;
-                                                            channel_vu_peaks[i] = 0.0f;
-                                                            channel_peak_hold[i] = 0;
-                                                        }
-                                                        // Clear screen immediately to prevent white flash
-                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
-                                                        // Tracker UI will be drawn in main loop
-                                                    } else {
-                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
-                                                            blit(-1, 0);
-                                                        }
-                                                    } else {
-                                                        free(mod_file_data);
-                                                        mod_file_data = NULL;
-                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
-                                                        blit(-1, 0);
-                                                    }
-                                                } else {
-                                                    free(mod_file_data);
-                                                    mod_file_data = NULL;
-                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
-                                                    blit(-1, 0);
-                                                }
-                                            } else {
-                                                fclose(f);
-                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of PSRAM");
-                                                blit(-1, 0);
-                                            }
-                                        } else {
-                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
-                        blit(-1, 0);
-                    }
-                                    }
-                                } else if (select_res == ESP_OK) {
-                                    // Directory entered - browser already refreshed
-                                    browser_needs_redraw = true;
-                                }
+                            // Reject files larger than 10MB
+                            if (file_size > MAX_MOD_FILE_SIZE) {
+                                fclose(f);
+                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "File too large (>10MB)");
+                                blit(-1, 0);
                                 break;
                             }
-                            default:
-                    break;
-                }
-                        
-                        // Mark browser for redraw (will be rendered after input processing)
-                        if (browser_needs_redraw) {
-                            needs_render = true;
-                        }
-                        } else if (mod_player_is_playing()) {
-                            // Volume control during playback
-                            // Actual range: 20%-100%, displayed as 0%-100%
-                            // Step: 5% displayed = 4% actual (0.05 * 0.80)
-                            float current_vol = 0.0f;
-                            if (audio_get_volume(&current_vol) == ESP_OK) {
-                                float new_vol = current_vol;
-                                if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_UP) {
-                                    new_vol += 0.04f;  // 5% display step
-                                    if (new_vol > 1.00f) new_vol = 1.00f;  // Cap at 100%
-                                } else if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_DOWN) {
-                                    new_vol -= 0.04f;  // 5% display step
-                                    if (new_vol < 0.20f) new_vol = 0.20f;  // Cap at 20%
-                                }
-                                audio_set_volume(new_vol);
+
+                            // Free previous MOD data if any
+                            if (mod_file_data) {
+                                free(mod_file_data);
                             }
+
+                            // Allocate file buffer in PSRAM
+                            mod_file_data = (uint8_t *)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+                            if (mod_file_data) {
+                                size_t read = fread(mod_file_data, 1, file_size, f);
+                                fclose(f);
+
+                                if (read == file_size) {
+                                    mod_file_size = file_size;
+                                    strncpy(current_mod_path, action_result.data.load_mod.path, sizeof(current_mod_path) - 1);
+                                    current_mod_path[sizeof(current_mod_path) - 1] = '\0';
+                                    
+                                    // Show loading message
+                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                          (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,
+                                                          (FB_HEIGHT - FONT_HEIGHT * 2) / 2,
+                                                          RGB565_WHITE, 2, "Loading...");
+                                    blit(-1, 0);
+                                    
+                                    res = mod_player_load(mod_file_data, mod_file_size);
+                                    if (res == ESP_OK) {
+                                        res = mod_player_start();
+                                        if (res == ESP_OK) {
+                                            browser_active = false;
+                                            mod_info_loaded = false;
+                                            current_view = VIEW_TRACKER;
+                                            
+                                            // Reset VU meter levels
+                                            for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
+                                                channel_vu_levels[i] = 0.0f;
+                                                channel_vu_peaks[i] = 0.0f;
+                                                channel_peak_hold[i] = 0;
+                                            }
+                                            
+                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
+                                        } else {
+                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
+                                            blit(-1, 0);
+                                        }
+                                    } else {
+                                        free(mod_file_data);
+                                        mod_file_data = NULL;
+                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
+                                        blit(-1, 0);
+                                    }
+                                } else {
+                                    free(mod_file_data);
+                                    mod_file_data = NULL;
+                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
+                                    blit(-1, 0);
+                                }
+                            } else {
+                                fclose(f);
+                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of PSRAM");
+                                blit(-1, 0);
+                            }
+                        } else {
+                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
+                            blit(-1, 0);
                         }
+                        break;
                     }
-                    break;
-                }
-                case INPUT_EVENT_TYPE_KEYBOARD:
-                    // Keyboard events not currently used
-                    break;
-                case INPUT_EVENT_TYPE_ACTION: {
-                    // Power button handler removed - using F6 instead
-                    // Debug: Action event (commented out)
-                    break;
-                }
-                case INPUT_EVENT_TYPE_SCANCODE: {
-                    // ESP_LOGI(TAG, "Scancode event 0x%0" PRIX32, (uint32_t)event.args_scancode.scancode);
                     
-                    bsp_input_scancode_t sc = event.args_scancode.scancode;
-                    
-                    // Handle F6 key (0x40) for exit
-                    if (sc == 0x40) {
+                    case INPUT_ACTION_EXIT_TO_LAUNCHER:
                         if (mod_player_is_playing()) {
                             mod_player_stop();
                         }
-                        if (browser_active) {
-                            audio_stop();
-                            audio_set_volume(0.0f);
-                            vTaskDelay(pdMS_TO_TICKS(50));
-                            bsp_device_restart_to_launcher();
-                        } else {
-                            // During playback - return to file browser
-                            mod_player_stop();
-                            browser_active = true;
-                            file_browser_refresh(&browser);
-                            // Mark browser for redraw (will be rendered after input processing)
-                            needs_render = true;
-                        }
-                    }
-                    
-                    // Handle F4 key (0x3E) for channel page switching during playback
-                    if (!browser_active && mod_player_is_playing() && sc == 0x3E) {
-                        tab_pressed_this_frame = true;  // Flag will be checked during rendering
-                    }
-
-                    // Handle F3 key (0x3D) for view mode toggle during playback
-                    if (!browser_active && mod_player_is_playing() && sc == 0x3D) {
-                        view_key_pressed = true;  // Flag will be checked during rendering
-                    }
-
-                    // Handle Space bar (0x39) for pause/resume during playback
-                    if (!browser_active && mod_player_is_playing() && sc == 0x39) {
+                        audio_stop();
+                        audio_set_volume(0.0f);
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                        bsp_device_restart_to_launcher();
+                        break;
+                        
+                    case INPUT_ACTION_RETURN_TO_BROWSER:
+                        mod_player_stop();
+                        browser_active = true;
+                        file_browser_refresh(&browser);
+                        needs_render = true;
+                        break;
+                        
+                    case INPUT_ACTION_SET_VOLUME:
+                        audio_set_volume(action_result.data.set_volume.volume);
+                        break;
+                        
+                    case INPUT_ACTION_PAUSE_RESUME:
                         if (mod_player_is_paused()) {
                             mod_player_resume();
                         } else {
                             mod_player_pause();
                         }
-                    }
-
-                    // Handle number keys (0-9) for channel mute toggle during playback
-                    // Standard PC scancodes (Set 1): 0=0x0B, 1-9=0x02-0x0A
-                    // Direct mapping: key number = channel number
-                    if (!browser_active && mod_player_is_playing()) {
-                        int channel = -1;
-                        if (sc >= 0x02 && sc <= 0x0A) {
-                            // Keys 1-9: scancodes 0x02-0x0A map directly to channels 1-9
-                            channel = sc - 0x01;
-                        } else if (sc == 0x0B) {
-                            // Key 0: scancode 0x0B maps to channel 0
-                            channel = 0;
-                        }
+                        break;
                         
-                        if (channel >= 0 && channel < MOD_MAX_CHANNELS) {
-                            // Toggle channel mute
-                            esp_err_t mute_res = mod_player_toggle_channel_mute(channel);
-                            if (mute_res == ESP_OK) {
-                                // Force redraw on next frame to show color change
-                                // The mute state will be checked during rendering
-                            }
-                        }
-                    }
-                    
-                    // Handle arrow keys via scancode (fallback for navigation)
-                    if (browser_active) {
-                        bool browser_needs_redraw = false;
-                        bsp_input_scancode_t sc = event.args_scancode.scancode;
+                    case INPUT_ACTION_TOGGLE_CHANNEL_MUTE:
+                        mod_player_toggle_channel_mute(action_result.data.toggle_mute.channel);
+                        break;
                         
-                        // Arrow key scancodes (standard PC scancodes)
-                        if (sc == 0x48) {  // Up arrow
-                            file_browser_up(&browser);
-                            browser_needs_redraw = true;
-                        } else if (sc == 0x50) {  // Down arrow
-                            file_browser_down(&browser);
-                            browser_needs_redraw = true;
-                        } else if (sc == 0x4B) {  // Left arrow
-                            if (file_browser_back(&browser) == ESP_OK) {
-                                browser_needs_redraw = true;
-                            }
-                        } else if (sc == 0x4D) {  // Right arrow
-                            // Enter directory or select file (same as Enter key)
-                            bool is_directory = false;
-                            if (browser.selected_index < browser.count) {
-                                is_directory = browser.files[browser.selected_index].is_dir;
-                            }
-                            
-                            static char selected_path[MAX_FILENAME_LEN];
-                            esp_err_t select_res = file_browser_select(&browser, selected_path, sizeof(selected_path));
-                            if (select_res == ESP_OK && !is_directory) {
-                                // File selected - check if it's a MOD file
-                                const char *ext = strrchr(selected_path, '.');
-                                if (ext && (strcasecmp(ext, ".mod") == 0 || strcasecmp(ext, ".xm") == 0 ||
-                                            strcasecmp(ext, ".s3m") == 0 || strcasecmp(ext, ".it") == 0)) {
-                                    // Valid MOD file - load it
-                                    FILE *f = fopen(selected_path, "rb");
-                                    if (f) {
-                                        fseek(f, 0, SEEK_END);
-                                        long file_size = ftell(f);
-                                        fseek(f, 0, SEEK_SET);
-
-                                        // Reject files larger than 10MB
-                                        if (file_size > MAX_MOD_FILE_SIZE) {
-                                            fclose(f);
-                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "File too large (>10MB)");
-                                            blit(-1, 0);
-                                            break;
-                                        }
-
-                                        if (mod_file_data) {
-                                            free(mod_file_data);
-                                        }
-
-                                        // Allocate file buffer in PSRAM for large tracker files
-                                        mod_file_data = (uint8_t *)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-                                        if (mod_file_data) {
-                                            size_t read = fread(mod_file_data, 1, file_size, f);
-                                            fclose(f);
-
-                                            if (read == file_size) {
-                                                mod_file_size = file_size;
-                                                // Store file path for display
-                                                strncpy(current_mod_path, selected_path, sizeof(current_mod_path) - 1);
-                                                current_mod_path[sizeof(current_mod_path) - 1] = '\0';
-                                                // Show loading message before blocking load operation
-                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                                      (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,  // Center horizontally (10 chars * 8px * 2 scale)
-                                                                      (FB_HEIGHT - FONT_HEIGHT * 2) / 2,    // Center vertically (16px * 2 scale)
-                                                                      RGB565_WHITE, 2, "Loading...");
-                                                blit(-1, 0);
-                                                res = mod_player_load(mod_file_data, mod_file_size);
-                                                if (res == ESP_OK) {
-                                                    res = mod_player_start();
-                                                    if (res == ESP_OK) {
-                                                        browser_active = false;
-                                                        mod_info_loaded = false;  // Force reload of module info
-                                                        current_view = VIEW_TRACKER;  // Reset to tracker view
-                                                        // Reset VU meter levels for new module
-                                                        for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
-                                                            channel_vu_levels[i] = 0.0f;
-                                                            channel_vu_peaks[i] = 0.0f;
-                                                            channel_peak_hold[i] = 0;
-                                                        }
-                                                        // Clear screen immediately to prevent white flash
-                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
-                                                        // Tracker UI will be drawn in main loop
-                                                        browser_needs_redraw = false;  // Don't redraw browser, we're playing now
-                                                    } else {
-                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
-                                                        blit(-1, 0);
-                                                    }
-                                                } else {
-                                                    free(mod_file_data);
-                                                    mod_file_data = NULL;
-                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
-                                                    blit(-1, 0);
-                                                }
-                                            } else {
-                                                free(mod_file_data);
-                                                mod_file_data = NULL;
-                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
-                                                blit(-1, 0);
-                                            }
-                                        } else {
-                                            fclose(f);
-                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
-                                            blit(-1, 0);
-                                        }
-                                    } else {
-                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
-                                        blit(-1, 0);
-                                    }
-                                }
-                            } else if (select_res == ESP_OK && is_directory) {
-                                // Directory entered - browser already refreshed by file_browser_select()
-                                browser_needs_redraw = true;
-                            }
-                        }
-                        
-                        // Mark browser for redraw (will be rendered after input processing)
-                        if (browser_needs_redraw) {
-                            needs_render = true;
-                        }
-                    }
-                    
-                    // Handle Enter key (0x1C press) for file selection in browser
-                    if (browser_active && event.args_scancode.scancode == 0x1C) {
-                        // Enter key pressed - same as RIGHT arrow for selection
-                        bool is_directory = false;
-                        if (browser.selected_index < browser.count) {
-                            is_directory = browser.files[browser.selected_index].is_dir;
-                        }
-                        
-                        bool browser_needs_redraw = false;
-                        static char selected_path[MAX_FILENAME_LEN];
-                        esp_err_t select_res = file_browser_select(&browser, selected_path, sizeof(selected_path));
-                        if (select_res == ESP_OK && !is_directory) {
-                            // File selected - check if it's a MOD file
-                            const char *ext = strrchr(selected_path, '.');
-                            if (ext && (strcasecmp(ext, ".mod") == 0 || strcasecmp(ext, ".xm") == 0 ||
-                                        strcasecmp(ext, ".s3m") == 0 || strcasecmp(ext, ".it") == 0)) {
-                                // Valid MOD file - load it (same logic as RIGHT arrow handler)
-                                FILE *f = fopen(selected_path, "rb");
-                                if (f) {
-                                    fseek(f, 0, SEEK_END);
-                                    long file_size = ftell(f);
-                                    fseek(f, 0, SEEK_SET);
-
-                                    // Reject files larger than 10MB
-                                    if (file_size > MAX_MOD_FILE_SIZE) {
-                                        fclose(f);
-                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "File too large (>10MB)");
-                                        blit(-1, 0);
-                                        break;
-                                    }
-
-                                    if (mod_file_data) {
-                                        free(mod_file_data);
-                                    }
-
-                                    // Allocate file buffer in PSRAM for large tracker files
-                                    mod_file_data = (uint8_t *)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-                                    if (mod_file_data) {
-                                        size_t read = fread(mod_file_data, 1, file_size, f);
-                                        fclose(f);
-
-                                        if (read == file_size) {
-                                            mod_file_size = file_size;
-                                            // Store file path for display
-                                            strncpy(current_mod_path, selected_path, sizeof(current_mod_path) - 1);
-                                            current_mod_path[sizeof(current_mod_path) - 1] = '\0';
-                                            // Show loading message before blocking load operation
-                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                                  (FB_WIDTH - 10 * FONT_WIDTH * 2) / 2,  // Center horizontally (10 chars * 8px * 2 scale)
-                                                                  (FB_HEIGHT - FONT_HEIGHT * 2) / 2,    // Center vertically (16px * 2 scale)
-                                                                  RGB565_WHITE, 2, "Loading...");
-                                            blit(-1, 0);
-                                            res = mod_player_load(mod_file_data, mod_file_size);
-                                            if (res == ESP_OK) {
-                                                res = mod_player_start();
-                                                    if (res == ESP_OK) {
-                                                        browser_active = false;
-                                                        mod_info_loaded = false;  // Force reload of module info
-                                                        current_view = VIEW_TRACKER;  // Reset to tracker view
-                                                        // Reset VU meter levels for new module
-                                                        for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
-                                                            channel_vu_levels[i] = 0.0f;
-                                                            channel_vu_peaks[i] = 0.0f;
-                                                            channel_peak_hold[i] = 0;
-                                                        }
-                                                        // Clear screen immediately to prevent white flash
-                                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
-                                                        // Tracker UI will be drawn in main loop
-                                                    } else {
-                                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
-                                                    blit(-1, 0);
-                                                }
-                                            } else {
-                                                free(mod_file_data);
-                                                mod_file_data = NULL;
-                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
-                                                blit(-1, 0);
-                                            }
-                                        } else {
-                                            free(mod_file_data);
-                                            mod_file_data = NULL;
-                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to read file");
-                                            blit(-1, 0);
-                                        }
-                                    } else {
-                                        fclose(f);
-                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of memory");
-                                        blit(-1, 0);
-                                    }
-                                } else {
-                                    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
-                                    blit(-1, 0);
-                                }
-                            }
-                        } else if (select_res == ESP_OK && is_directory) {
-                            // Directory entered - browser already refreshed by file_browser_select()
-                            browser_needs_redraw = true;
-                        }
-                        
-                        // Mark browser for redraw (will be rendered after input processing)
-                        if (browser_needs_redraw) {
-                            needs_render = true;
-                        }
-                    }
-                    
-                    // Debug: Scancode event (commented out)
-                    break;
+                    case INPUT_ACTION_NONE:
+                    default:
+                        break;
                 }
-                default:
-                    break;
             }
+        }  // End of input event processing
+
         }  // End of while loop processing all pending input events
         
         // Render file browser if needed (input handlers set needs_render flag)
