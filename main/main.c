@@ -28,7 +28,6 @@
 #include "driver/ppa.h"  // For PPA rotation
 #include "hal/color_types.h"  // For color_pixel_argb8888_data_t
 #include "esp_attr.h"  // For IRAM_ATTR
-#include "esp_async_memcpy.h"  // For GDMA memory operations
 #include "wifi_connection.h"
 #include "wifi_remote.h"
 #include "profiling.h"
@@ -125,16 +124,6 @@ static inline void format_channel_string(char *ch_str, size_t ch_str_size,
     ui_format_channel_string(ch_str, ch_str_size, note, ins, fxt, fxp, use_compact, note_names);
 }
 
-static volatile bool gdma_copy_done = false;
-
-static bool gdma_memcpy_callback(async_memcpy_handle_t mcp_hdl, async_memcpy_event_t *event, void *cb_args) {
-    (void)mcp_hdl;
-    (void)event;
-    (void)cb_args;
-    gdma_copy_done = true;
-    return false;  // No high priority task woken
-}
-
 // Hardware-accelerated scrolling using PPA SRM with 0° rotation
 // Optimized: Direct copy from source to destination (no temp buffer needed)
 // Since src_y > dst_y (scrolling up), regions don't overlap, so we can copy directly
@@ -142,120 +131,6 @@ static bool gdma_memcpy_callback(async_memcpy_handle_t mcp_hdl, async_memcpy_eve
 // Blit function - rotates framebuffer and sends to display via BSP
 // BSP handles vsync and double buffering internally
 
-#if 0
-// Old blit implementation - removed, LCD task now handles rotation and display
-void IRAM_ATTR blit_old(int row_y, int row_height) {
-    // Use PPA to rotate logical landscape framebuffer (800x480) to ST7701S native portrait (480x800)
-    if (CURRENT_FB && fb_rotated[current_fb_index] && ppa_srm_handle && panel_handle) {
-        bool partial_rotation = (row_y >= 0 && row_y < FB_HEIGHT && row_height > 0);
-        
-        if (partial_rotation) {
-            // Partial rotation: only rotate the changed row region (much faster)
-            // After 270° CCW rotation: 
-            // - Row at y becomes column at x = (FB_HEIGHT - 1 - y)
-            // - Row at y+row_height-1 becomes column at x = (FB_HEIGHT - 1 - (y + row_height - 1))
-            // Since we're rotating row_height pixels, we get row_height columns in the rotated buffer
-            // The columns are in reverse order: top row becomes rightmost column
-            int rotated_col_right = FB_HEIGHT - 1 - row_y;  // Rightmost column (top of source region)
-            int rotated_col_left = FB_HEIGHT - 1 - (row_y + row_height - 1);  // Leftmost column (bottom of source region)
-            
-            // Rotate only this row region
-            ppa_srm_oper_config_t srm_config = {
-                .in.buffer = CURRENT_FB,
-                .in.pic_w = FB_WIDTH,      // 800
-                .in.pic_h = FB_HEIGHT,     // 480
-                .in.block_w = FB_WIDTH,    // Full width of the row
-                .in.block_h = row_height,  // Height of the row region
-                .in.block_offset_x = 0,
-                .in.block_offset_y = row_y,  // Source row in logical framebuffer
-                .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                .out.buffer = fb_rotated,
-                .out.buffer_size = 480 * 800 * sizeof(uint16_t),  // Rotated size
-                .out.pic_w = 480,  // After 270° rotation: height becomes width
-                .out.pic_h = 800,  // After 270° rotation: width becomes height
-                .out.block_offset_x = rotated_col_left,  // Leftmost column position in rotated framebuffer
-                .out.block_offset_y = 0,  // Start from top
-                .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,  // 270° CCW rotation
-                .scale_x = 1,
-                .scale_y = 1,
-                .rgb_swap = 0,
-                .byte_swap = 0,
-                .mode = PPA_TRANS_MODE_BLOCKING,
-            };
-            
-            // Perform partial rotation
-            esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
-            if (ret == ESP_OK) {
-                // Extract rotated columns to temporary buffer (columns are interleaved in rotated buffer)
-                // For esp_lcd_panel_draw_bitmap, we need contiguous row-major data
-                // The panel expects data in left-to-right order, so we extract columns from left to right
-                static uint16_t col_buffer[800 * 20];  // Static buffer for up to 20 rows (should be enough)
-                if (row_height <= 20) {
-                // Extract each column from left to right and pack them row-major for the panel update
-                // Optimized: use row-major access pattern for better cache locality
-                // Access rotated buffer column-wise but pack row-major in col_buffer
-                for (int col = 0; col < row_height; col++) {
-                    int rotated_col_x = rotated_col_left + col;  // Extract from left to right
-                    uint16_t *col_buf_ptr = col_buffer + col * 800;  // Row start in destination
-                    // Access rotated buffer column (stride=480) - cache-friendly if we process multiple columns
-                    for (int i = 0; i < 800; i++) {
-                        col_buf_ptr[i] = fb_rotated[i * 480 + rotated_col_x];
-                    }
-                }
-                    // Send the rotated column region to panel (partial update)
-                    // x_start = rotated_col_left, x_end = rotated_col_right + 1 (exclusive)
-                    // Width is row_height columns, height is 800 pixels
-                    esp_lcd_panel_draw_bitmap(panel_handle, rotated_col_left, 0, rotated_col_right + 1, 800, col_buffer);
-                } else {
-                    // Fallback to full rotation if row_height is too large
-                    ESP_LOGW(TAG, "Row height %d too large for partial rotation, using full rotation", row_height);
-                    partial_rotation = false;
-                }
-            } else {
-                ESP_LOGE(TAG, "PPA partial rotation failed: %s", esp_err_to_name(ret));
-                partial_rotation = false;
-            }
-        }
-        
-        if (!partial_rotation) {
-            // Full screen rotation (first render or fallback)
-            ppa_srm_oper_config_t srm_config = {
-                .in.buffer = CURRENT_FB,
-                .in.pic_w = FB_WIDTH,      // 800
-                .in.pic_h = FB_HEIGHT,     // 480
-                .in.block_w = FB_WIDTH,
-                .in.block_h = FB_HEIGHT,
-                .in.block_offset_x = 0,
-                .in.block_offset_y = 0,
-                .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                .out.buffer = fb_rotated,
-                .out.buffer_size = 480 * 800 * sizeof(uint16_t),  // Rotated size
-                .out.pic_w = 480,  // After 270° rotation: height becomes width
-                .out.pic_h = 800,  // After 270° rotation: width becomes height
-                .out.block_offset_x = 0,
-                .out.block_offset_y = 0,
-                .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,  // 270° CCW rotation
-                .scale_x = 1,
-                .scale_y = 1,
-                .rgb_swap = 0,
-                .byte_swap = 0,
-                .mode = PPA_TRANS_MODE_BLOCKING,
-            };
-            
-            // Perform rotation
-            esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
-            if (ret == ESP_OK) {
-                // Send rotated buffer directly to panel
-                esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, 480, 800, fb_rotated);
-            } else {
-                ESP_LOGE(TAG, "PPA rotation failed: %s", esp_err_to_name(ret));
-            }
-        }
-    }
-}
-#endif
 
 void app_main(void) {
     // Initialize application state
