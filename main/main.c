@@ -52,20 +52,22 @@ static char const TAG[] = "main";
 // Internal flash wear levelling handle
 static wl_handle_t int_flash_wl_handle = WL_INVALID_HANDLE;
 
-// Logical landscape framebuffer dimensions (matches physical display orientation)
-// Will be rotated 270° CCW via PPA when sending to ST7701S (native 480x800 portrait)
-#define FB_WIDTH  800
-#define FB_HEIGHT 480
+// Global framebuffers and hardware handles
+static uint16_t *fb = NULL;  // Logical landscape framebuffer (800x480)
+static uint16_t *fb_rotated = NULL;  // Rotated framebuffer (480x800)
+static ppa_client_handle_t ppa_srm_handle = NULL;  // PPA SRM client
+static ppa_client_handle_t ppa_fill_handle = NULL;  // PPA Fill client
+static QueueHandle_t input_event_queue = NULL;  // Input event queue
 
-// Screen margins to ensure content is visible
-#define MARGIN_LEFT   10
-#define MARGIN_RIGHT  10
-#define MARGIN_TOP    5
-#define MARGIN_BOTTOM 5
-
-// Effective content area after margins
-#define CONTENT_WIDTH  (FB_WIDTH - MARGIN_LEFT - MARGIN_RIGHT)   // 780
-#define CONTENT_HEIGHT (FB_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM)  // 470
+// Framebuffer dimensions (use module constants)
+#define FB_WIDTH  HW_ACCEL_FB_WIDTH
+#define FB_HEIGHT HW_ACCEL_FB_HEIGHT
+#define MARGIN_LEFT   APP_STATE_MARGIN_LEFT
+#define MARGIN_RIGHT  APP_STATE_MARGIN_RIGHT
+#define MARGIN_TOP    APP_STATE_MARGIN_TOP
+#define MARGIN_BOTTOM APP_STATE_MARGIN_BOTTOM
+#define CONTENT_WIDTH  APP_STATE_CONTENT_WIDTH
+#define CONTENT_HEIGHT APP_STATE_CONTENT_HEIGHT
 
 // Format: ARGB32 = 0xAARRGGBB, RGB565 = 0bRRRRRGGGGGGBBBBB
 static inline uint16_t argb32_to_rgb565(uint32_t argb) {
@@ -78,16 +80,6 @@ static inline uint16_t argb32_to_rgb565(uint32_t argb) {
 // Application state (managed by app_state module)
 static app_state_t *state = NULL;
 
-// Local convenience macros for framebuffer access
-#define FB_WIDTH  HW_ACCEL_FB_WIDTH
-#define FB_HEIGHT HW_ACCEL_FB_HEIGHT
-#define MARGIN_LEFT   APP_STATE_MARGIN_LEFT
-#define MARGIN_RIGHT  APP_STATE_MARGIN_RIGHT
-#define MARGIN_TOP    APP_STATE_MARGIN_TOP
-#define MARGIN_BOTTOM APP_STATE_MARGIN_BOTTOM
-#define CONTENT_WIDTH  APP_STATE_CONTENT_WIDTH
-#define CONTENT_HEIGHT APP_STATE_CONTENT_HEIGHT
-
 // Legacy compatibility
 #define VU_DECAY_RATE       APP_STATE_VU_DECAY_RATE
 #define VU_ATTACK_RATE      APP_STATE_VU_ATTACK_RATE
@@ -96,140 +88,10 @@ static app_state_t *state = NULL;
 #define MAX_MOD_FILE_SIZE   APP_STATE_MAX_MOD_FILE_SIZE
 #define MAX_TRACKER_ROWS    APP_STATE_MAX_TRACKER_ROWS
 
-// Convenience accessors for app state
-#define CURRENT_FB (state->fb)
+// Convenience accessors
+#define CURRENT_FB (fb)
 
-static void IRAM_ATTR ppa_fill_framebuffer(uint16_t *fb_ptr, int width, int height, uint16_t color) {
-    if (!fb_ptr || width <= 0 || height <= 0) {
-        return;
-    }
-    
-    if (ppa_fill_handle && fb_ptr) {
-        color_pixel_argb8888_data_t fill_color = rgb565_to_argb8888(color);
-        
-        // Configure PPA Fill operation
-        ppa_fill_oper_config_t fill_config = {
-            .out = {
-                .buffer = CURRENT_FB,
-                .buffer_size = width * height * sizeof(uint16_t),
-                .pic_w = width,
-                .pic_h = height,
-                .block_offset_x = 0,
-                .block_offset_y = 0,
-                .fill_cm = PPA_FILL_COLOR_MODE_RGB565,  // Output format is RGB565
-            },
-            .fill_block_w = width,
-            .fill_block_h = height,
-            .fill_argb_color = fill_color,
-            .mode = PPA_TRANS_MODE_BLOCKING,
-            .user_data = NULL,
-        };
-        
-        esp_err_t ret = ppa_do_fill(ppa_fill_handle, &fill_config);
-        if (ret == ESP_OK) {
-            return;
-        }
-        ESP_LOGW(TAG, "PPA Fill failed (%s), falling back to CPU fill", esp_err_to_name(ret));
-    } else {
-        ESP_LOGD(TAG, "PPA Fill handle not available, using CPU fill");
-    }
-    
-    uint64_t color_word = ((uint64_t)color << 48) | ((uint64_t)color << 32) | 
-                          ((uint64_t)color << 16) | (uint64_t)color;
-    
-    int total_pixels = width * height;
-    uint64_t *fb_words = (uint64_t *)fb_ptr;
-    int word_count = total_pixels / 4;
-    
-    for (int i = 0; i < word_count; i++) {
-        fb_words[i] = color_word;
-    }
-    
-    int remainder = total_pixels % 4;
-    if (remainder > 0) {
-        int start_idx = word_count * 4;
-        for (int i = 0; i < remainder; i++) {
-            fb_ptr[start_idx + i] = color;
-        }
-    }
-}
 
-static void IRAM_ATTR ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int x, int y, int w, int h, uint16_t color) {
-    if (!fb_ptr || width <= 0 || height <= 0 || w <= 0 || h <= 0) {
-        return;
-    }
-    
-    if (x < 0) {
-        w += x;
-        x = 0;
-    }
-    if (y < 0) {
-        h += y;
-        y = 0;
-    }
-    if (x + w > width) {
-        w = width - x;
-    }
-    if (y + h > height) {
-        h = height - y;
-    }
-    if (w <= 0 || h <= 0) {
-        return;
-    }
-    
-    if (ppa_fill_handle) {
-        color_pixel_argb8888_data_t fill_color = rgb565_to_argb8888(color);
-        
-        ppa_fill_oper_config_t fill_config = {
-            .out = {
-                .buffer = fb_ptr,
-                .buffer_size = width * height * sizeof(uint16_t),
-                .pic_w = width,
-                .pic_h = height,
-                .block_offset_x = x,
-                .block_offset_y = y,
-                .fill_cm = PPA_FILL_COLOR_MODE_RGB565,
-            },
-            .fill_block_w = w,
-            .fill_block_h = h,
-            .fill_argb_color = fill_color,
-            .mode = PPA_TRANS_MODE_BLOCKING,
-            .user_data = NULL,
-        };
-        
-        esp_err_t ret = ppa_do_fill(ppa_fill_handle, &fill_config);
-        if (ret == ESP_OK) {
-            return;
-        }
-        ESP_LOGW(TAG, "PPA Fill rect failed (%s), falling back to CPU fill", esp_err_to_name(ret));
-    } else {
-        ESP_LOGD(TAG, "PPA Fill handle not available, using CPU fill for rect");
-    }
-    
-    uint64_t color_word = ((uint64_t)color << 48) | ((uint64_t)color << 32) | 
-                          ((uint64_t)color << 16) | (uint64_t)color;
-    
-    for (int dy = 0; dy < h; dy++) {
-        int fy = y + dy;
-        if (fy >= 0 && fy < height) {
-            uint16_t *row = &fb_ptr[fy * width + x];
-            int word_count = w / 4;
-            uint64_t *row_words = (uint64_t *)row;
-            
-            for (int i = 0; i < word_count; i++) {
-                row_words[i] = color_word;
-            }
-            
-            int remainder = w % 4;
-            if (remainder > 0) {
-                int start_idx = word_count * 4;
-                for (int i = 0; i < remainder; i++) {
-                    row[start_idx + i] = color;
-                }
-            }
-        }
-    }
-}
 
 #define RGB565_BLACK   0x0000
 #define RGB565_WHITE   0xFFFF
@@ -241,187 +103,34 @@ static void IRAM_ATTR ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int
 #define RGB565_CYAN    0x07FF
 #define RGB565_GRAY    0x8410
 #define RGB565_DARK_BLUE 0x1084
-static void IRAM_ATTR format_channel_string(char *ch_str, size_t ch_str_size, 
-                                   unsigned char note, unsigned char ins, 
-                                   unsigned char fxt, unsigned char fxp, 
-                                   bool use_compact, const char *note_names[12]) {
-    char note_str[4];
-    if (note > 0 && note <= 96) {
-        int note_idx = (note - 1) % 12;
-        int octave = (note - 1) / 12;
-        if (note_idx < 0) note_idx = 0;
-        if (note_idx > 11) note_idx = 11;
-        if (octave < 0) octave = 0;
-        if (octave > 9) octave = 9;
-        const char *note_name = note_names[note_idx];
-        if (use_compact) {
-            // Compact: "C4" or "C#4"
-            if (note_name[1] == '#') {
-                snprintf(note_str, sizeof(note_str), "%c#%d", note_name[0], octave);
-            } else {
-                snprintf(note_str, sizeof(note_str), "%c%d", note_name[0], octave);
-            }
-        } else {
-            // Full: "C-4" or "C#4"
-            snprintf(note_str, sizeof(note_str), "%s%d", note_name, octave);
-        }
-    } else {
-        strcpy(note_str, use_compact ? "--" : "---");
-    }
-    
-    // Format instrument: "--" if no instrument, else hex value
-    char ins_str[3];
-    if (ins == 0) {
-        strcpy(ins_str, "--");
-    } else {
-        snprintf(ins_str, sizeof(ins_str), "%02X", ins);
-    }
 
-    if (fxt == 0 && fxp == 0) {
-        snprintf(ch_str, ch_str_size, "%s %s ----", note_str, ins_str);
-    } else {
-        snprintf(ch_str, ch_str_size, "%s %s %02X%02X", note_str, ins_str, fxt, fxp);
-    }
+// Wrapper functions to redirect to new modules
+// These allow the existing code in main.c to continue working without changes
+static inline void ppa_fill_framebuffer(uint16_t *fb_ptr, int width, int height, uint16_t color) {
+    hw_accel_fill_framebuffer(fb_ptr, width, height, color);
 }
 
-static void draw_file_browser(file_browser_t *browser) {
-    const int font_scale = 2;
-    const int row_height = THEME_ROW_HEIGHT_MD;  // 32px per row
-    const int header_height = THEME_HEADER_HEIGHT;  // 40px header
-    const int icon_size = UI_ICON_WIDTH;
-    const int icon_padding = THEME_ICON_PADDING;
-    const int text_offset_x = MARGIN_LEFT + icon_size + icon_padding * 2;
+static inline void ppa_fill_rect(uint16_t *fb_ptr, int width, int height, int x, int y, int w, int h, uint16_t color) {
+    hw_accel_fill_rect(fb_ptr, width, height, x, y, w, h, color);
+}
 
-    // Clear background
-    ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
+static inline void scroll_framebuffer_ppa(uint16_t *fb_pixels, int src_y, int dst_y, int copy_height, int stride) {
+    hw_accel_scroll_framebuffer(fb_pixels, src_y, dst_y, copy_height, stride);
+}
 
-    // Draw header with gradient
-    ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                      0, MARGIN_TOP, FB_WIDTH, header_height,
-                      THEME_BG_HEADER, THEME_BG_PRIMARY);
+static inline void blit(int row_y, int row_height) {
+    hw_accel_blit(NULL, fb, fb_rotated, row_y, row_height);
+}
 
-    // Header title (centered)
-    const char *title = "Trackmatsu";
-    int title_width = strlen(title) * FONT_WIDTH * font_scale;
-    int title_x = (FB_WIDTH - title_width) / 2;
-    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                            title_x, MARGIN_TOP + 4,
-                            THEME_TEXT_PRIMARY, font_scale, title);
+static inline void draw_file_browser(file_browser_t *browser) {
+    ui_draw_file_browser(fb, FB_WIDTH, FB_HEIGHT, browser);
+}
 
-    // Path display (below header)
-    int path_y = MARGIN_TOP + header_height + 2;
-    char path_text[80];
-    int path_len = snprintf(path_text, sizeof(path_text), "%s", browser->current_path);
-    if (path_len >= (int)sizeof(path_text)) {
-        path_text[sizeof(path_text) - 1] = '\0';
-    }
-    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                            MARGIN_LEFT, path_y,
-                            THEME_TEXT_SECONDARY, 1, path_text);
-
-    // File list area
-    int file_list_y = path_y + FONT_HEIGHT + 8;
-    int visible_rows = (FB_HEIGHT - file_list_y - MARGIN_BOTTOM - row_height) / row_height;
-    if (visible_rows > 12) visible_rows = 12;
-
-    // Calculate visible range (center selection when possible)
-    int half_visible = visible_rows / 2;
-    int start_idx = browser->selected_index - half_visible;
-    if (start_idx < 0) start_idx = 0;
-    int end_idx = start_idx + visible_rows;
-    if (end_idx > browser->count) {
-        end_idx = browser->count;
-        start_idx = end_idx - visible_rows;
-        if (start_idx < 0) start_idx = 0;
-    }
-
-    // Detect directory change or scroll - reset animation state
-    if (browser_last_count != browser->count || browser_last_start_idx != start_idx) {
-        browser_last_selected = -1;
-        browser_last_count = browser->count;
-        browser_last_start_idx = start_idx;
-    }
-
-    // Draw alternating row backgrounds
-    for (int i = start_idx; i < end_idx; i++) {
-        int row_idx = i - start_idx;
-        int row_y = file_list_y + row_idx * row_height;
-        uint16_t row_bg = (row_idx % 2 == 0) ? THEME_BG_PRIMARY : THEME_BG_SECONDARY;
-        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                      MARGIN_LEFT, row_y, CONTENT_WIDTH, row_height, row_bg);
-    }
-
-    // Draw icons and text (selected item uses white text)
-    for (int i = start_idx; i < end_idx; i++) {
-        int row_idx = i - start_idx;
-        int row_y = file_list_y + row_idx * row_height;
-
-        // Determine icon and color based on file type
-        bool is_parent = (strcmp(browser->files[i].filename, "..") == 0);
-        bool is_dir = browser->files[i].is_dir;
-        const char *ext = strrchr(browser->files[i].filename, '.');
-        ui_icon_id_t icon_id = ui_get_file_icon_id(ext, is_dir, is_parent);
-
-        // Icon color based on type
-        uint16_t icon_color;
-        switch (icon_id) {
-            case UI_ICON_ID_FOLDER: icon_color = THEME_ACCENT_5; break;  // Magenta
-            case UI_ICON_ID_PARENT: icon_color = THEME_ACCENT_6; break;  // Cyan
-            case UI_ICON_ID_MOD:    icon_color = THEME_ACCENT_1; break;  // Red
-            case UI_ICON_ID_XM:     icon_color = THEME_ACCENT_2; break;  // Green
-            case UI_ICON_ID_S3M:    icon_color = THEME_ACCENT_3; break;  // Blue
-            case UI_ICON_ID_IT:     icon_color = THEME_ACCENT_4; break;  // Yellow
-            default:                icon_color = THEME_TEXT_SECONDARY; break;
-        }
-
-        // Draw icon
-        int icon_y = row_y + (row_height - icon_size) / 2;
-        const uint8_t *icon_data = ui_get_icon(icon_id);
-        if (icon_data) {
-            ui_draw_icon(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                         MARGIN_LEFT + icon_padding, icon_y,
-                         icon_data, UI_ICON_WIDTH, UI_ICON_HEIGHT,
-                         icon_color);
-        }
-
-        // Draw filename
-        char name[64];
-        strncpy(name, browser->files[i].filename, sizeof(name) - 1);
-        name[sizeof(name) - 1] = '\0';
-
-        int text_y = row_y + (row_height - FONT_HEIGHT * font_scale) / 2;
-        uint16_t text_color = (i == browser->selected_index) ? THEME_TEXT_PRIMARY : THEME_TEXT_SECONDARY;
-        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                text_offset_x, text_y, text_color, font_scale, name);
-    }
-
-    // Footer hint bar (same style as playback views)
-    int hint_bar_height = 20;
-    int hint_bar_y = FB_HEIGHT - MARGIN_BOTTOM - hint_bar_height;
-    ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                  0, hint_bar_y, FB_WIDTH, hint_bar_height, THEME_BG_SECONDARY);
-
-    // Calculate total width for centering
-    // ↑↓ Nav | ⏎ Select | ← Back
-    int gap = 20;
-    int total_width = 0;
-    total_width += FONT_WIDTH * 6 + gap;   // "↑↓ Nav" (6 chars)
-    total_width += FONT_WIDTH * 8 + gap;   // "⏎ Select" (8 chars)
-    total_width += FONT_WIDTH * 6;          // "← Back" (6 chars)
-
-    int hint_x = (FB_WIDTH - total_width) / 2;
-    int text_y = hint_bar_y + (hint_bar_height - FONT_HEIGHT) / 2 + 1;
-
-    // ↑↓ Nav (chars 0x80, 0x81)
-    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Nav");
-    hint_x += FONT_WIDTH * 6 + gap;
-
-    // ⏎ Select (char 0x84)
-    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x84 Select");
-    hint_x += FONT_WIDTH * 8 + gap;
-
-    // ← Back (char 0x82)
-    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x82 Back");
+static inline void format_channel_string(char *ch_str, size_t ch_str_size,
+                                         unsigned char note, unsigned char ins,
+                                         unsigned char fxt, unsigned char fxp,
+                                         bool use_compact, const char *note_names[12]) {
+    ui_format_channel_string(ch_str, ch_str_size, note, ins, fxt, fxp, use_compact, note_names);
 }
 
 static volatile bool gdma_copy_done = false;
@@ -437,97 +146,9 @@ static bool gdma_memcpy_callback(async_memcpy_handle_t mcp_hdl, async_memcpy_eve
 // Hardware-accelerated scrolling using PPA SRM with 0° rotation
 // Optimized: Direct copy from source to destination (no temp buffer needed)
 // Since src_y > dst_y (scrolling up), regions don't overlap, so we can copy directly
-static void IRAM_ATTR scroll_framebuffer_ppa(uint16_t *fb_pixels, int src_y, int dst_y, int copy_height, int stride) {
-    if (!fb_pixels || !ppa_srm_handle || copy_height <= 0) {
-        return;
-    }
-    
-    int copy_width = stride;  // Full width
-    
-    // Direct copy from source region to destination using PPA SRM with 0° rotation
-    // Since we're scrolling up (src_y > dst_y), the regions don't overlap, so we can copy directly
-    ppa_srm_oper_config_t srm_config = {
-        .in.buffer = fb_pixels,  // Full framebuffer as input picture
-        .in.pic_w = stride,
-        .in.pic_h = FB_HEIGHT,
-        .in.block_w = copy_width,
-        .in.block_h = copy_height,
-        .in.block_offset_x = 0,
-        .in.block_offset_y = src_y,  // Start reading from src_y
-        .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        .out.buffer = fb_pixels,  // Same framebuffer, different region
-        .out.buffer_size = FB_HEIGHT * stride * sizeof(uint16_t),  // Full buffer size
-        .out.pic_w = stride,
-        .out.pic_h = FB_HEIGHT,
-        .out.block_offset_x = 0,
-        .out.block_offset_y = dst_y,  // Write to dst_y
-        .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,  // No rotation, just copy
-        .scale_x = 1,
-        .scale_y = 1,
-        .rgb_swap = 0,
-        .byte_swap = 0,
-        .mode = PPA_TRANS_MODE_BLOCKING,
-    };
-    
-    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
-    if (ret != ESP_OK) {
-        // Fallback: memcpy (non-overlapping regions when scrolling up: src_y > dst_y)
-        // Compiler may optimize memcpy with SIMD internally
-        ESP_LOGW(TAG, "PPA scrolling failed (%s), falling back to memcpy", esp_err_to_name(ret));
-        uint16_t *src_ptr = fb_pixels + src_y * stride;
-        uint16_t *dst_ptr = fb_pixels + dst_y * stride;
-        size_t copy_bytes = copy_height * stride * sizeof(uint16_t);
-        // Use memcpy since regions don't overlap (scrolling up: src_y > dst_y)
-        memcpy(dst_ptr, src_ptr, copy_bytes);
-    }
-}
 
 // Blit function - rotates framebuffer and sends to display via BSP
 // BSP handles vsync and double buffering internally
-void IRAM_ATTR blit(int row_y, int row_height) {
-    // BSP handles double buffering, so we just rotate and blit
-    // row_y and row_height are unused - we always do full screen rotation for simplicity
-    (void)row_y;
-    (void)row_height;
-    
-    if (!fb || !fb_rotated || !ppa_srm_handle) {
-        return;
-    }
-    
-    // Rotate landscape framebuffer (800x480) to portrait (480x800) using PPA
-    ppa_srm_oper_config_t srm_config = {
-        .in.buffer = fb,
-        .in.pic_w = FB_WIDTH,
-        .in.pic_h = FB_HEIGHT,
-        .in.block_w = FB_WIDTH,
-        .in.block_h = FB_HEIGHT,
-        .in.block_offset_x = 0,
-        .in.block_offset_y = 0,
-        .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        .out.buffer = fb_rotated,
-        .out.buffer_size = 480 * 800 * sizeof(uint16_t),
-        .out.pic_w = 480,
-        .out.pic_h = 800,
-        .out.block_offset_x = 0,
-        .out.block_offset_y = 0,
-        .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
-        .scale_x = 1,
-        .scale_y = 1,
-        .rgb_swap = 0,
-        .byte_swap = 0,
-        .mode = PPA_TRANS_MODE_BLOCKING,
-    };
-    
-    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
-    if (ret == ESP_OK) {
-        // Send rotated buffer to display via BSP (handles vsync and double buffering)
-        bsp_display_blit(0, 0, 480, 800, fb_rotated);
-    } else {
-        ESP_LOGE(TAG, "PPA rotation failed: %s", esp_err_to_name(ret));
-    }
-}
 
 #if 0
 // Old blit implementation - removed, LCD task now handles rotation and display
@@ -666,22 +287,11 @@ void app_main(void) {
             },
     };
     ESP_ERROR_CHECK(bsp_device_initialize(&bsp_configuration));
-    
-    // Initialize PPA SRM client for rotation
-    ppa_client_config_t ppa_srm_config = {
-        .oper_type = PPA_OPERATION_SRM,
-        .max_pending_trans_num = 1,
-    };
-    ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
-    ESP_LOGI(TAG, "PPA SRM client registered for rotation");
-    
-    // Initialize PPA Fill client for hardware-accelerated fills
-    ppa_client_config_t ppa_fill_config = {
-        .oper_type = PPA_OPERATION_FILL,
-        .max_pending_trans_num = 1,
-    };
-    ESP_ERROR_CHECK(ppa_register_client(&ppa_fill_config, &ppa_fill_handle));
-    ESP_LOGI(TAG, "PPA Fill client registered for hardware-accelerated fills");
+
+    // Initialize hardware acceleration module
+    ESP_ERROR_CHECK(hw_accel_init());
+    ppa_srm_handle = hw_accel_get_srm_handle();
+    ppa_fill_handle = hw_accel_get_fill_handle();
 
     // Allocate single logical landscape framebuffer (800x480) from DMA-capable PSRAM
     // Use 64-byte alignment for L2 cache line optimization (ESP32-P4 has 64-byte cache lines)
