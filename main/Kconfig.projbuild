@@ -31,3 +31,30 @@ menu "MOD Playback Configuration"
     endchoice
 
 endmenu
+
+menu "VGM Playback Configuration"
+
+    config VGM_ENABLE
+        bool "Enable VGM/VGZ playback"
+        default y
+        help
+            Enable playback of VGM (Video Game Music) and VGZ (compressed VGM) files.
+            VGM files are chip register logs from classic game consoles.
+
+    config VGM_ENABLE_SEGACD
+        bool "Enable Sega CD PCM support"
+        depends on VGM_ENABLE
+        default n
+        help
+            Enable Sega CD PCM chip emulation for VGM files that use it.
+            Increases binary size.
+
+    config VGM_ENABLE_YM2151
+        bool "Enable YM2151 support"
+        depends on VGM_ENABLE
+        default n
+        help
+            Enable YM2151 (OPM) chip emulation for arcade VGM files.
+            Increases binary size.
+
+endmenu

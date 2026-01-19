@@ -62,7 +62,8 @@ extern "C" {
 typedef enum {
     APP_VIEW_TRACKER,    // Normal tracker display with channel data
     APP_VIEW_SPECTRUM,   // FFT spectrum analyzer visualization
-    APP_VIEW_INFO        // Module info display
+    APP_VIEW_INFO,       // Module info display
+    APP_VIEW_VGM         // VGM playback view
 } app_playback_view_t;
 
 /**

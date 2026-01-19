@@ -7,3 +7,6 @@
 [submodule "components/micromod"]
 	path = components/micromod
 	url = https://github.com/martincameron/micromod.git
+[submodule "components/libvgm/src"]
+	path = components/libvgm/src
+	url = https://github.com/ValleyBell/libvgm.git

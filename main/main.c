@@ -46,6 +46,11 @@
 #include "ui/ui_file_browser.h"
 #include "ui/ui_input_handler.h"
 
+// VGM player support (conditionally compiled via Kconfig)
+#ifdef CONFIG_VGM_ENABLE
+#include "vgm_player.h"
+#endif
+
 // Constants
 static char const TAG[] = "main";
 
@@ -207,10 +212,10 @@ void app_main(void) {
         
         // Initialize MOD player first (task will start but won't play until MOD is loaded)
         res = mod_player_init(MOD_CONFIG_SAMPLE_RATE);
-        
+
         // Small delay to let MOD player task initialize
         vTaskDelay(pdMS_TO_TICKS(50));
-        
+
         // Startup beep removed
         // audio_beep(100);
         if (res == ESP_OK) {
@@ -218,6 +223,16 @@ void app_main(void) {
         } else {
             ESP_LOGW(TAG, "MOD player initialization failed: %s", esp_err_to_name(res));
         }
+
+#ifdef CONFIG_VGM_ENABLE
+        // Initialize VGM player
+        res = vgm_player_init(VGM_NATIVE_SAMPLE_RATE);
+        if (res == ESP_OK) {
+            ESP_LOGI(TAG, "VGM player initialized");
+        } else {
+            ESP_LOGW(TAG, "VGM player initialization failed: %s", esp_err_to_name(res));
+        }
+#endif
     } else {
         ESP_LOGW(TAG, "Audio initialization failed: %s", esp_err_to_name(res));
         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
@@ -367,9 +382,15 @@ void app_main(void) {
                         break;
                         
                     case INPUT_ACTION_LOAD_MOD_FILE: {
-                        // Load MOD file
+                        // Load music file (MOD or VGM)
+                        ESP_LOGI("main", "INPUT_ACTION_LOAD_MOD_FILE: %s", action_result.data.load_mod.path);
                         FILE *f = fopen(action_result.data.load_mod.path, "rb");
-                        if (f) {
+                        if (!f) {
+                            ESP_LOGE("main", "Failed to open file: %s", action_result.data.load_mod.path);
+                            break;
+                        }
+                        ESP_LOGI("main", "File opened successfully");
+                        {
                             fseek(f, 0, SEEK_END);
                             long file_size = ftell(f);
                             fseek(f, 0, SEEK_SET);
@@ -383,6 +404,11 @@ void app_main(void) {
                                 break;
                             }
 
+                            // Check file extension to determine player type
+                            const char *ext = strrchr(action_result.data.load_mod.path, '.');
+                            bool is_vgm = (ext && (strcasecmp(ext, ".vgm") == 0 || strcasecmp(ext, ".vgz") == 0));
+                            ESP_LOGI("main", "File size: %ld, ext: %s, is_vgm: %d", file_size, ext ? ext : "NULL", is_vgm);
+
                             // Free previous MOD data if any
                             if (state->mod_file.data) {
                                 free(state->mod_file.data);
@@ -394,11 +420,11 @@ void app_main(void) {
                                 size_t read = fread(state->mod_file.data, 1, file_size, f);
                                 fclose(f);
 
-                                if (read == file_size) {
+                                if (read == (size_t)file_size) {
                                     state->mod_file.size = file_size;
                                     strncpy(state->mod_file.path, action_result.data.load_mod.path, sizeof(state->mod_file.path) - 1);
                                     state->mod_file.path[sizeof(state->mod_file.path) - 1] = '\0';
-                                    
+
                                     // Show loading message
                                     ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                     font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
@@ -406,34 +432,78 @@ void app_main(void) {
                                                           (FB_HEIGHT - FONT_HEIGHT * 2) / 2,
                                                           RGB565_WHITE, 2, "Loading...");
                                     blit(-1, 0);
-                                    
-                                    res = mod_player_load(state->mod_file.data, state->mod_file.size);
-                                    if (res == ESP_OK) {
-                                        res = mod_player_start();
+
+#ifdef CONFIG_VGM_ENABLE
+                                    if (is_vgm) {
+                                        ESP_LOGI("main", "Loading VGM file...");
+                                        // Stop MOD player if playing
+                                        if (mod_player_is_playing()) {
+                                            mod_player_stop();
+                                        }
+
+                                        // Load and start VGM file
+                                        res = vgm_player_load(state->mod_file.data, state->mod_file.size);
+                                        ESP_LOGI("main", "vgm_player_load returned: %d", res);
                                         if (res == ESP_OK) {
-                                            state->browser_active = false;
-                                            state->tracker.mod_info_loaded = false;
-                                            state->current_view = APP_VIEW_TRACKER;
-                                            
-                                            // Reset VU meter levels
-                                            for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
-                                                state->vu_state.levels[i] = 0.0f;
-                                                state->vu_state.peaks[i] = 0.0f;
-                                                state->vu_state.peak_hold[i] = 0;
+                                            res = vgm_player_start();
+                                            ESP_LOGI("main", "vgm_player_start returned: %d", res);
+                                            if (res == ESP_OK) {
+                                                state->browser_active = false;
+                                                state->current_view = APP_VIEW_VGM;
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
+                                                ESP_LOGI("main", "VGM playback started, switched to VGM view");
+                                            } else {
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start VGM");
+                                                blit(-1, 0);
                                             }
-                                            
-                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
                                         } else {
+                                            free(state->mod_file.data);
+                                            state->mod_file.data = NULL;
                                             ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load VGM");
                                             blit(-1, 0);
                                         }
-                                    } else {
-                                        free(state->mod_file.data);
-                                        state->mod_file.data = NULL;
-                                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
-                                        blit(-1, 0);
+                                    } else
+#endif
+                                    {
+                                        // Stop VGM player if playing
+#ifdef CONFIG_VGM_ENABLE
+                                        if (vgm_player_is_playing()) {
+                                            vgm_player_stop();
+                                        }
+#endif
+                                        (void)is_vgm;  // Suppress unused warning when VGM disabled
+
+                                        // Load and start MOD file
+                                        res = mod_player_load(state->mod_file.data, state->mod_file.size);
+                                        if (res == ESP_OK) {
+                                            res = mod_player_start();
+                                            if (res == ESP_OK) {
+                                                state->browser_active = false;
+                                                state->tracker.mod_info_loaded = false;
+                                                state->current_view = APP_VIEW_TRACKER;
+
+                                                // Reset VU meter levels
+                                                for (int i = 0; i < MOD_MAX_CHANNELS; i++) {
+                                                    state->vu_state.levels[i] = 0.0f;
+                                                    state->vu_state.peaks[i] = 0.0f;
+                                                    state->vu_state.peak_hold[i] = 0;
+                                                }
+
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
+                                            } else {
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start MOD");
+                                                blit(-1, 0);
+                                            }
+                                        } else {
+                                            free(state->mod_file.data);
+                                            state->mod_file.data = NULL;
+                                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to load MOD");
+                                            blit(-1, 0);
+                                        }
                                     }
                                 } else {
                                     free(state->mod_file.data);
@@ -448,10 +518,6 @@ void app_main(void) {
                                 font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Out of PSRAM");
                                 blit(-1, 0);
                             }
-                        } else {
-                            ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to open file");
-                            blit(-1, 0);
                         }
                         break;
                     }
@@ -460,14 +526,22 @@ void app_main(void) {
                         if (mod_player_is_playing()) {
                             mod_player_stop();
                         }
+#ifdef CONFIG_VGM_ENABLE
+                        if (vgm_player_is_playing()) {
+                            vgm_player_stop();
+                        }
+#endif
                         audio_stop();
                         audio_set_volume(0.0f);
                         vTaskDelay(pdMS_TO_TICKS(50));
                         bsp_device_restart_to_launcher();
                         break;
-                        
+
                     case INPUT_ACTION_RETURN_TO_BROWSER:
                         mod_player_stop();
+#ifdef CONFIG_VGM_ENABLE
+                        vgm_player_stop();
+#endif
                         state->browser_active = true;
                         file_browser_refresh(&state->browser);
                         needs_render = true;
@@ -478,10 +552,23 @@ void app_main(void) {
                         break;
                         
                     case INPUT_ACTION_PAUSE_RESUME:
-                        if (mod_player_is_paused()) {
-                            mod_player_resume();
-                        } else {
-                            mod_player_pause();
+#ifdef CONFIG_VGM_ENABLE
+                        if (state->current_view == APP_VIEW_VGM) {
+                            // VGM pause/resume
+                            if (vgm_player_is_paused()) {
+                                vgm_player_resume();
+                            } else {
+                                vgm_player_pause();
+                            }
+                        } else
+#endif
+                        {
+                            // MOD pause/resume
+                            if (mod_player_is_paused()) {
+                                mod_player_resume();
+                            } else {
+                                mod_player_pause();
+                            }
                         }
                         break;
                         
@@ -558,7 +645,10 @@ void app_main(void) {
                     if (num_channels > 0 && num_channels <= MOD_MAX_CHANNELS) {
                         // Handle view mode toggle ('V' key)
                         if (state->view_key_pressed) {
-                            state->current_view = (app_playback_view_t)((state->current_view + 1) % 3);  // Cycle through APP_VIEW_TRACKER, APP_VIEW_SPECTRUM, APP_VIEW_INFO
+                            // Only cycle through MOD views if not playing VGM
+                            if (state->current_view != APP_VIEW_VGM) {
+                                state->current_view = (app_playback_view_t)((state->current_view + 1) % 3);  // Cycle through APP_VIEW_TRACKER, APP_VIEW_SPECTRUM, APP_VIEW_INFO
+                            }
                             state->view_key_pressed = false;
                             // Clear framebuffer when switching views
                             ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
@@ -1579,6 +1669,159 @@ void app_main(void) {
                         const char *info_pause = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, info_pause);
                     }
+#ifdef CONFIG_VGM_ENABLE
+                    else if (state->current_view == APP_VIEW_VGM) {
+                        // VGM playback view
+                        ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
+
+                        // Header
+                        ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                          0, MARGIN_TOP, FB_WIDTH, THEME_HEADER_HEIGHT,
+                                          THEME_BG_HEADER, THEME_BG_PRIMARY);
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, MARGIN_TOP + 4,
+                                                THEME_TEXT_PRIMARY, 2, "VGM PLAYER");
+
+                        // Get VGM tags and playback info
+                        vgm_tags_t vgm_tags;
+                        vgm_playback_info_t vgm_info;
+                        vgm_player_get_tags(&vgm_tags);
+                        vgm_player_get_info(&vgm_info);
+
+                        int vgm_y = MARGIN_TOP + THEME_HEADER_HEIGHT + 16;
+                        int line_spacing = 24;
+                        char vgm_line[128];
+
+                        // Title (or filename as fallback)
+                        if (vgm_tags.title[0]) {
+                            snprintf(vgm_line, sizeof(vgm_line), "Title: %.50s", vgm_tags.title);
+                        } else {
+                            // Extract filename from path
+                            const char *fname = strrchr(state->mod_file.path, '/');
+                            fname = fname ? fname + 1 : state->mod_file.path;
+                            snprintf(vgm_line, sizeof(vgm_line), "File: %.50s", fname);
+                        }
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, vgm_y, THEME_TEXT_PRIMARY, 2, vgm_line);
+                        vgm_y += line_spacing;
+
+                        // Game
+                        if (vgm_tags.game[0]) {
+                            snprintf(vgm_line, sizeof(vgm_line), "Game: %.50s", vgm_tags.game);
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, 2, vgm_line);
+                            vgm_y += line_spacing;
+                        }
+
+                        // System
+                        if (vgm_tags.system[0]) {
+                            snprintf(vgm_line, sizeof(vgm_line), "System: %.50s", vgm_tags.system);
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, 2, vgm_line);
+                            vgm_y += line_spacing;
+                        }
+
+                        // Author
+                        if (vgm_tags.author[0]) {
+                            snprintf(vgm_line, sizeof(vgm_line), "Author: %.50s", vgm_tags.author);
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, 2, vgm_line);
+                            vgm_y += line_spacing;
+                        }
+
+                        // Chip info
+                        vgm_y += 8;
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                MARGIN_LEFT, vgm_y, THEME_TEXT_PRIMARY, 2, "Chips:");
+                        vgm_y += line_spacing;
+
+                        // Display active chips
+                        int chip_x = MARGIN_LEFT + 16;
+                        for (int i = 0; i < vgm_info.num_chips && i < 4; i++) {
+                            vgm_chip_info_t chip;
+                            if (vgm_player_get_chip_info(i, &chip) == ESP_OK && chip.name) {
+                                snprintf(vgm_line, sizeof(vgm_line), "[%s]", chip.name);
+                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                        chip_x, vgm_y, THEME_VU_MID, 2, vgm_line);
+                                chip_x += strlen(vgm_line) * FONT_WIDTH * 2 + 16;
+                            }
+                        }
+                        vgm_y += line_spacing + 16;
+
+                        // Progress bar
+                        int progress_bar_w = CONTENT_WIDTH - 120;
+                        int progress_bar_h = 16;
+                        int progress_bar_x = MARGIN_LEFT;
+                        int progress_bar_y = vgm_y;
+
+                        // Background
+                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                      progress_bar_x, progress_bar_y, progress_bar_w, progress_bar_h,
+                                      THEME_VU_BG);
+
+                        // Progress fill
+                        double progress = 0.0;
+                        if (vgm_info.total_time_sec > 0) {
+                            progress = vgm_info.current_time_sec / vgm_info.total_time_sec;
+                            if (progress > 1.0) progress = 1.0;
+                        }
+                        int fill_w = (int)(progress_bar_w * progress);
+                        if (fill_w > 0) {
+                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                          progress_bar_x, progress_bar_y, fill_w, progress_bar_h,
+                                          THEME_VU_MID);
+                        }
+
+                        // Time display
+                        int cur_min = (int)(vgm_info.current_time_sec / 60);
+                        int cur_sec = (int)(vgm_info.current_time_sec) % 60;
+                        int tot_min = (int)(vgm_info.total_time_sec / 60);
+                        int tot_sec = (int)(vgm_info.total_time_sec) % 60;
+                        snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / %d:%02d", cur_min, cur_sec, tot_min, tot_sec);
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                progress_bar_x + progress_bar_w + 8, progress_bar_y,
+                                                THEME_TEXT_SECONDARY, 2, vgm_line);
+
+                        // Loop indicator
+                        if (vgm_info.has_loop) {
+                            vgm_y += line_spacing + 8;
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_MUTED, 1, "(Looping track)");
+                        }
+
+                        // Footer hint bar
+                        int vgm_hint_h = 20;
+                        int vgm_hint_y = FB_HEIGHT - MARGIN_BOTTOM - vgm_hint_h;
+                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                      0, vgm_hint_y, FB_WIDTH, vgm_hint_h, THEME_BG_PRIMARY);
+
+                        int vgm_icon_w = 16, vgm_icon_h = 16;
+                        if (fkey_icon_available(6)) fkey_icon_get_size(6, &vgm_icon_w, &vgm_icon_h);
+                        int vgm_gap = 20;
+                        int vgm_hx = MARGIN_LEFT + 20;
+                        int vgm_icon_y_pos = vgm_hint_y + (vgm_hint_h - vgm_icon_h) / 2;
+                        int vgm_text_y = vgm_hint_y + (vgm_hint_h - FONT_HEIGHT) / 2 + 1;
+
+                        // F6 Exit
+                        if (fkey_icon_available(6)) {
+                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_icon_y_pos, 6, 1);
+                            vgm_hx += vgm_icon_w + 4;
+                        } else {
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "F6");
+                            vgm_hx += FONT_WIDTH * 2 + 4;
+                        }
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "Exit");
+                        vgm_hx += FONT_WIDTH * 4 + vgm_gap;
+
+                        // arrows Vol
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
+                        vgm_hx += FONT_WIDTH * 6 + vgm_gap;
+
+                        // space Pause
+                        const char *vgm_pause = vgm_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, vgm_pause);
+                    }
+#endif
 
                     PROFILING_END(render, render);
                     // Note: state->tracker.last_row is now updated when we finish scrolling, not immediately

@@ -84,11 +84,12 @@ esp_err_t ui_input_handle_navigation(bsp_input_navigation_key_t key,
                 esp_err_t select_res = file_browser_select(ctx->browser, selected_path, sizeof(selected_path));
 
                 if (select_res == ESP_OK && !is_directory) {
-                    // File selected - check if it's a MOD file
+                    // File selected - check if it's a supported music file
                     const char *ext = strrchr(selected_path, '.');
                     if (ext && (strcasecmp(ext, ".mod") == 0 || strcasecmp(ext, ".xm") == 0 ||
-                                strcasecmp(ext, ".s3m") == 0 || strcasecmp(ext, ".it") == 0)) {
-                        // Valid MOD file - request load
+                                strcasecmp(ext, ".s3m") == 0 || strcasecmp(ext, ".it") == 0 ||
+                                strcasecmp(ext, ".vgm") == 0 || strcasecmp(ext, ".vgz") == 0)) {
+                        // Valid music file - request load
                         result->action = INPUT_ACTION_LOAD_MOD_FILE;
                         strncpy(result->data.load_mod.path, selected_path, sizeof(result->data.load_mod.path) - 1);
                         result->data.load_mod.path[sizeof(result->data.load_mod.path) - 1] = '\0';
@@ -201,11 +202,12 @@ esp_err_t ui_input_handle_scancode(bsp_input_scancode_t scancode,
             esp_err_t select_res = file_browser_select(ctx->browser, selected_path, sizeof(selected_path));
 
             if (select_res == ESP_OK && !is_directory) {
-                // File selected - check if it's a MOD file
+                // File selected - check if it's a supported music file
                 const char *ext = strrchr(selected_path, '.');
                 if (ext && (strcasecmp(ext, ".mod") == 0 || strcasecmp(ext, ".xm") == 0 ||
-                            strcasecmp(ext, ".s3m") == 0 || strcasecmp(ext, ".it") == 0)) {
-                    // Valid MOD file - request load
+                            strcasecmp(ext, ".s3m") == 0 || strcasecmp(ext, ".it") == 0 ||
+                            strcasecmp(ext, ".vgm") == 0 || strcasecmp(ext, ".vgz") == 0)) {
+                    // Valid music file - request load
                     result->action = INPUT_ACTION_LOAD_MOD_FILE;
                     strncpy(result->data.load_mod.path, selected_path, sizeof(result->data.load_mod.path) - 1);
                     result->data.load_mod.path[sizeof(result->data.load_mod.path) - 1] = '\0';

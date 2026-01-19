@@ -89,13 +89,15 @@ esp_err_t file_browser_refresh(file_browser_t *browser) {
                 file->is_dir = true;
                 browser->count++;
             } else {
-                // For files, only include MOD files (.mod, .xm, .s3m, .it)
+                // For files, include MOD files (.mod, .xm, .s3m, .it) and VGM files (.vgm, .vgz)
                 const char *ext = strrchr(entry->d_name, '.');
                 if (ext != NULL && (
                     strcasecmp(ext, ".mod") == 0 ||
                     strcasecmp(ext, ".xm") == 0 ||
                     strcasecmp(ext, ".s3m") == 0 ||
-                    strcasecmp(ext, ".it") == 0)) {
+                    strcasecmp(ext, ".it") == 0 ||
+                    strcasecmp(ext, ".vgm") == 0 ||
+                    strcasecmp(ext, ".vgz") == 0)) {
                     file_entry_t *file = &browser->files[browser->count];
                     strncpy(file->filename, entry->d_name, sizeof(file->filename) - 1);
                     file->filename[sizeof(file->filename) - 1] = '\0';
