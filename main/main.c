@@ -42,6 +42,9 @@
 #include "esp_vfs_fat.h"
 #include "wear_levelling.h"
 #include "fkey_icons.h"
+#include "app_state.h"
+#include "graphics/hw_accel.h"
+#include "ui/ui_file_browser.h"
 
 // Constants
 static char const TAG[] = "main";
@@ -72,68 +75,29 @@ static inline uint16_t argb32_to_rgb565(uint32_t argb) {
     return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
 }
 
-// Global variables - Simplified with BSP double buffering
-static uint16_t *fb = NULL;  // Single logical landscape framebuffer (800x480) in PSRAM
-static uint16_t *fb_rotated = NULL;  // Single rotated framebuffer (480x800) for display output
-static ppa_client_handle_t ppa_srm_handle = NULL;  // PPA SRM client for rotation
-static ppa_client_handle_t ppa_fill_handle = NULL;  // PPA Fill client for hardware-accelerated fills
-static QueueHandle_t input_event_queue = NULL;
-static int channel_page_offset = 0;  // Channel pagination: offset for current page (0-4-8-12...)
-static bool tab_pressed_this_frame = false;  // Flag set by Tab key handler, checked during rendering
+// Application state (managed by app_state module)
+static app_state_t *state = NULL;
 
-// Playback view modes
-typedef enum {
-    VIEW_TRACKER,    // Normal tracker display with channel data
-    VIEW_SPECTRUM,   // FFT spectrum analyzer visualization
-    VIEW_INFO        // Module info display
-} playback_view_t;
-static playback_view_t current_view = VIEW_TRACKER;
-static bool view_key_pressed = false;  // 'V' key pressed flag for view toggle
+// Local convenience macros for framebuffer access
+#define FB_WIDTH  HW_ACCEL_FB_WIDTH
+#define FB_HEIGHT HW_ACCEL_FB_HEIGHT
+#define MARGIN_LEFT   APP_STATE_MARGIN_LEFT
+#define MARGIN_RIGHT  APP_STATE_MARGIN_RIGHT
+#define MARGIN_TOP    APP_STATE_MARGIN_TOP
+#define MARGIN_BOTTOM APP_STATE_MARGIN_BOTTOM
+#define CONTENT_WIDTH  APP_STATE_CONTENT_WIDTH
+#define CONTENT_HEIGHT APP_STATE_CONTENT_HEIGHT
 
-// VU meter state (volume decay tracking for smooth animation)
-static float channel_vu_levels[MOD_MAX_CHANNELS] = {0};
-static float channel_vu_peaks[MOD_MAX_CHANNELS] = {0};
+// Legacy compatibility
+#define VU_DECAY_RATE       APP_STATE_VU_DECAY_RATE
+#define VU_ATTACK_RATE      APP_STATE_VU_ATTACK_RATE
+#define VU_PEAK_DECAY_RATE  APP_STATE_VU_PEAK_DECAY_RATE
+#define VU_PEAK_HOLD_FRAMES APP_STATE_VU_PEAK_HOLD_FRAMES
+#define MAX_MOD_FILE_SIZE   APP_STATE_MAX_MOD_FILE_SIZE
+#define MAX_TRACKER_ROWS    APP_STATE_MAX_TRACKER_ROWS
 
-// VU meter layout cache (updated by tracker rendering, used by VU overlay)
-static int vu_cached_line_height = 32;   // Row height for VU meter sizing
-static int vu_start_channel = 0;         // First visible channel
-static int vu_visible_channels = 4;      // Number of visible channels
-static int vu_channel_x[4] = {0};        // X position of each visible channel column
-static int vu_channel_width[4] = {0};    // Width of each visible channel column
-static uint32_t channel_peak_hold[MOD_MAX_CHANNELS] = {0};
-#define VU_DECAY_RATE 0.08f      // Decay per frame (lower = smoother)
-#define VU_ATTACK_RATE 0.4f      // Attack per frame (lower = smoother, less flicker)
-#define MAX_MOD_FILE_SIZE (10 * 1024 * 1024)  // 10MB max file size
-#define VU_PEAK_DECAY_RATE 0.02f // Peak decay per frame
-#define VU_PEAK_HOLD_FRAMES 20   // Frames to hold peak before decay
-
-// Spectrum analyzer instance
-static spectrum_analyzer_t *spectrum = NULL;
-
-// File browser animation state
-static int browser_anim_target_y = 0;
-static int browser_anim_current_y = 0;
-static int browser_anim_start_y = 0;   // Starting Y position for animation (fixed during anim)
-static TickType_t browser_anim_start = 0;
-static int browser_last_selected = -1;
-static int browser_last_count = -1;   // Track file count to detect directory changes
-static int browser_last_start_idx = -1;  // Track scroll position to reset animation on scroll
-#define BROWSER_ANIM_DURATION_MS 100
-
-#define CURRENT_FB (fb)
-
-// PPA API requires fill_argb_color in ARGB8888 format regardless of output format
-static inline color_pixel_argb8888_data_t rgb565_to_argb8888(uint16_t rgb565) {
-    color_pixel_argb8888_data_t argb;
-    uint8_t r = ((rgb565 >> 11) & 0x1F) << 3;  // 5 bits -> 8 bits (scale by 8)
-    uint8_t g = ((rgb565 >> 5) & 0x3F) << 2;   // 6 bits -> 8 bits (scale by 4)
-    uint8_t b = (rgb565 & 0x1F) << 3;          // 5 bits -> 8 bits (scale by 8)
-    argb.a = 0xFF;
-    argb.r = r;
-    argb.g = g;
-    argb.b = b;
-    return argb;
-}
+// Convenience accessors for app state
+#define CURRENT_FB (state->fb)
 
 static void IRAM_ATTR ppa_fill_framebuffer(uint16_t *fb_ptr, int width, int height, uint16_t color) {
     if (!fb_ptr || width <= 0 || height <= 0) {

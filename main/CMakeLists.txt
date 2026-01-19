@@ -39,6 +39,9 @@ idf_component_register(
 		"spectrum_analyzer.c"
 		"stb_image_impl.c"
 		"fkey_icons.c"
+		"app_state.c"
+		"graphics/hw_accel.c"
+		"ui/ui_file_browser.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
