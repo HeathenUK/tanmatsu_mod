@@ -23,6 +23,7 @@
 #include "spectrum_analyzer.h"
 #include "esp_vfs_fat.h"
 #include "wear_levelling.h"
+#include "driver/ppa.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -135,6 +136,10 @@ typedef struct {
     // Framebuffers
     uint16_t *fb;
     uint16_t *fb_rotated;
+
+    // PPA handles for hardware acceleration
+    ppa_client_handle_t ppa_srm_handle;
+    ppa_client_handle_t ppa_fill_handle;
 
     // Input queue
     QueueHandle_t input_event_queue;
