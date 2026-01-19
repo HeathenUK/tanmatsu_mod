@@ -45,6 +45,7 @@
 #include "app_state.h"
 #include "graphics/hw_accel.h"
 #include "ui/ui_file_browser.h"
+#include "ui/ui_input_handler.h"
 
 // Constants
 static char const TAG[] = "main";
