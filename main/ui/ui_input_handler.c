@@ -9,7 +9,7 @@
 #include <string.h>
 #include <strings.h>
 
-static const char TAG[] = "ui_input";
+static const char TAG[] __attribute__((unused)) = "ui_input";
 
 esp_err_t ui_input_handle_event(const bsp_input_event_t *event,
                                  input_handler_context_t *ctx,

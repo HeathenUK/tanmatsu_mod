@@ -79,7 +79,7 @@ void app_state_cleanup(void) {
     }
 
     if (g_app_state.spectrum) {
-        spectrum_analyzer_destroy(g_app_state.spectrum);
+        spectrum_free(g_app_state.spectrum);
         g_app_state.spectrum = NULL;
     }
 

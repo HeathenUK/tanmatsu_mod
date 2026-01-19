@@ -494,9 +494,7 @@ void app_main(void) {
                         break;
                 }
             }
-        }  // End of input event processing
-
-        }  // End of while loop processing all pending input events
+        }  // End of input event processing (while loop for xQueueReceive)
         
         // Render file browser if needed (input handlers set needs_render flag)
         // Also render on first loop if browser is active but hasn't been rendered yet
@@ -533,7 +531,7 @@ void app_main(void) {
             static bool last_browser_active = true;
             if (last_browser_active && !state->browser_active) {
                 // Switching from browser to playback - clear framebuffer for clean transition
-                ppa_fill_framebuffer(fb, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                 did_render = true;  // Ensure we blit to show the cleared screen
             }
             last_browser_active = state->browser_active;
@@ -664,7 +662,7 @@ void app_main(void) {
                         int ch_width = cached_ch_width;
 
                         // Update global VU line height cache
-                        vu_cached_line_height = line_height;
+                        state->vu_state.cached_line_height = line_height;
 
                         // Header height: use smaller header to maximize tracker content area
                         // Font scale 1 = 16px text height, add small padding
@@ -688,38 +686,6 @@ void app_main(void) {
                         const int logical_width = FB_WIDTH;  // 800
                         const int logical_height = FB_HEIGHT;  // 480
                         int stride = logical_width;  // Pixels per row in landscape framebuffer (800)
-                        
-                        void draw_header(void) {
-                            // Clear header area with theme background
-                            ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                              0, MARGIN_TOP, FB_WIDTH, header_height,
-                                              THEME_BG_HEADER, THEME_BG_PRIMARY);
-
-                            // Use module metadata name instead of filename
-                            const char *mod_name = (state->tracker.mod_info.mod && state->tracker.mod_info.mod->name[0])
-                                                   ? state->tracker.mod_info.mod->name : "Unknown";
-
-                            // Draw song title on the left (font scale 1 for compact header)
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                    MARGIN_LEFT, MARGIN_TOP + 2,
-                                                    THEME_TEXT_PRIMARY, 1, mod_name);
-
-                            // Draw volume right-aligned
-                            // Map actual volume (20%-100%) to display (0%-100%)
-                            float header_vol = 0.0f;
-                            if (audio_get_volume(&header_vol) == ESP_OK) {
-                                char vol_text[16];
-                                int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
-                                if (vol_percent < 0) vol_percent = 0;
-                                if (vol_percent > 100) vol_percent = 100;
-                                snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
-                                int vol_width = strlen(vol_text) * FONT_WIDTH;  // font_scale = 1
-                                int vol_x = FB_WIDTH - MARGIN_RIGHT - vol_width;
-                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                        vol_x, MARGIN_TOP + 2,
-                                                        THEME_TEXT_PRIMARY, 1, vol_text);
-                            }
-                        }
                         
                         // Hex digit lookup table removed - using snprintf with %02X format instead
                         
@@ -755,7 +721,37 @@ void app_main(void) {
                             ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                             
                             // Draw header on first render (always clear to ensure exact alignment)
-                            draw_header();
+                            {
+                                // Clear header area with theme background
+                                ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                  0, MARGIN_TOP, FB_WIDTH, header_height,
+                                                  THEME_BG_HEADER, THEME_BG_PRIMARY);
+
+                                // Use module metadata name instead of filename
+                                const char *mod_name = (state->tracker.mod_info.mod && state->tracker.mod_info.mod->name[0])
+                                                       ? state->tracker.mod_info.mod->name : "Unknown";
+
+                                // Draw song title on the left (font scale 1 for compact header)
+                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                        MARGIN_LEFT, MARGIN_TOP + 2,
+                                                        THEME_TEXT_PRIMARY, 1, mod_name);
+
+                                // Draw volume right-aligned
+                                // Map actual volume (20%-100%) to display (0%-100%)
+                                float header_vol = 0.0f;
+                                if (audio_get_volume(&header_vol) == ESP_OK) {
+                                    char vol_text[16];
+                                    int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
+                                    if (vol_percent < 0) vol_percent = 0;
+                                    if (vol_percent > 100) vol_percent = 100;
+                                    snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
+                                    int vol_width = strlen(vol_text) * FONT_WIDTH;  // font_scale = 1
+                                    int vol_x = FB_WIDTH - MARGIN_RIGHT - vol_width;
+                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                            vol_x, MARGIN_TOP + 2,
+                                                            THEME_TEXT_PRIMARY, 1, vol_text);
+                                }
+                            }
                             
                             // Initialize current tick with first frame data
                             memcpy(state->tracker.current_tick.channels, frame_info.channel_info, sizeof(frame_info.channel_info));
@@ -849,7 +845,37 @@ void app_main(void) {
                             
                             // Always redraw header every frame to prevent smudging from scrolling rows
                             // This ensures the header area stays clean as rows scroll underneath
-                            draw_header();
+                            {
+                                // Clear header area with theme background
+                                ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                  0, MARGIN_TOP, FB_WIDTH, header_height,
+                                                  THEME_BG_HEADER, THEME_BG_PRIMARY);
+
+                                // Use module metadata name instead of filename
+                                const char *mod_name = (state->tracker.mod_info.mod && state->tracker.mod_info.mod->name[0])
+                                                       ? state->tracker.mod_info.mod->name : "Unknown";
+
+                                // Draw song title on the left (font scale 1 for compact header)
+                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                        MARGIN_LEFT, MARGIN_TOP + 2,
+                                                        THEME_TEXT_PRIMARY, 1, mod_name);
+
+                                // Draw volume right-aligned
+                                // Map actual volume (20%-100%) to display (0%-100%)
+                                float header_vol = 0.0f;
+                                if (audio_get_volume(&header_vol) == ESP_OK) {
+                                    char vol_text[16];
+                                    int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
+                                    if (vol_percent < 0) vol_percent = 0;
+                                    if (vol_percent > 100) vol_percent = 100;
+                                    snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
+                                    int vol_width = strlen(vol_text) * FONT_WIDTH;  // font_scale = 1
+                                    int vol_x = FB_WIDTH - MARGIN_RIGHT - vol_width;
+                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                            vol_x, MARGIN_TOP + 2,
+                                                            THEME_TEXT_PRIMARY, 1, vol_text);
+                                }
+                            }
                             
                             // Pattern-timed smooth scrolling: scroll one line_height over the duration of one pattern row
                             // This keeps scrolling in sync with pattern playback
@@ -876,7 +902,7 @@ void app_main(void) {
                                         state->tracker.tick_history_count++;
                                     } else {
                                         // Shift history (oldest first, so remove oldest)
-                                        memmove(tick_history, tick_history + 1, (MAX_TRACKER_ROWS - 1) * sizeof(struct tracker_tick));
+                                        memmove(state->tracker.tick_history, state->tracker.tick_history + 1, (MAX_TRACKER_ROWS - 1) * sizeof(app_tracker_tick_t));
                                         memcpy(state->tracker.tick_history[MAX_TRACKER_ROWS - 1].channels, state->tracker.current_tick.channels, sizeof(state->tracker.current_tick.channels));
                                         state->tracker.tick_history[MAX_TRACKER_ROWS - 1].pos = state->tracker.current_tick.pos;
                                         state->tracker.tick_history[MAX_TRACKER_ROWS - 1].pattern = state->tracker.current_tick.pattern;
@@ -1004,7 +1030,7 @@ void app_main(void) {
                                 }
                                 
                                 // Determine which data to draw for this row index
-                                struct tracker_tick *tick = NULL;
+                                app_tracker_tick_t *tick = NULL;
                                 bool is_current_row = false;
                                 
                                 if (row_idx < center_row_idx) {
@@ -1143,8 +1169,8 @@ void app_main(void) {
                                         if (is_current_row) {
                                             int cache_x = start_x;
                                             for (int i = 0; i < visible_channels && i < 4; i++) {
-                                                vu_channel_x[i] = cache_x;
-                                                vu_channel_width[i] = channel_widths[i];
+                                                state->vu_state.channel_x[i] = cache_x;
+                                                state->vu_state.channel_width[i] = channel_widths[i];
                                                 cache_x += channel_widths[i];
                                                 if (i < visible_channels - 1) {
                                                     cache_x += separator_width;
@@ -1254,7 +1280,7 @@ void app_main(void) {
                     if (state->current_view == APP_VIEW_TRACKER) {
                         // Layout: VU meters above hint bar at bottom
                         int hint_bar_height = 20;  // Height for hint bar
-                        int vu_height = vu_cached_line_height;
+                        int vu_height = state->vu_state.cached_line_height;
                         int hint_bar_y = FB_HEIGHT - MARGIN_BOTTOM - hint_bar_height;
                         int vu_footer_y = hint_bar_y - vu_height;
 
@@ -1270,8 +1296,8 @@ void app_main(void) {
                             if (ch >= num_channels || ch >= MOD_MAX_CHANNELS) break;
 
                             // Use cached column positions for alignment
-                            int vu_x = vu_channel_x[i];
-                            int vu_width = vu_channel_width[i];
+                            int vu_x = state->vu_state.channel_x[i];
+                            int vu_width = state->vu_state.channel_width[i];
                             if (vu_width < 10) vu_width = 50;  // Fallback if not cached yet
 
                             ui_draw_vu_meter(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
@@ -1373,9 +1399,9 @@ void app_main(void) {
                         // Draw spectrum bars
                         uint8_t bands[SPECTRUM_NUM_BANDS] = {0};
                         uint8_t peaks[SPECTRUM_NUM_BANDS] = {0};
-                        if (spectrum) {
-                            spectrum_get_bands_and_peaks(spectrum, bands, peaks, SPECTRUM_NUM_BANDS);
-                            spectrum_update_decay(spectrum);
+                        if (state->spectrum) {
+                            spectrum_get_bands_and_peaks(state->spectrum, bands, peaks, SPECTRUM_NUM_BANDS);
+                            spectrum_update_decay(state->spectrum);
                         } else {
                             // No spectrum analyzer - show simulated bars from channel volumes
                             for (int i = 0; i < SPECTRUM_NUM_BANDS && i < num_channels; i++) {
