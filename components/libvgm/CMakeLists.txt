@@ -246,7 +246,10 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
 
 # Optional Sega CD support
 if(CONFIG_VGM_ENABLE_SEGACD)
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE SNDDEV_RF5C68)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        SNDDEV_RF5C68
+        EC_RF5C68_GENS      # Gens core (default, accurate)
+    )
 endif()
 
 # C++ standard for player module
