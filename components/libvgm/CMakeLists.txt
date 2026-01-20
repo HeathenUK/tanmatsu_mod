@@ -76,16 +76,18 @@ set(EMU_PCE_SRCS
     "src/emu/cores/Ootake_PSG.c"
 )
 
-# OPL2 (YM3812) - AdLib, Sound Blaster, many DOS games
+# OPL2 (YM3812) + OPL (YM3526) - AdLib, Sound Blaster, many DOS games
+# Note: oplintf.c is shared between YM3812 and YM3526
 set(EMU_OPL2_SRCS
     "src/emu/cores/oplintf.c"
-    "src/emu/cores/fmopl.c"
+    "src/emu/cores/adlibemu_opl2.c"  # YM3812 AdLibEmu core
+    "src/emu/cores/fmopl.c"          # YM3526 MAME core
 )
 
 # OPL3 (YMF262) - Sound Blaster Pro 2, AWE32, DOS games
 set(EMU_OPL3_SRCS
     "src/emu/cores/262intf.c"
-    "src/emu/cores/ymf262.c"
+    "src/emu/cores/adlibemu_opl3.c"
 )
 
 # QSound - Capcom CPS1.5/CPS2 arcade
@@ -179,27 +181,67 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     VGM_LITTLE_ENDIAN
     # Enable device selection mode (instead of building all emulators)
     SNDDEV_SELECT
-    # Sega chips
-    SNDDEV_YM2612      # Genesis FM
-    SNDDEV_SN76496     # Genesis/SMS PSG
-    # Arcade chips
-    SNDDEV_YM2151      # Arcade FM (CPS1, etc.)
-    SNDDEV_QSOUND      # Capcom CPS1.5/CPS2
-    # Yamaha FM chips
-    SNDDEV_YM2413      # OPLL (SMS FM, MSX)
-    SNDDEV_YM3812      # OPL2 (AdLib)
-    SNDDEV_YM3526      # OPL (predecessor to OPL2)
-    SNDDEV_YMF262      # OPL3 (Sound Blaster Pro 2)
-    # PSG chips
-    SNDDEV_AY8910      # MSX, ZX Spectrum, Amstrad
-    # Console chips
-    SNDDEV_NES_APU     # NES/Famicom
-    SNDDEV_GAMEBOY     # Game Boy
-    SNDDEV_C6280       # PC Engine/TurboGrafx-16
-    # Other chips
-    SNDDEV_POKEY       # Atari
-    SNDDEV_K051649     # SCC (Konami MSX)
-    SNDDEV_SEGAPCM     # Sega arcade PCM
+
+    # Sega Genesis/Mega Drive - YM2612 (FM synthesizer)
+    SNDDEV_YM2612
+    EC_YM2612_GENS          # Gens core (fast, good accuracy)
+
+    # Sega Genesis/SMS/Game Gear - SN76496 (PSG)
+    SNDDEV_SN76496
+    EC_SN76496_MAME         # MAME core (default, accurate)
+
+    # Arcade - YM2151 (OPM FM)
+    SNDDEV_YM2151
+    EC_YM2151_MAME          # MAME core (accurate)
+
+    # Arcade - QSound (Capcom CPS1.5/CPS2)
+    SNDDEV_QSOUND
+    EC_QSOUND_CTR           # superctr core (default, accurate)
+
+    # Yamaha OPLL - YM2413 (SMS FM, MSX-MUSIC)
+    SNDDEV_YM2413
+    EC_YM2413_EMU2413       # EMU2413 core (default, lightweight)
+
+    # Yamaha OPL2 - YM3812 (AdLib, early Sound Blaster)
+    SNDDEV_YM3812
+    EC_YM3812_ADLIBEMU      # AdLibEmu core (default, accurate)
+
+    # Yamaha OPL - YM3526 (predecessor to OPL2)
+    SNDDEV_YM3526
+    # Uses fmopl.c (MAME core, auto-enabled)
+
+    # Yamaha OPL3 - YMF262 (Sound Blaster Pro 2, AWE32)
+    SNDDEV_YMF262
+    EC_YMF262_ADLIBEMU      # AdLibEmu core (default, accurate)
+
+    # PSG - AY8910 (MSX, ZX Spectrum, Amstrad CPC)
+    SNDDEV_AY8910
+    EC_AY8910_EMU2149       # EMU2149 core (default, accurate)
+
+    # NES APU - Nintendo Entertainment System / Famicom
+    SNDDEV_NES_APU
+    EC_NES_NSFPLAY          # NSFPlay core (default, accurate)
+    EC_NES_NSFP_FDS         # FDS expansion (Famicom Disk System)
+
+    # Game Boy APU
+    SNDDEV_GAMEBOY
+    # Uses gb.c (no core variants)
+
+    # PC Engine/TurboGrafx-16 - HuC6280
+    SNDDEV_C6280
+    EC_C6280_OOTAKE         # Ootake core (default, accurate)
+
+    # Atari - POKEY
+    SNDDEV_POKEY
+    # Uses pokey.c (no core variants)
+
+    # Konami SCC - K051649 (MSX cartridges)
+    SNDDEV_K051649
+    # Uses k051649.c (no core variants)
+
+    # Sega arcade - SegaPCM
+    SNDDEV_SEGAPCM
+    # Uses segapcm.c (no core variants)
 )
 
 # Optional Sega CD support
