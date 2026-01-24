@@ -3,6 +3,8 @@
 #include <ctype.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <math.h>
+#include <inttypes.h>
 #include "audio.h"
 #include "mod_player.h"
 #include "mod_backend_config.h"  // For MOD_CONFIG_SAMPLE_RATE
@@ -18,6 +20,7 @@
 #include "custom_certificates.h"
 #include "driver/gpio.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_timer.h"
 #include "esp_lcd_types.h"
 #include "esp_log.h"
 #include "hal/lcd_types.h"
@@ -41,6 +44,7 @@
 #include "esp_vfs_fat.h"
 #include "wear_levelling.h"
 #include "fkey_icons.h"
+#include "ui/ui_hints.h"
 #include "app_state.h"
 #include "graphics/hw_accel.h"
 #include "ui/ui_file_browser.h"
@@ -164,6 +168,24 @@ void app_main(void) {
             },
     };
     ESP_ERROR_CHECK(bsp_device_initialize(&bsp_configuration));
+
+    // Track display backlight for idle dimming on file browser screen
+    uint8_t backlight_full = 100;
+    if (bsp_display_get_backlight_brightness(&backlight_full) != ESP_OK || backlight_full == 0) {
+        backlight_full = 100;
+    }
+    uint8_t keyboard_full = 100;
+    if (bsp_input_get_backlight_brightness(&keyboard_full) != ESP_OK || keyboard_full == 0) {
+        keyboard_full = 100;
+    }
+    uint8_t backlight_dim = 0;
+    uint8_t keyboard_dim = 0;
+    uint8_t backlight_current = backlight_full;
+    uint8_t keyboard_current = keyboard_full;
+    bool backlight_forced_off = false;
+    int64_t last_input_us = esp_timer_get_time();
+    bsp_display_set_backlight_brightness(backlight_full);
+    bsp_input_set_backlight_brightness(keyboard_full);
 
     // Initialize hardware acceleration module
     ESP_ERROR_CHECK(hw_accel_init());
@@ -313,23 +335,6 @@ void app_main(void) {
     // of ticks to wait, for example pdMS_TO_TICKS(1000)
 
     // File browser state (static to avoid stack overflow)
-    // Channel colors (RGB565)
-    static const uint16_t channel_colors_rgb565[MOD_MAX_CHANNELS] = {
-        0xF800, 0x07E0, 0x001F, 0xFFE0,  // Red, Green, Blue, Yellow
-        0xF81F, 0x07FF, 0xFC00, 0x87E0,  // Magenta, Cyan, Orange, Lime
-        0x041F, 0xF810, 0x87FF, 0xFC10,  // Light Blue, Pink, Light Cyan, Light Red
-        0x87F0, 0x841F, 0xFFF0, 0x87FF,  // Light Green, Light Blue, Light Yellow, etc.
-        0xFC1F, 0x87FF, 0xFFF0, 0x8410,  // More colors...
-        0xFC10, 0x87F0, 0x841F, 0xFC10,  // Repeating pattern for more channels
-        0x87F0, 0x841F, 0xFFF0, 0x87FF,
-        0xFC1F, 0x87FF, 0xFFF0, 0x8410,
-        0xFC10, 0x87F0, 0x841F, 0xFC10,
-        0x87F0, 0x841F, 0xFFF0, 0x87FF,
-        0xFC1F, 0x87FF, 0xFFF0, 0x8410,
-        0xFC10, 0x87F0, 0x841F, 0xFC10,
-        0x87F0, 0x841F, 0xFFF0, 0x87FF,
-        0xFC1F, 0x87FF, 0xFFF0, 0x8410,
-    };
 
     // Start with file browser if SD card is mounted
     // NOTE: Don't call blit() here - the main loop will render and call blit() once per frame
@@ -371,10 +376,30 @@ void app_main(void) {
         
         // Process ALL pending input events before doing anything else
         while (xQueueReceive(state->input_event_queue, &event, 0) == pdTRUE) {
+            bool is_press = true;
+            if (event.type == INPUT_EVENT_TYPE_NAVIGATION) {
+                is_press = event.args_navigation.state != 0;
+            } else if (event.type == INPUT_EVENT_TYPE_ACTION) {
+                is_press = event.args_action.state != 0;
+            }
+            if (is_press) {
+                last_input_us = esp_timer_get_time();
+            }
             input_action_result_t action_result;
             
             // Process input event
             if (ui_input_handle_event(&event, &input_ctx, &action_result) == ESP_OK) {
+                if (is_press && action_result.action != INPUT_ACTION_TOGGLE_BACKLIGHT) {
+                    if (backlight_forced_off || backlight_current != backlight_full) {
+                        bsp_display_set_backlight_brightness(backlight_full);
+                        backlight_current = backlight_full;
+                    }
+                    if (backlight_forced_off || keyboard_current != keyboard_full) {
+                        bsp_input_set_backlight_brightness(keyboard_full);
+                        keyboard_current = keyboard_full;
+                    }
+                    backlight_forced_off = false;
+                }
                 // Execute action based on result
                 switch (action_result.action) {
                     case INPUT_ACTION_REDRAW_BROWSER:
@@ -384,6 +409,7 @@ void app_main(void) {
                     case INPUT_ACTION_LOAD_MOD_FILE: {
                         // Load music file (MOD or VGM)
                         ESP_LOGI("main", "INPUT_ACTION_LOAD_MOD_FILE: %s", action_result.data.load_mod.path);
+                        file_browser_remember_selection(&state->browser);
                         FILE *f = fopen(action_result.data.load_mod.path, "rb");
                         if (!f) {
                             ESP_LOGE("main", "Failed to open file: %s", action_result.data.load_mod.path);
@@ -451,6 +477,24 @@ void app_main(void) {
                                                 state->current_view = APP_VIEW_VGM;
                                                 ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
                                                 ESP_LOGI("main", "VGM playback started, switched to VGM view");
+                                            } else if (res == ESP_ERR_NOT_SUPPORTED) {
+                                                const char *err = vgm_player_get_last_error();
+                                                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
+                                                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                                        16, 16, RGB565_RED, 2, "Unsupported VGM");
+                                                if (err && err[0]) {
+                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                                            16, 48, RGB565_WHITE, 1, err);
+                                                } else {
+                                                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                                            16, 48, RGB565_WHITE, 1, "Missing core for this VGM");
+                                                }
+                                                blit(-1, 0);
+                                                vTaskDelay(pdMS_TO_TICKS(1200));
+                                                free(state->mod_file.data);
+                                                state->mod_file.data = NULL;
+                                                state->browser_active = true;
+                                                file_browser_refresh(&state->browser);
                                             } else {
                                                 ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
                                                 font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, 0, 0, RGB565_RED, 2, "Failed to start VGM");
@@ -540,6 +584,7 @@ void app_main(void) {
                         
                     case INPUT_ACTION_SET_VOLUME:
                         audio_set_volume(action_result.data.set_volume.volume);
+                        state->volume_osd_ticks = 90;
                         break;
                         
                     case INPUT_ACTION_PAUSE_RESUME:
@@ -564,6 +609,20 @@ void app_main(void) {
                     case INPUT_ACTION_TOGGLE_CHANNEL_MUTE:
                         mod_player_toggle_channel_mute(action_result.data.toggle_mute.channel);
                         break;
+
+                    case INPUT_ACTION_VGM_SKIP:
+                        if (vgm_player_is_playing() && state->current_view == APP_VIEW_VGM) {
+                            vgm_player_skip_seconds(action_result.data.vgm_skip.seconds);
+                        }
+                        break;
+                        
+                    case INPUT_ACTION_TOGGLE_BACKLIGHT:
+                        backlight_forced_off = true;
+                        bsp_display_set_backlight_brightness(0);
+                        bsp_input_set_backlight_brightness(0);
+                        backlight_current = 0;
+                        keyboard_current = 0;
+                        break;
                         
                     case INPUT_ACTION_NONE:
                     default:
@@ -577,11 +636,66 @@ void app_main(void) {
         static bool browser_rendered = false;
         if (state->browser_active && (needs_render || !browser_rendered)) {
             draw_file_browser(&state->browser);
+            if (state->volume_osd_ticks > 0) {
+                float vol = 0.0f;
+                if (audio_get_volume(&vol) == ESP_OK) {
+                    ui_draw_browser_volume_osd(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vol);
+                }
+            }
             needs_render = false;  // Clear flag after rendering
             browser_rendered = true;  // Mark as rendered
             did_render = true;  // Mark that we rendered this frame
         } else if (!state->browser_active) {
             browser_rendered = false;  // Reset when browser becomes inactive
+        }
+
+        if (state->volume_osd_ticks > 0) {
+            state->volume_osd_ticks--;
+        }
+
+        // Idle dimming on file browser screen (wake on any input)
+        if (state->browser_active && !backlight_forced_off) {
+            const int64_t idle_start_ms = 30000;  // start dim after 30s
+            const int64_t fade_ms = 8000;        // fade duration
+            int64_t now_us = esp_timer_get_time();
+            int64_t idle_ms = (now_us - last_input_us) / 1000;
+            if (idle_ms <= idle_start_ms) {
+                if (backlight_current != backlight_full) {
+                    bsp_display_set_backlight_brightness(backlight_full);
+                    backlight_current = backlight_full;
+                }
+                if (keyboard_current != keyboard_full) {
+                    bsp_input_set_backlight_brightness(keyboard_full);
+                    keyboard_current = keyboard_full;
+                }
+            } else {
+                int64_t fade_elapsed = idle_ms - idle_start_ms;
+                if (fade_elapsed > fade_ms) fade_elapsed = fade_ms;
+                uint8_t target = backlight_full;
+                if (fade_ms > 0) {
+                    int32_t delta = (int32_t)backlight_full - (int32_t)backlight_dim;
+                    target = (uint8_t)(backlight_full - (delta * fade_elapsed) / fade_ms);
+                } else {
+                    target = backlight_dim;
+                }
+                if (target < backlight_dim) target = backlight_dim;
+                if (backlight_current != target) {
+                    bsp_display_set_backlight_brightness(target);
+                    backlight_current = target;
+                }
+                uint8_t kbd_target = keyboard_full;
+                if (fade_ms > 0) {
+                    int32_t delta = (int32_t)keyboard_full - (int32_t)keyboard_dim;
+                    kbd_target = (uint8_t)(keyboard_full - (delta * fade_elapsed) / fade_ms);
+                } else {
+                    kbd_target = keyboard_dim;
+                }
+                if (kbd_target < keyboard_dim) kbd_target = keyboard_dim;
+                if (keyboard_current != kbd_target) {
+                    bsp_input_set_backlight_brightness(kbd_target);
+                    keyboard_current = kbd_target;
+                }
+            }
         }
         
         // Render "no SD card" error if needed (only once, or if it changed)
@@ -703,8 +817,6 @@ void app_main(void) {
 
                         // Calculate layout (cache for performance)
                         static int cached_line_height = 0;
-                        static int cached_max_rows = 0;
-                        static int cached_ch_width = 0;
                         static int cached_num_channels = 0;
                         
                         // Recalculate if channel count changed
@@ -713,7 +825,6 @@ void app_main(void) {
                         if (cached_num_channels != layout_channels) {
                             // Dynamic text scaling to use ~85% of content width (after margins: 780px)
                             const int content_width = CONTENT_WIDTH;  // 780 (800 - 10 - 10)
-                            const int content_height = CONTENT_HEIGHT;  // 470 (480 - 5 - 5)
                             int available_width = (int)(content_width * 0.85);
                             int ch_width_estimate = available_width / layout_channels;
                             // Scale line height from 16px to 32px based on channel width (8x16 font needs larger range)
@@ -733,14 +844,10 @@ void app_main(void) {
                             // Ensure line_height is at least as tall as the rendered text to prevent overlap
                             cached_line_height = (estimated_line_height > actual_text_height) ? estimated_line_height : actual_text_height;
 
-                            cached_max_rows = (int)(content_height / cached_line_height);
-                            cached_ch_width = ch_width_estimate;
                             cached_num_channels = layout_channels;
                         }
                         
                         int line_height = cached_line_height;
-                        int max_rows_on_screen = cached_max_rows;
-                        int ch_width = cached_ch_width;
 
                         // Update global VU line height cache
                         state->vu_state.cached_line_height = line_height;
@@ -761,13 +868,6 @@ void app_main(void) {
                             }
                         }
                         
-                        // Get direct framebuffer access for scrolling (RGB565 = 2 bytes per pixel)
-                        // Logical landscape framebuffer: 800 pixels wide, 480 pixels tall
-                        uint16_t *fb_pixels = CURRENT_FB;  // Direct framebuffer access
-                        const int logical_width = FB_WIDTH;  // 800
-                        const int logical_height = FB_HEIGHT;  // 480
-                        int stride = logical_width;  // Pixels per row in landscape framebuffer (800)
-                        
                         // Hex digit lookup table removed - using snprintf with %02X format instead
                         
                         // Note name lookup
@@ -782,12 +882,10 @@ void app_main(void) {
                         if (font_scale < 1) font_scale = 1;
                         if (font_scale > 3) font_scale = 3;
                         int estimated_chars_per_channel_full = 12;  // "C-4 01 0F02 "
-                        int estimated_chars_per_channel_compact = 11;  // "C4 01 0F02 "
                         // Use channels_per_page (4) instead of num_channels for width calculation
                         // since we only show 4 channels at a time with pagination
                         int channels_for_width = (visible_channels < 4) ? visible_channels : 4;
                         int estimated_total_width_full = estimated_chars_per_channel_full * channels_for_width * FONT_WIDTH * font_scale;
-                        int estimated_total_width_compact = estimated_chars_per_channel_compact * channels_for_width * FONT_WIDTH * font_scale;
                         int available_width_pixels = CONTENT_WIDTH;  // 780 pixels
                         bool use_compact_format = (estimated_total_width_full > available_width_pixels);
                         
@@ -818,11 +916,11 @@ void app_main(void) {
                                                         THEME_TEXT_PRIMARY, 1, mod_name);
 
                                 // Draw volume right-aligned
-                                // Map actual volume (20%-100%) to display (0%-100%)
+                                // Map actual volume (0%-100%) to display (0%-100%)
                                 float header_vol = 0.0f;
                                 if (audio_get_volume(&header_vol) == ESP_OK) {
                                     char vol_text[16];
-                                    int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
+                                    int vol_percent = (int)(header_vol * 100.0f + 0.5f);
                                     if (vol_percent < 0) vol_percent = 0;
                                     if (vol_percent > 100) vol_percent = 100;
                                     snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
@@ -904,7 +1002,7 @@ void app_main(void) {
                                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, RGB565_WHITE, font_scale, separator);
                                         int line_x = x + separator_width / 2;  // Middle of the space
                                         int line_top = header_y;  // Start from header bottom
-                                        int line_bottom = logical_height - MARGIN_BOTTOM;  // End at content bottom
+                                        int line_bottom = FB_HEIGHT - MARGIN_BOTTOM;  // End at content bottom
                                         ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, line_x, line_top, 1, line_bottom - line_top, RGB565_GRAY);
                                         x += separator_width;
                                     }
@@ -942,11 +1040,11 @@ void app_main(void) {
                                                         THEME_TEXT_PRIMARY, 1, mod_name);
 
                                 // Draw volume right-aligned
-                                // Map actual volume (20%-100%) to display (0%-100%)
+                                // Map actual volume (0%-100%) to display (0%-100%)
                                 float header_vol = 0.0f;
                                 if (audio_get_volume(&header_vol) == ESP_OK) {
                                     char vol_text[16];
-                                    int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
+                                    int vol_percent = (int)(header_vol * 100.0f + 0.5f);
                                     if (vol_percent < 0) vol_percent = 0;
                                     if (vol_percent > 100) vol_percent = 100;
                                     snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
@@ -1079,7 +1177,7 @@ void app_main(void) {
                             // First, calculate how many rows will actually fit (check if last row would overflow)
                             int max_row_y = header_y + (num_visible_rows - 1) * line_height + line_height;
                             int actual_rows_count = num_visible_rows;
-                            if (max_row_y > logical_height - MARGIN_BOTTOM) {
+                            if (max_row_y > FB_HEIGHT - MARGIN_BOTTOM) {
                                 // Last row would overflow, so we'll skip it - adjust count for centering
                                 actual_rows_count = num_visible_rows - 1;
                             }
@@ -1106,7 +1204,7 @@ void app_main(void) {
                                 
                                 // Skip rows that would overflow below the visible area
                                 // This prevents the extra pending row from showing remnants at the bottom
-                                if (y + line_height > logical_height - MARGIN_BOTTOM) {
+                                if (y + line_height > FB_HEIGHT - MARGIN_BOTTOM) {
                                     continue;  // Skip this row - it's partially or fully off-screen
                                 }
                                 
@@ -1303,7 +1401,7 @@ void app_main(void) {
                                                 font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y, sep_color, font_scale, separator);
                                                 int line_x = x + separator_width / 2;  // Middle of the space
                                                 int line_top = header_y;  // Start from header bottom
-                                                int line_bottom = logical_height - MARGIN_BOTTOM;  // End at content bottom
+                                                int line_bottom = FB_HEIGHT - MARGIN_BOTTOM;  // End at content bottom
                                                 ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT, line_x, line_top, 1, line_bottom - line_top, RGB565_GRAY);
                                                 x += separator_width;
                                             }
@@ -1397,77 +1495,19 @@ void app_main(void) {
                                                     THEME_TEXT_MUTED, 1, ch_label);
                         }
 
-                        // Draw hint bar at bottom
-                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                      0, hint_bar_y, FB_WIDTH, hint_bar_height, THEME_BG_PRIMARY);
-
-                        // Draw playback hints - get icon dimensions for proper positioning
-                        int icon_width = 0, icon_height = 0;
-                        int gap = 20;
-
-                        // Get actual icon size if available
-                        if (fkey_icon_available(3)) {
-                            fkey_icon_get_size(3, &icon_width, &icon_height);
-                        }
-                        if (icon_width == 0) icon_width = 16;
-                        if (icon_height == 0) icon_height = 16;
-
-                        // Calculate total width for centering
-                        // F3 View + F4 Channel page + F6 Exit + arrows Vol + space Pause
-                        int total_width = 0;
-                        total_width += icon_width + 4 + FONT_WIDTH * 4 + gap;   // F3 View
-                        total_width += icon_width + 4 + FONT_WIDTH * 12 + gap;  // F4 Channel page
-                        total_width += icon_width + 4 + FONT_WIDTH * 4 + gap;   // F6 Exit
-                        total_width += FONT_WIDTH * 6 + gap;                     // arrows Vol
-                        total_width += FONT_WIDTH * 8;                           // space Pause/Resume
-
-                        int hint_x = (FB_WIDTH - total_width) / 2;
-
-                        // Calculate vertical centering
-                        // Font has more bottom padding than top, so add 1px offset to visually center text with icons
-                        int icon_y = hint_bar_y + (hint_bar_height - icon_height) / 2;
-                        int text_y = hint_bar_y + (hint_bar_height - FONT_HEIGHT) / 2 + 1;
-
-                        // F3 - View
-                        if (fkey_icon_available(3)) {
-                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, icon_y, 3, 1);
-                            hint_x += icon_width + 4;
-                        } else {
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "F3");
-                            hint_x += FONT_WIDTH * 2 + 4;
-                        }
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "View");
-                        hint_x += FONT_WIDTH * 4 + gap;
-
-                        // F4 - Channel page
-                        if (fkey_icon_available(4)) {
-                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, icon_y, 4, 1);
-                            hint_x += icon_width + 4;
-                        } else {
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "F4");
-                            hint_x += FONT_WIDTH * 2 + 4;
-                        }
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "Channel page");
-                        hint_x += FONT_WIDTH * 12 + gap;
-
-                        // F6 - Exit
-                        if (fkey_icon_available(6)) {
-                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, icon_y, 6, 1);
-                            hint_x += icon_width + 4;
-                        } else {
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "F6");
-                            hint_x += FONT_WIDTH * 2 + 4;
-                        }
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "Exit");
-                        hint_x += FONT_WIDTH * 4 + gap;
-
-                        // Up/Down arrows - Vol (chars 128, 129 = 0x80, 0x81)
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
-                        hint_x += FONT_WIDTH * 6 + gap;
-
-                        // Space bar - Pause/Resume (char 133 = 0x85)
-                        const char *pause_text = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, hint_x, text_y, THEME_TEXT_MUTED, 1, pause_text);
+                        const ui_hint_item_t hints[] = {
+                            {3, "View"},
+                            {4, "Channel page"},
+                            {1, "Backlight"},
+                            {6, "Exit"},
+                            {0, "\x80\x81 Vol"},
+                            {0, mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause"},
+                        };
+                        ui_draw_hint_bar(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                         hint_bar_y, hint_bar_height,
+                                         THEME_BG_PRIMARY, THEME_TEXT_MUTED,
+                                         hints, (int)(sizeof(hints) / sizeof(hints[0])),
+                                         20);
                     } else if (state->current_view == APP_VIEW_SPECTRUM) {
                         // Full-screen spectrum analyzer view
                         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_SPECTRUM_BG);
@@ -1498,49 +1538,19 @@ void app_main(void) {
                                               MARGIN_LEFT, spec_y, CONTENT_WIDTH, spec_height,
                                               bands, SPECTRUM_NUM_BANDS, peaks, 4);
 
-                        // Footer hint bar (same style as tracker view)
                         int spec_hint_y = FB_HEIGHT - MARGIN_BOTTOM - hint_bar_height_spec;
-                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                      0, spec_hint_y, FB_WIDTH, hint_bar_height_spec, THEME_BG_PRIMARY);
-
-                        int spec_icon_w = 16, spec_icon_h = 16;
-                        if (fkey_icon_available(3)) fkey_icon_get_size(3, &spec_icon_w, &spec_icon_h);
-                        int spec_gap = 20;
-                        int spec_total = (spec_icon_w + 4 + FONT_WIDTH * 4 + spec_gap) * 2 +  // F3 View, F6 Exit
-                                         FONT_WIDTH * 6 + spec_gap + FONT_WIDTH * 8;          // arrows Vol, space Pause
-                        int spec_hx = (FB_WIDTH - spec_total) / 2;
-                        int spec_icon_y = spec_hint_y + (hint_bar_height_spec - spec_icon_h) / 2;
-                        int spec_text_y = spec_hint_y + (hint_bar_height_spec - FONT_HEIGHT) / 2 + 1;
-
-                        // F3 View
-                        if (fkey_icon_available(3)) {
-                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_icon_y, 3, 1);
-                            spec_hx += spec_icon_w + 4;
-                        } else {
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "F3");
-                            spec_hx += FONT_WIDTH * 2 + 4;
-                        }
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "View");
-                        spec_hx += FONT_WIDTH * 4 + spec_gap;
-
-                        // F6 Exit
-                        if (fkey_icon_available(6)) {
-                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_icon_y, 6, 1);
-                            spec_hx += spec_icon_w + 4;
-                        } else {
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "F6");
-                            spec_hx += FONT_WIDTH * 2 + 4;
-                        }
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "Exit");
-                        spec_hx += FONT_WIDTH * 4 + spec_gap;
-
-                        // arrows Vol
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
-                        spec_hx += FONT_WIDTH * 6 + spec_gap;
-
-                        // space Pause
-                        const char *spec_pause = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, spec_hx, spec_text_y, THEME_TEXT_MUTED, 1, spec_pause);
+                        const ui_hint_item_t hints[] = {
+                            {3, "View"},
+                            {1, "Backlight"},
+                            {6, "Exit"},
+                            {0, "\x80\x81 Vol"},
+                            {0, mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause"},
+                        };
+                        ui_draw_hint_bar(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                         spec_hint_y, hint_bar_height_spec,
+                                         THEME_BG_PRIMARY, THEME_TEXT_MUTED,
+                                         hints, (int)(sizeof(hints) / sizeof(hints[0])),
+                                         20);
                     } else if (state->current_view == APP_VIEW_INFO) {
                         // Module info view
                         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
@@ -1615,50 +1625,20 @@ void app_main(void) {
                                            state->vu_state.levels[ch], THEME_VU_BG);
                         }
 
-                        // Footer hint bar (same style as tracker view)
                         int info_hint_h = 20;
                         int info_hint_y = FB_HEIGHT - MARGIN_BOTTOM - info_hint_h;
-                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                      0, info_hint_y, FB_WIDTH, info_hint_h, THEME_BG_PRIMARY);
-
-                        int info_icon_w = 16, info_icon_h = 16;
-                        if (fkey_icon_available(3)) fkey_icon_get_size(3, &info_icon_w, &info_icon_h);
-                        int info_gap = 20;
-                        int info_total = (info_icon_w + 4 + FONT_WIDTH * 4 + info_gap) * 2 +
-                                         FONT_WIDTH * 6 + info_gap + FONT_WIDTH * 8;
-                        int info_hx = (FB_WIDTH - info_total) / 2;
-                        int info_icon_y = info_hint_y + (info_hint_h - info_icon_h) / 2;
-                        int info_text_y = info_hint_y + (info_hint_h - FONT_HEIGHT) / 2 + 1;
-
-                        // F3 View
-                        if (fkey_icon_available(3)) {
-                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_icon_y, 3, 1);
-                            info_hx += info_icon_w + 4;
-                        } else {
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "F3");
-                            info_hx += FONT_WIDTH * 2 + 4;
-                        }
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "View");
-                        info_hx += FONT_WIDTH * 4 + info_gap;
-
-                        // F6 Exit
-                        if (fkey_icon_available(6)) {
-                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_icon_y, 6, 1);
-                            info_hx += info_icon_w + 4;
-                        } else {
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "F6");
-                            info_hx += FONT_WIDTH * 2 + 4;
-                        }
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "Exit");
-                        info_hx += FONT_WIDTH * 4 + info_gap;
-
-                        // arrows Vol
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
-                        info_hx += FONT_WIDTH * 6 + info_gap;
-
-                        // space Pause
-                        const char *info_pause = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, info_pause);
+                        const ui_hint_item_t hints[] = {
+                            {3, "View"},
+                            {1, "Backlight"},
+                            {6, "Exit"},
+                            {0, "\x80\x81 Vol"},
+                            {0, mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause"},
+                        };
+                        ui_draw_hint_bar(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                         info_hint_y, info_hint_h,
+                                         THEME_BG_PRIMARY, THEME_TEXT_MUTED,
+                                         hints, (int)(sizeof(hints) / sizeof(hints[0])),
+                                         20);
                     }
                     else if (state->current_view == APP_VIEW_VGM) {
                         // VGM playback view
@@ -1692,7 +1672,7 @@ void app_main(void) {
                         float header_vol = 0.0f;
                         if (audio_get_volume(&header_vol) == ESP_OK) {
                             char vol_text[16];
-                            int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
+                            int vol_percent = (int)(header_vol * 100.0f + 0.5f);
                             if (vol_percent < 0) vol_percent = 0;
                             if (vol_percent > 100) vol_percent = 100;
                             snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
@@ -1761,25 +1741,83 @@ void app_main(void) {
                                       progress_bar_x, progress_bar_y, progress_bar_w, progress_bar_h,
                                       THEME_VU_BG);
 
-                        // Progress fill
-                        double progress = 0.0;
-                        if (vgm_info.total_time_sec > 0) {
-                            progress = vgm_info.current_time_sec / vgm_info.total_time_sec;
-                            if (progress > 1.0) progress = 1.0;
+                        // Loop-aware segmented bar
+                        double loop_start = vgm_info.loop_time_sec;
+                        double song_total = vgm_info.total_time_sec;
+                        double loop_len = (vgm_info.has_loop && song_total > loop_start) ? (song_total - loop_start) : 0.0;
+                        uint32_t loops_total = vgm_info.loop_count;
+                        uint32_t loops_draw = loops_total ? loops_total : 3;
+                        double total_play = song_total;
+                        double display_total = song_total;
+                        if (vgm_info.has_loop && loop_len > 0.0) {
+                            if (loops_total > 0) {
+                                total_play = loop_start + loop_len * loops_total;
+                                display_total = total_play;
+                            } else {
+                                display_total = loop_start + loop_len * loops_draw;
+                            }
                         }
-                        int fill_w = (int)(progress_bar_w * progress);
-                        if (fill_w > 0) {
-                            ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                          progress_bar_x, progress_bar_y, fill_w, progress_bar_h,
-                                          THEME_VU_MID);
+                        if (display_total > 0.0) {
+                            int intro_w = (int)((loop_start / display_total) * progress_bar_w);
+                            if (intro_w > 0) {
+                                ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                              progress_bar_x, progress_bar_y, intro_w, progress_bar_h,
+                                              THEME_VU_MID);
+                            }
+                            if (vgm_info.has_loop && loop_len > 0.0) {
+                                int loop_w = (int)((loop_len / display_total) * progress_bar_w);
+                                for (uint32_t i = 0; i < loops_draw; i++) {
+                                    int seg_x = progress_bar_x + intro_w + (int)(i * loop_w);
+                                    if (seg_x >= progress_bar_x + progress_bar_w) break;
+                                    int seg_w = loop_w;
+                                    if (seg_x + seg_w > progress_bar_x + progress_bar_w) {
+                                        seg_w = progress_bar_x + progress_bar_w - seg_x;
+                                    }
+                                    if (seg_w > 0) {
+                                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                      seg_x, progress_bar_y, seg_w, progress_bar_h,
+                                                      THEME_VU_LOW);
+                                    }
+                                }
+                            }
+
+                            // Progress marker
+                            double cur_time = vgm_info.current_time_sec;
+                            if (vgm_info.has_loop && loop_len > 0.0) {
+                                if (loops_total > 0 && cur_time > total_play) {
+                                    cur_time = total_play;
+                                } else if (loops_total == 0 && cur_time > loop_start) {
+                                    double loop_pos = fmod(cur_time - loop_start, loop_len);
+                                    cur_time = loop_start + loop_pos;
+                                }
+                            }
+                            int marker_x = progress_bar_x + (int)((cur_time / display_total) * progress_bar_w);
+                            if (marker_x < progress_bar_x) marker_x = progress_bar_x;
+                            if (marker_x >= progress_bar_x + progress_bar_w) marker_x = progress_bar_x + progress_bar_w - 1;
+                            ui_draw_vline(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                          marker_x, progress_bar_y, progress_bar_h, THEME_BG_PRIMARY);
                         }
 
-                        // Time display
+                        // Time display (loop-aware)
                         int cur_min = (int)(vgm_info.current_time_sec / 60);
                         int cur_sec = (int)(vgm_info.current_time_sec) % 60;
-                        int tot_min = (int)(vgm_info.total_time_sec / 60);
-                        int tot_sec = (int)(vgm_info.total_time_sec) % 60;
-                        snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / %d:%02d", cur_min, cur_sec, tot_min, tot_sec);
+                        if (vgm_info.has_loop && loop_len > 0.0) {
+                            int loop_min = (int)(loop_start / 60);
+                            int loop_sec = (int)(loop_start) % 60;
+                            if (loops_total > 0) {
+                                int tot_min = (int)(total_play / 60);
+                                int tot_sec = (int)(total_play) % 60;
+                                snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / %d:%02d (L %d:%02d x%" PRIu32 ")",
+                                         cur_min, cur_sec, tot_min, tot_sec, loop_min, loop_sec, loops_total);
+                            } else {
+                                snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / inf (L %d:%02d xinf)",
+                                         cur_min, cur_sec, loop_min, loop_sec);
+                            }
+                        } else {
+                            int tot_min = (int)(song_total / 60);
+                            int tot_sec = (int)(song_total) % 60;
+                            snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / %d:%02d", cur_min, cur_sec, tot_min, tot_sec);
+                        }
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                                 progress_bar_x + progress_bar_w + 8, progress_bar_y,
                                                 THEME_TEXT_SECONDARY, 1, vgm_line);
@@ -1861,40 +1899,20 @@ void app_main(void) {
                             vgm_y += line_spacing;
                         }
 
-                        // Footer hint bar
                         const int vgm_hint_h = 20;
                         int vgm_hint_y = FB_HEIGHT - MARGIN_BOTTOM - vgm_hint_h;
-                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                      0, vgm_hint_y, FB_WIDTH, vgm_hint_h, THEME_BG_PRIMARY);
-
-                        int vgm_icon_w = 16, vgm_icon_h = 16;
-                        if (fkey_icon_available(6)) fkey_icon_get_size(6, &vgm_icon_w, &vgm_icon_h);
-                        int vgm_gap = 20;
-                        int vgm_total = (vgm_icon_w + 4 + FONT_WIDTH * 4 + vgm_gap) +  // F6 Exit
-                                        (FONT_WIDTH * 6 + vgm_gap) +                   // arrows Vol
-                                        (FONT_WIDTH * 8);                              // space Pause
-                        int vgm_hx = (FB_WIDTH - vgm_total) / 2;
-                        int vgm_icon_y_pos = vgm_hint_y + (vgm_hint_h - vgm_icon_h) / 2;
-                        int vgm_text_y = vgm_hint_y + (vgm_hint_h - FONT_HEIGHT) / 2 + 1;
-
-                        // F6 Exit
-                        if (fkey_icon_available(6)) {
-                            fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_icon_y_pos, 6, 1);
-                            vgm_hx += vgm_icon_w + 4;
-                        } else {
-                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "F6");
-                            vgm_hx += FONT_WIDTH * 2 + 4;
-                        }
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "Exit");
-                        vgm_hx += FONT_WIDTH * 4 + vgm_gap;
-
-                        // arrows Vol
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
-                        vgm_hx += FONT_WIDTH * 6 + vgm_gap;
-
-                        // space Pause
-                        const char *vgm_pause = vgm_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, vgm_pause);
+                        const ui_hint_item_t hints[] = {
+                            {6, "Exit"},
+                            {1, "Backlight"},
+                            {0, "\x80\x81 Vol"},
+                            {0, "\x83 +10s"},
+                            {0, vgm_player_is_paused() ? "\x85 Resume" : "\x85 Pause"},
+                        };
+                        ui_draw_hint_bar(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                         vgm_hint_y, vgm_hint_h,
+                                         THEME_BG_PRIMARY, THEME_TEXT_MUTED,
+                                         hints, (int)(sizeof(hints) / sizeof(hints[0])),
+                                         20);
                     }
 
                     PROFILING_END(render, render);
@@ -1937,7 +1955,7 @@ void app_main(void) {
                 float header_vol = 0.0f;
                 if (audio_get_volume(&header_vol) == ESP_OK) {
                     char vol_text[16];
-                    int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
+                    int vol_percent = (int)(header_vol * 100.0f + 0.5f);
                     if (vol_percent < 0) vol_percent = 0;
                     if (vol_percent > 100) vol_percent = 100;
                     snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
@@ -2011,24 +2029,83 @@ void app_main(void) {
                               progress_bar_x, progress_bar_y, progress_bar_w, progress_bar_h,
                               THEME_VU_BG);
 
-                double progress = 0.0;
-                if (vgm_info.total_time_sec > 0) {
-                    progress = vgm_info.current_time_sec / vgm_info.total_time_sec;
-                    if (progress > 1.0) progress = 1.0;
+                // Loop-aware segmented bar
+                double loop_start = vgm_info.loop_time_sec;
+                double song_total = vgm_info.total_time_sec;
+                double loop_len = (vgm_info.has_loop && song_total > loop_start) ? (song_total - loop_start) : 0.0;
+                uint32_t loops_total = vgm_info.loop_count;
+                uint32_t loops_draw = loops_total ? loops_total : 3;
+                double total_play = song_total;
+                double display_total = song_total;
+                if (vgm_info.has_loop && loop_len > 0.0) {
+                    if (loops_total > 0) {
+                        total_play = loop_start + loop_len * loops_total;
+                        display_total = total_play;
+                    } else {
+                        display_total = loop_start + loop_len * loops_draw;
+                    }
                 }
-                int fill_w = (int)(progress_bar_w * progress);
-                if (fill_w > 0) {
-                    ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                  progress_bar_x, progress_bar_y, fill_w, progress_bar_h,
-                                  THEME_VU_MID);
+                if (display_total > 0.0) {
+                    int intro_w = (int)((loop_start / display_total) * progress_bar_w);
+                    if (intro_w > 0) {
+                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                      progress_bar_x, progress_bar_y, intro_w, progress_bar_h,
+                                      THEME_VU_MID);
+                    }
+                    if (vgm_info.has_loop && loop_len > 0.0) {
+                        int loop_w = (int)((loop_len / display_total) * progress_bar_w);
+                        for (uint32_t i = 0; i < loops_draw; i++) {
+                            int seg_x = progress_bar_x + intro_w + (int)(i * loop_w);
+                            if (seg_x >= progress_bar_x + progress_bar_w) break;
+                            int seg_w = loop_w;
+                            if (seg_x + seg_w > progress_bar_x + progress_bar_w) {
+                                seg_w = progress_bar_x + progress_bar_w - seg_x;
+                            }
+                            if (seg_w > 0) {
+                                ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                              seg_x, progress_bar_y, seg_w, progress_bar_h,
+                                              THEME_VU_LOW);
+                            }
+                        }
+                    }
+
+                    // Progress marker
+                    double cur_time = vgm_info.current_time_sec;
+                    if (vgm_info.has_loop && loop_len > 0.0) {
+                        if (loops_total > 0 && cur_time > total_play) {
+                            cur_time = total_play;
+                        } else if (loops_total == 0 && cur_time > loop_start) {
+                            double loop_pos = fmod(cur_time - loop_start, loop_len);
+                            cur_time = loop_start + loop_pos;
+                        }
+                    }
+                    int marker_x = progress_bar_x + (int)((cur_time / display_total) * progress_bar_w);
+                    if (marker_x < progress_bar_x) marker_x = progress_bar_x;
+                    if (marker_x >= progress_bar_x + progress_bar_w) marker_x = progress_bar_x + progress_bar_w - 1;
+                    ui_draw_vline(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                  marker_x, progress_bar_y, progress_bar_h, THEME_BG_PRIMARY);
                 }
 
-                // Time display
+                // Time display (loop-aware)
                 int cur_min = (int)(vgm_info.current_time_sec / 60);
                 int cur_sec = (int)(vgm_info.current_time_sec) % 60;
-                int tot_min = (int)(vgm_info.total_time_sec / 60);
-                int tot_sec = (int)(vgm_info.total_time_sec) % 60;
-                snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / %d:%02d", cur_min, cur_sec, tot_min, tot_sec);
+                if (vgm_info.has_loop && loop_len > 0.0) {
+                    int loop_min = (int)(loop_start / 60);
+                    int loop_sec = (int)(loop_start) % 60;
+                    if (loops_total > 0) {
+                        int tot_min = (int)(total_play / 60);
+                        int tot_sec = (int)(total_play) % 60;
+                        snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / %d:%02d (L %d:%02d x%" PRIu32 ")",
+                                 cur_min, cur_sec, tot_min, tot_sec, loop_min, loop_sec, loops_total);
+                    } else {
+                        snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / inf (L %d:%02d xinf)",
+                                 cur_min, cur_sec, loop_min, loop_sec);
+                    }
+                } else {
+                    int tot_min = (int)(song_total / 60);
+                    int tot_sec = (int)(song_total) % 60;
+                    snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / %d:%02d", cur_min, cur_sec, tot_min, tot_sec);
+                }
                 font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                         progress_bar_x + progress_bar_w + 8, progress_bar_y,
                                         THEME_TEXT_SECONDARY, 1, vgm_line);
@@ -2093,37 +2170,20 @@ void app_main(void) {
                     vgm_y += line_spacing;
                 }
 
-                // Footer hint bar
                 const int vgm_hint_h = 20;
                 int vgm_hint_y = FB_HEIGHT - MARGIN_BOTTOM - vgm_hint_h;
-                ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                              0, vgm_hint_y, FB_WIDTH, vgm_hint_h, THEME_BG_PRIMARY);
-
-                int vgm_icon_w = 16, vgm_icon_h = 16;
-                if (fkey_icon_available(6)) fkey_icon_get_size(6, &vgm_icon_w, &vgm_icon_h);
-                int vgm_gap = 20;
-                int vgm_total = (vgm_icon_w + 4 + FONT_WIDTH * 4 + vgm_gap) +  // F6 Exit
-                                (FONT_WIDTH * 6 + vgm_gap) +                   // arrows Vol
-                                (FONT_WIDTH * 8);                              // space Pause
-                int vgm_hx = (FB_WIDTH - vgm_total) / 2;
-                int vgm_icon_y_pos = vgm_hint_y + (vgm_hint_h - vgm_icon_h) / 2;
-                int vgm_text_y = vgm_hint_y + (vgm_hint_h - FONT_HEIGHT) / 2 + 1;
-
-                if (fkey_icon_available(6)) {
-                    fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_icon_y_pos, 6, 1);
-                    vgm_hx += vgm_icon_w + 4;
-                } else {
-                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "F6");
-                    vgm_hx += FONT_WIDTH * 2 + 4;
-                }
-                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "Exit");
-                vgm_hx += FONT_WIDTH * 4 + vgm_gap;
-
-                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
-                vgm_hx += FONT_WIDTH * 6 + vgm_gap;
-
-                const char *vgm_pause = vgm_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
-                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, vgm_pause);
+                const ui_hint_item_t hints[] = {
+                    {6, "Exit"},
+                    {1, "Backlight"},
+                    {0, "\x80\x81 Vol"},
+                    {0, "\x83 +10s"},
+                    {0, vgm_player_is_paused() ? "\x85 Resume" : "\x85 Pause"},
+                };
+                ui_draw_hint_bar(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                 vgm_hint_y, vgm_hint_h,
+                                 THEME_BG_PRIMARY, THEME_TEXT_MUTED,
+                                 hints, (int)(sizeof(hints) / sizeof(hints[0])),
+                                 20);
 
                 PROFILING_END(render, render);
                 did_render = true;

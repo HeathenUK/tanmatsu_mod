@@ -56,6 +56,7 @@ app_state_t *app_state_init(void) {
     g_app_state.tracker.last_row = -1;
     g_app_state.tracker.mod_info_loaded = false;
     g_app_state.tracker.current_tick_valid = false;
+    g_app_state.volume_osd_ticks = 0;
 
     // Internal flash
     g_app_state.int_flash_wl_handle = WL_INVALID_HANDLE;
@@ -82,6 +83,7 @@ void app_state_cleanup(void) {
         spectrum_free(g_app_state.spectrum);
         g_app_state.spectrum = NULL;
     }
+    file_browser_free(&g_app_state.browser);
 
     g_app_state_initialized = false;
 }

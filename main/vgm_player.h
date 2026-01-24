@@ -71,6 +71,14 @@ esp_err_t vgm_player_pause(void);
 esp_err_t vgm_player_resume(void);
 
 /**
+ * @brief Skip ahead by N seconds during playback (rendering without output)
+ *
+ * @param seconds Seconds to skip forward
+ * @return ESP_OK on success
+ */
+esp_err_t vgm_player_skip_seconds(uint32_t seconds);
+
+/**
  * @brief Check if VGM is currently playing
  *
  * @return true if playing, false otherwise
@@ -90,6 +98,13 @@ bool vgm_player_is_paused(void);
  * @return true if loaded, false otherwise
  */
 bool vgm_player_is_loaded(void);
+
+/**
+ * @brief Get last VGM player error message (if any)
+ *
+ * @return Pointer to error string, or NULL if none
+ */
+const char *vgm_player_get_last_error(void);
 
 /**
  * @brief Get VGM player task handle

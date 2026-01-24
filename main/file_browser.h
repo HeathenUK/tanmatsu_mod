@@ -3,19 +3,37 @@
 #include "esp_err.h"
 #include <stdbool.h>
 
-#define MAX_FILENAME_LEN 64   // Match FATFS_MAX_LFN to save space
-#define MAX_FILES 32          // Reduced from 64 to save space
+#define MAX_FILENAME_LEN 96   // Display/filename buffer
+#define MAX_PATH_LEN 256      // Full path buffer
 
 typedef struct {
     char filename[MAX_FILENAME_LEN];
+    char full_path[MAX_PATH_LEN];
+    char meta_title[MAX_FILENAME_LEN];
+    char meta_game[MAX_FILENAME_LEN];
     bool is_dir;
 } file_entry_t;
 
 typedef struct {
-    file_entry_t files[MAX_FILES];
+    file_entry_t *files;
     int count;
+    int capacity;
     int selected_index;
-    char current_path[MAX_FILENAME_LEN];
+    char current_path[MAX_PATH_LEN];
+    file_entry_t *all_files;
+    int all_count;
+    int all_capacity;
+    file_entry_t *search_cache;
+    int search_cache_count;
+    int search_cache_capacity;
+    bool search_cache_ready;
+    bool search_cache_building;
+    char search_cache_root[MAX_PATH_LEN];
+    void *search_cache_mutex;
+    bool search_active;
+    char search_query[32];
+    char last_selected_name[MAX_FILENAME_LEN];
+    int sort_mode;
 } file_browser_t;
 
 /**
@@ -34,6 +52,19 @@ esp_err_t file_browser_init(file_browser_t *browser, const char *base_path);
  * @return esp_err_t ESP_OK on success
  */
 esp_err_t file_browser_refresh(file_browser_t *browser);
+esp_err_t file_browser_apply_filter(file_browser_t *browser);
+void file_browser_set_search_mode(file_browser_t *browser, bool active);
+void file_browser_clear_search(file_browser_t *browser);
+void file_browser_append_search_char(file_browser_t *browser, char ch);
+void file_browser_backspace_search(file_browser_t *browser);
+bool file_browser_jump_to_letter(file_browser_t *browser, char ch);
+void file_browser_free(file_browser_t *browser);
+void file_browser_page_move(file_browser_t *browser, int direction, int page_size);
+void file_browser_remember_selection(file_browser_t *browser);
+void file_browser_restore_selection(file_browser_t *browser);
+void file_browser_cycle_sort(file_browser_t *browser);
+void file_browser_build_search_cache_async(file_browser_t *browser, const char *root_path);
+void file_browser_fill_cached_meta(file_browser_t *browser, file_entry_t *entry);
 
 /**
  * @brief Move selection up

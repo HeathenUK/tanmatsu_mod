@@ -27,6 +27,7 @@ idf_component_register(
 		"graphics/hw_accel.c"
 		"ui/ui_file_browser.c"
 		"ui/ui_input_handler.c"
+		"ui/ui_hints.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs

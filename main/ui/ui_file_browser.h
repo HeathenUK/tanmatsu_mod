@@ -28,6 +28,7 @@ extern "C" {
  * @param browser Pointer to file browser state
  */
 void ui_draw_file_browser(uint16_t *fb, int fb_width, int fb_height, file_browser_t *browser);
+void ui_draw_browser_volume_osd(uint16_t *fb, int fb_width, int fb_height, float volume);
 
 /**
  * @brief Format a channel's event data as a string

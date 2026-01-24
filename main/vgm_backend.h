@@ -54,6 +54,7 @@ typedef struct {
     double total_time_sec;       // Total time in seconds
     double current_time_sec;     // Current time in seconds
     double loop_time_sec;        // Loop point time in seconds (0 if no loop)
+    uint32_t loop_count;         // Total number of plays (0 = infinite)
     uint32_t sample_rate;        // Output sample rate
     uint8_t num_chips;           // Number of sound chips used
     bool has_loop;               // Whether file has loop point

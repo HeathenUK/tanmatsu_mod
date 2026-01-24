@@ -32,7 +32,9 @@ typedef enum {
     INPUT_ACTION_SET_VIEW_MODE,      // Set view mode (tracker/spectrum/info)
     INPUT_ACTION_SET_CHANNEL_PAGE,   // Set channel pagination
     INPUT_ACTION_PAUSE_RESUME,       // Pause/resume playback
-    INPUT_ACTION_TOGGLE_CHANNEL_MUTE // Toggle channel mute
+    INPUT_ACTION_TOGGLE_CHANNEL_MUTE, // Toggle channel mute
+    INPUT_ACTION_VGM_SKIP,            // Skip ahead in VGM playback
+    INPUT_ACTION_TOGGLE_BACKLIGHT     // Toggle display/keyboard backlight
 } input_action_type_t;
 
 /**
@@ -56,6 +58,9 @@ typedef struct {
         struct {
             int channel;     // Channel number to toggle mute
         } toggle_mute;
+        struct {
+            uint32_t seconds; // Seconds to skip ahead
+        } vgm_skip;
     } data;
 } input_action_result_t;
 

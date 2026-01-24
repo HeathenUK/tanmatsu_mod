@@ -7,6 +7,7 @@
 #include "ui_theme.h"
 #include "ui_primitives.h"
 #include "ui_icons.h"
+#include "ui_hints.h"
 #include "simple_font.h"
 #include "graphics/hw_accel.h"
 #include <string.h>
@@ -68,6 +69,7 @@ void ui_format_channel_string(char *ch_str, size_t ch_str_size,
 
 void ui_draw_file_browser(uint16_t *fb, int fb_width, int fb_height, file_browser_t *browser) {
     const int font_scale = 2;
+    const int entry_scale = 1;
     const int row_height = THEME_ROW_HEIGHT_MD;  // 32px per row
     const int header_height = THEME_HEADER_HEIGHT;  // 40px header
     const int icon_size = UI_ICON_WIDTH;
@@ -101,8 +103,26 @@ void ui_draw_file_browser(uint16_t *fb, int fb_width, int fb_height, file_browse
                             MARGIN_LEFT, path_y,
                             THEME_TEXT_SECONDARY, 1, path_text);
 
+    // Item count (right-aligned)
+    char count_text[24];
+    snprintf(count_text, sizeof(count_text), "%d items", browser->count);
+    int count_w = strlen(count_text) * FONT_WIDTH;
+    int count_x = fb_width - MARGIN_RIGHT - count_w;
+    font_draw_string_scaled(fb, fb_width, fb_height,
+                            count_x, path_y,
+                            THEME_TEXT_MUTED, 1, count_text);
+
     // File list area
     int file_list_y = path_y + FONT_HEIGHT + 8;
+    if (browser->search_active) {
+        const int search_scale = 2;
+        char search_text[80];
+        snprintf(search_text, sizeof(search_text), "Search: %.30s", browser->search_query);
+        font_draw_string_scaled(fb, fb_width, fb_height,
+                                MARGIN_LEFT, file_list_y,
+                                THEME_TEXT_MUTED, search_scale, search_text);
+        file_list_y += FONT_HEIGHT * search_scale + 6;
+    }
     int visible_rows = (fb_height - file_list_y - MARGIN_BOTTOM - row_height) / row_height;
     if (visible_rows > 12) visible_rows = 12;
 
@@ -159,42 +179,129 @@ void ui_draw_file_browser(uint16_t *fb, int fb_width, int fb_height, file_browse
                          icon_color);
         }
 
-        // Draw filename
-        char name[64];
-        strncpy(name, browser->files[i].filename, sizeof(name) - 1);
-        name[sizeof(name) - 1] = '\0';
+        // Draw filename + metadata
+        file_entry_t *entry = &browser->files[i];
+        file_browser_fill_cached_meta(browser, entry);
 
-        int text_y = row_y + (row_height - FONT_HEIGHT * font_scale) / 2;
-        uint16_t text_color = (i == browser->selected_index) ? THEME_TEXT_PRIMARY : THEME_TEXT_SECONDARY;
+        int list_right = fb_width - MARGIN_RIGHT - 8;
+        int max_chars = (list_right - text_offset_x) / (FONT_WIDTH * entry_scale);
+        char name[128];
+        char meta[128];
+        name[0] = '\0';
+        meta[0] = '\0';
+
+        strncat(name, entry->filename, sizeof(name) - 1);
+        if (entry->meta_title[0] != '\0') {
+            strncat(meta, entry->meta_title, sizeof(meta) - 1);
+            if (entry->meta_game[0] != '\0') {
+                strncat(meta, " - ", sizeof(meta) - strlen(meta) - 1);
+                strncat(meta, entry->meta_game, sizeof(meta) - strlen(meta) - 1);
+            }
+        }
+
+        if (max_chars > 0 && (int)strlen(meta) > max_chars) {
+            if (max_chars > 3) {
+                meta[max_chars - 3] = '.';
+                meta[max_chars - 2] = '.';
+                meta[max_chars - 1] = '.';
+                meta[max_chars] = '\0';
+            } else {
+                meta[max_chars] = '\0';
+            }
+        }
+
+        int meta_w = (int)strlen(meta) * FONT_WIDTH * entry_scale;
+        const int gap_px = 8;
+        int name_max_px = list_right - text_offset_x - (meta_w ? (meta_w + gap_px) : 0);
+        int name_max_chars = name_max_px / (FONT_WIDTH * entry_scale);
+        if (name_max_chars < 0) name_max_chars = 0;
+        if (name_max_chars > 0 && (int)strlen(name) > name_max_chars) {
+            if (name_max_chars > 3) {
+                name[name_max_chars - 3] = '.';
+                name[name_max_chars - 2] = '.';
+                name[name_max_chars - 1] = '.';
+                name[name_max_chars] = '\0';
+            } else {
+                name[name_max_chars] = '\0';
+            }
+        }
+
+        int text_y = row_y + (row_height - FONT_HEIGHT * entry_scale) / 2;
+        uint16_t name_color = (i == browser->selected_index) ? THEME_TEXT_SECONDARY : THEME_TEXT_MUTED;
+        uint16_t meta_color = (i == browser->selected_index) ? THEME_TEXT_PRIMARY : THEME_TEXT_SECONDARY;
         font_draw_string_scaled(fb, fb_width, fb_height,
-                                text_offset_x, text_y, text_color, font_scale, name);
+                                text_offset_x, text_y, name_color, entry_scale, name);
+        if (meta[0] != '\0') {
+            int meta_x = list_right - meta_w;
+            if (meta_x < text_offset_x + gap_px) {
+                meta_x = text_offset_x + gap_px;
+            }
+            font_draw_string_scaled(fb, fb_width, fb_height,
+                                    meta_x, text_y, meta_color, entry_scale, meta);
+        }
     }
 
-    // Footer hint bar (same style as playback views)
-    int hint_bar_height = 20;
+    // Scroll indicator
+    if (browser->count > 0) {
+        int track_x = fb_width - MARGIN_RIGHT + 2;
+        int track_w = 4;
+        int track_y = file_list_y;
+        int track_h = end_idx > start_idx ? (end_idx - start_idx) * row_height : row_height;
+        hw_accel_fill_rect(fb, fb_width, fb_height,
+                           track_x, track_y, track_w, track_h, THEME_BG_SECONDARY);
+        int thumb_h = (browser->count > 0) ? (track_h * (end_idx - start_idx) / browser->count) : track_h;
+        if (thumb_h < 6) thumb_h = 6;
+        int max_pos = (browser->count > 1) ? (browser->count - 1) : 1;
+        int thumb_y = track_y + (track_h - thumb_h) * browser->selected_index / max_pos;
+        hw_accel_fill_rect(fb, fb_width, fb_height,
+                           track_x, thumb_y, track_w, thumb_h, THEME_TEXT_MUTED);
+    }
+
+    // Footer hint bar
+    const int hint_bar_height = 20;
     int hint_bar_y = fb_height - MARGIN_BOTTOM - hint_bar_height;
+    const char *sort_label = (browser->sort_mode == 0) ? "Sort: A→Z" : "Sort: Z→A";
+    const char *back_label = "Parent directory";
+    if (browser->search_active) {
+        back_label = "Exit results";
+    } else if (strcmp(browser->current_path, "/sdcard") == 0) {
+        back_label = "Exit to Launcher";
+    }
+    const ui_hint_item_t hints[] = {
+        {5, "Search"},
+        {2, sort_label},
+        {6, back_label},
+    };
+    ui_draw_hint_bar(fb, fb_width, fb_height, hint_bar_y, hint_bar_height,
+                     THEME_BG_PRIMARY, THEME_TEXT_MUTED, hints,
+                     (int)(sizeof(hints) / sizeof(hints[0])), 20);
+
+    if (browser->search_cache_building) {
+        const char *indexing_text = "Indexing...";
+        int text_w = (int)strlen(indexing_text) * FONT_WIDTH;
+        int text_x = fb_width - MARGIN_RIGHT - text_w;
+        int text_y = hint_bar_y + (hint_bar_height - FONT_HEIGHT) / 2;
+        font_draw_string_scaled(fb, fb_width, fb_height,
+                                text_x, text_y, THEME_TEXT_MUTED, 1, indexing_text);
+    }
+
+}
+
+void ui_draw_browser_volume_osd(uint16_t *fb, int fb_width, int fb_height, float volume) {
+    int vol_percent = (int)(volume * 100.0f + 0.5f);
+    if (vol_percent < 0) vol_percent = 0;
+    if (vol_percent > 100) vol_percent = 100;
+
+    char vol_text[24];
+    snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
+    int text_w = (int)strlen(vol_text) * FONT_WIDTH * 2;
+    int box_w = text_w + 16;
+    int box_h = FONT_HEIGHT * 2 + 10;
+    int box_x = fb_width - MARGIN_RIGHT - box_w;
+    int box_y = MARGIN_TOP + 6;
+
     hw_accel_fill_rect(fb, fb_width, fb_height,
-                      0, hint_bar_y, fb_width, hint_bar_height, THEME_BG_SECONDARY);
-
-    // Calculate total width for centering
-    // ↑↓ Nav | ⏎ Select | ← Back
-    int gap = 20;
-    int total_width = 0;
-    total_width += FONT_WIDTH * 6 + gap;   // "↑↓ Nav" (6 chars)
-    total_width += FONT_WIDTH * 8 + gap;   // "⏎ Select" (8 chars)
-    total_width += FONT_WIDTH * 6;          // "← Back" (6 chars)
-
-    int hint_x = (fb_width - total_width) / 2;
-    int text_y = hint_bar_y + (hint_bar_height - FONT_HEIGHT) / 2 + 1;
-
-    // ↑↓ Nav (chars 0x80, 0x81)
-    font_draw_string_scaled(fb, fb_width, fb_height, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Nav");
-    hint_x += FONT_WIDTH * 6 + gap;
-
-    // ⏎ Select (char 0x84)
-    font_draw_string_scaled(fb, fb_width, fb_height, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x84 Select");
-    hint_x += FONT_WIDTH * 8 + gap;
-
-    // ← Back (char 0x82)
-    font_draw_string_scaled(fb, fb_width, fb_height, hint_x, text_y, THEME_TEXT_MUTED, 1, "\x82 Back");
+                       box_x, box_y, box_w, box_h, THEME_BG_SECONDARY);
+    font_draw_string_scaled(fb, fb_width, fb_height,
+                            box_x + 8, box_y + 5, THEME_TEXT_PRIMARY, 2, vol_text);
 }

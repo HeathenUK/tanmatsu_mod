@@ -32,6 +32,25 @@ static uint8_t current_volume = 100;  // 0-100%
 static audio_output_owner_t audio_owner = AUDIO_OUTPUT_OWNER_NONE;
 static portMUX_TYPE audio_owner_lock = portMUX_INITIALIZER_UNLOCKED;
 
+// Volume mapping: UI/display 0-100% maps to codec range [MIN, 100]%
+// Map the old "25%" UI point back to the absolute codec level to avoid silence at low UI values.
+#define AUDIO_VOLUME_MIN_PERCENT 58.75f
+#define AUDIO_VOLUME_MAX_PERCENT 100.0f
+
+static float audio_volume_to_codec_percent(float display_volume) {
+    if (display_volume < 0.0f) display_volume = 0.0f;
+    if (display_volume > 1.0f) display_volume = 1.0f;
+    return AUDIO_VOLUME_MIN_PERCENT +
+           display_volume * (AUDIO_VOLUME_MAX_PERCENT - AUDIO_VOLUME_MIN_PERCENT);
+}
+
+static float audio_volume_from_codec_percent(float codec_percent) {
+    if (codec_percent < AUDIO_VOLUME_MIN_PERCENT) codec_percent = AUDIO_VOLUME_MIN_PERCENT;
+    if (codec_percent > AUDIO_VOLUME_MAX_PERCENT) codec_percent = AUDIO_VOLUME_MAX_PERCENT;
+    return (codec_percent - AUDIO_VOLUME_MIN_PERCENT) /
+           (AUDIO_VOLUME_MAX_PERCENT - AUDIO_VOLUME_MIN_PERCENT);
+}
+
 esp_err_t audio_init(void) {
     if (audio_initialized) {
         ESP_LOGW(TAG, "Audio already initialized");
@@ -73,28 +92,17 @@ esp_err_t audio_init(void) {
     bsp_audio_set_amplifier(true);
     amplifier_enabled = true;
 
-    // Get initial volume from BSP - BSP should handle persistence
-    float volume_percent = 70.0f;  // Default fallback if BSP doesn't support get_volume
-    esp_err_t get_vol_ret = bsp_audio_get_volume(&volume_percent);
-    if (get_vol_ret == ESP_OK) {
-        ESP_LOGI(TAG, "Got initial volume from BSP: %.1f%%", volume_percent);
-    } else if (get_vol_ret == ESP_ERR_NOT_SUPPORTED) {
-        // BSP doesn't support get_volume, use default 70%
-        ESP_LOGI(TAG, "BSP get_volume not supported, using default: 70%%");
-        volume_percent = 70.0f;
-    } else {
-        // Other error, still use default but log it
-        ESP_LOGW(TAG, "bsp_audio_get_volume returned: %s, using default: 70%%", esp_err_to_name(get_vol_ret));
-        volume_percent = 70.0f;
-    }
-    current_volume = (uint8_t)volume_percent;
+    // Set initial volume to 70% of the UI range (mapped to codec range)
+    float display_percent = 70.0f;
+    float codec_percent = audio_volume_to_codec_percent(display_percent / 100.0f);
+    current_volume = (uint8_t)display_percent;
 
     // Actually SET the volume on the codec (critical - codec may start at 0!)
-    esp_err_t set_vol_ret = bsp_audio_set_volume(volume_percent);
+    esp_err_t set_vol_ret = bsp_audio_set_volume(codec_percent);
     if (set_vol_ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set initial volume: %s", esp_err_to_name(set_vol_ret));
     } else {
-        ESP_LOGI(TAG, "Initial volume set to %.0f%%", volume_percent);
+        ESP_LOGI(TAG, "Initial volume set to %.0f%% (codec %.1f%%)", display_percent, codec_percent);
     }
 
     // Get ES8156 handle for diagnostics and optimization
@@ -276,17 +284,17 @@ esp_err_t audio_set_volume(float volume) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Convert 0.0-1.0 to 0-100% (BSP expects float)
-    float volume_percent = volume * 100.0f;
-    
-    esp_err_t ret = bsp_audio_set_volume(volume_percent);
+    float display_percent = volume * 100.0f;
+    float codec_percent = audio_volume_to_codec_percent(volume);
+
+    esp_err_t ret = bsp_audio_set_volume(codec_percent);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set volume: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    current_volume = (uint8_t)volume_percent;
-    ESP_LOGI(TAG, "Volume set to %.0f%%", volume_percent);
+    current_volume = (uint8_t)display_percent;
+    ESP_LOGI(TAG, "Volume set to %.0f%% (codec %.1f%%)", display_percent, codec_percent);
     return ESP_OK;
 }
 
@@ -303,9 +311,10 @@ esp_err_t audio_get_volume(float *volume) {
     float volume_percent = 0.0f;
     esp_err_t ret = bsp_audio_get_volume(&volume_percent);
     if (ret == ESP_OK) {
-        // BSP returned volume, convert from 0-100% to 0.0-1.0
-        *volume = volume_percent / 100.0f;
-        current_volume = (uint8_t)volume_percent;  // Update cached value for display
+        // BSP returned codec volume, convert to UI/display range
+        float display = audio_volume_from_codec_percent(volume_percent);
+        *volume = display;
+        current_volume = (uint8_t)(display * 100.0f + 0.5f);
         return ESP_OK;
     } else if (ret == ESP_ERR_NOT_SUPPORTED) {
         // BSP doesn't support get_volume, use cached value (no log spam)
@@ -321,6 +330,41 @@ esp_err_t audio_get_volume(float *volume) {
     }
     *volume = current_volume / 100.0f;
     return ESP_OK;
+}
+
+void audio_i2s_silence_and_disable(void *handle, int16_t *buffer, size_t bytes, int writes) {
+    if (!handle || !buffer || bytes == 0 || writes <= 0) {
+        return;
+    }
+    memset(buffer, 0, bytes);
+    for (int i = 0; i < writes; i++) {
+        size_t bytes_written = 0;
+        i2s_channel_write((i2s_chan_handle_t)handle, buffer, bytes, &bytes_written, 0);
+    }
+    i2s_channel_disable((i2s_chan_handle_t)handle);
+}
+
+void audio_i2s_preload_and_enable(void *handle, int16_t *buffer, size_t bytes) {
+    if (!handle || !buffer || bytes == 0) {
+        return;
+    }
+    i2s_channel_disable((i2s_chan_handle_t)handle);
+    memset(buffer, 0, bytes);
+    size_t bytes_loaded = 0;
+    i2s_channel_preload_data((i2s_chan_handle_t)handle, buffer, bytes, &bytes_loaded);
+    i2s_channel_enable((i2s_chan_handle_t)handle);
+}
+
+int16_t audio_soft_clip(int32_t sample) {
+    const int32_t limit = 30000;
+    if (sample > limit) {
+        sample = limit + (sample - limit) / 4;
+    } else if (sample < -limit) {
+        sample = -limit + (sample + limit) / 4;
+    }
+    if (sample > 32767) sample = 32767;
+    if (sample < -32768) sample = -32768;
+    return (int16_t)sample;
 }
 
 esp_err_t audio_get_i2s_handle(void **handle) {

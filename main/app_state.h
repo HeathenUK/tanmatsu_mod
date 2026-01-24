@@ -168,6 +168,9 @@ typedef struct {
     // MOD file state
     app_mod_file_state_t mod_file;
 
+    // Volume OSD
+    int volume_osd_ticks;
+
     // Internal flash wear levelling
     wl_handle_t int_flash_wl_handle;
 } app_state_t;

@@ -2,6 +2,8 @@
 
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
 
 /**
  * @brief Initialize audio system (I2S and ES8156 codec)
@@ -70,6 +72,10 @@ esp_err_t audio_get_volume(float *volume);
  * @return esp_err_t ESP_OK on success
  */
 esp_err_t audio_get_i2s_handle(void **handle);
+
+void audio_i2s_silence_and_disable(void *handle, int16_t *buffer, size_t bytes, int writes);
+void audio_i2s_preload_and_enable(void *handle, int16_t *buffer, size_t bytes);
+int16_t audio_soft_clip(int32_t sample);
 
 /**
  * @brief Diagnose ES8156 codec configuration (read and log current settings)

@@ -8,7 +8,9 @@
 #include "esp_heap_caps.h"
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <new>
+#include <stdint.h>
 
 // libvgm includes
 #include "playera.hpp"
@@ -16,6 +18,7 @@
 #include "DataLoader.h"
 #include "MemoryLoader.h"
 #include "SoundEmu.h"
+#include "SoundDevs.h"
 #include "EmuCores.h"
 
 // For VGZ decompression - use miniz from esp_rom
@@ -24,6 +27,18 @@ extern "C" {
 }
 
 static const char *TAG = "vgm_backend";
+
+static inline int16_t vgm_soft_clip(int32_t sample) {
+    const int32_t limit = 30000;
+    if (sample > limit) {
+        sample = limit + (sample - limit) / 4;
+    } else if (sample < -limit) {
+        sample = -limit + (sample + limit) / 4;
+    }
+    if (sample > 32767) sample = 32767;
+    if (sample < -32768) sample = -32768;
+    return (int16_t)sample;
+}
 
 static bool vgm_device_has_core(const DEV_DECL *decl) {
     return decl && decl->cores[0];
@@ -37,6 +52,9 @@ struct vgm_backend {
     uint8_t *vgmData;           // Decompressed VGM data
     size_t vgmDataSize;
     uint32_t sampleRate;
+    int32_t masterGainQ15;
+    int32_t chipGainQ15;
+    float chipGainDb;
     bool loaded;
     bool playing;
     uint32_t loopCount;
@@ -151,6 +169,68 @@ static uint8_t *decompress_vgz(const uint8_t *data, size_t size, size_t *out_siz
     return out;
 }
 
+static float vgm_device_atten_db(DEV_ID type) {
+    switch (type) {
+        case DEVID_SN76496: return -6.0f;
+        case DEVID_YM2413: return -1.0f;
+        case DEVID_YM2612: return -3.0f;
+        case DEVID_YM2151: return -3.0f;
+        case DEVID_SEGAPCM: return -3.0f;
+        case DEVID_RF5C68: return -3.0f;
+        case DEVID_YM2203: return -3.0f;
+        case DEVID_YM2608: return -3.0f;
+        case DEVID_YM2610: return -3.0f;
+        case DEVID_YM3812: return -4.0f;
+        case DEVID_YM3526: return -4.0f;
+        case DEVID_Y8950: return -4.0f;
+        case DEVID_YMF262: return -5.0f;
+        case DEVID_YMF278B: return -5.0f;
+        case DEVID_YMF271: return -4.0f;
+        case DEVID_YMZ280B: return -3.0f;
+        case DEVID_32X_PWM: return -6.0f;
+        case DEVID_AY8910: return 0.0f;
+        case DEVID_GB_DMG: return -4.0f;
+        case DEVID_NES_APU: return -4.0f;
+        case DEVID_YMW258: return -4.0f;
+        case DEVID_uPD7759: return -6.0f;
+        case DEVID_MSM6258: return -6.0f;
+        case DEVID_MSM6295: return -6.0f;
+        case DEVID_K051649: return -6.0f;
+        case DEVID_K054539: return -6.0f;
+        case DEVID_C6280: return -4.0f;
+        case DEVID_C140: return -4.0f;
+        case DEVID_C219: return -4.0f;
+        case DEVID_K053260: return -6.0f;
+        case DEVID_POKEY: return -6.0f;
+        case DEVID_QSOUND: return -6.0f;
+        case DEVID_SCSP: return -4.0f;
+        case DEVID_WSWAN: return -4.0f;
+        case DEVID_VBOY_VSU: return -4.0f;
+        case DEVID_SAA1099: return -6.0f;
+        case DEVID_ES5503: return -6.0f;
+        case DEVID_ES5506: return -6.0f;
+        case DEVID_X1_010: return -6.0f;
+        case DEVID_C352: return -6.0f;
+        case DEVID_GA20: return -6.0f;
+        case DEVID_MIKEY: return -6.0f;
+        case DEVID_K007232: return -6.0f;
+        case DEVID_K005289: return -6.0f;
+        case DEVID_MSM5205: return -6.0f;
+        case DEVID_MSM5232: return -6.0f;
+        case DEVID_BSMT2000: return -6.0f;
+        case DEVID_ICS2115: return -6.0f;
+        default: return 0.0f;
+    }
+}
+
+static int32_t vgm_db_to_q15(float db) {
+    float linear = powf(10.0f, db / 20.0f);
+    int32_t q15 = (int32_t)lroundf(linear * 32768.0f);
+    if (q15 < 0) q15 = 0;
+    if (q15 > 32768) q15 = 32768;
+    return q15;
+}
+
 extern "C" {
 
 vgm_backend_t *vgm_backend_create(void) {
@@ -200,6 +280,9 @@ vgm_backend_t *vgm_backend_create(void) {
     ctx->loopCount = 2;  // Play twice (1 loop)
     ctx->fadeSamples = 44100 * 3;  // 3 second fade
     ctx->sampleRate = VGM_PLAYBACK_SAMPLE_RATE;
+    ctx->masterGainQ15 = vgm_db_to_q15(-3.0f);
+    ctx->chipGainQ15 = 32768;
+    ctx->chipGainDb = 0.0f;
 
     ESP_LOGI(TAG, "VGM backend created");
     return ctx;
@@ -325,6 +408,26 @@ esp_err_t vgm_backend_load(vgm_backend_t *ctx, const uint8_t *data, size_t size)
         }
     }
 
+    {
+        std::vector<PLR_DEV_INFO> devInfoList;
+        float min_db = 0.0f;
+        if (ctx->vgmPlayer->GetSongDeviceInfo(devInfoList) == 0) {
+            for (const auto &devInfo : devInfoList) {
+                float db = vgm_device_atten_db(devInfo.type);
+                if (db < min_db) min_db = db;
+                for (const auto &linkDev : devInfo.devLink) {
+                    db = vgm_device_atten_db(linkDev.type);
+                    if (db < min_db) min_db = db;
+                }
+            }
+        }
+        ctx->chipGainDb = min_db;
+        ctx->chipGainQ15 = vgm_db_to_q15(min_db);
+        if (min_db < 0.0f) {
+            ESP_LOGI(TAG, "VGM chip attenuation: %.1f dB", (double)min_db);
+        }
+    }
+
     ctx->loaded = true;
 
     // Get file info
@@ -425,12 +528,11 @@ uint32_t vgm_backend_render(vgm_backend_t *ctx, int16_t *buffer, uint32_t num_sa
     // Convert from bytes to sample frames
     uint32_t sample_frames = rendered / 4;
 
-    // Attenuate output slightly (-6dB) to reduce clipping risk
+    int32_t gain_q15 = (int32_t)(((int64_t)ctx->masterGainQ15 * ctx->chipGainQ15 + 16384) >> 15);
     for (uint32_t i = 0; i < sample_frames * 2; i++) {
-        int32_t sample = ((int32_t)buffer[i]) >> 1;
-        if (sample > 32767) sample = 32767;
-        else if (sample < -32768) sample = -32768;
-        buffer[i] = (int16_t)sample;
+        int32_t sample = (int32_t)buffer[i];
+        sample = (int32_t)(((int64_t)sample * gain_q15 + 16384) >> 15);
+        buffer[i] = vgm_soft_clip(sample);
     }
 
     return sample_frames;
@@ -485,6 +587,7 @@ esp_err_t vgm_backend_get_info(vgm_backend_t *ctx, vgm_playback_info_t *info) {
     memset(info, 0, sizeof(vgm_playback_info_t));
     info->sample_rate = ctx->sampleRate;
     info->is_playing = ctx->playing;
+    info->loop_count = ctx->loopCount;
 
     if (!ctx->loaded) return ESP_OK;
 

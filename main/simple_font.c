@@ -218,6 +218,14 @@ static uint32_t font_next_codepoint(const char **text) {
         case 0x201C:  // “
         case 0x201D:  // ”
             return '"';
+        case 0x2190:  // ←
+            return 0x82;
+        case 0x2191:  // ↑
+            return 0x80;
+        case 0x2192:  // →
+            return 0x83;
+        case 0x2193:  // ↓
+            return 0x81;
         case 0x2026:  // …
             pending[0] = '.';
             pending[1] = '.';
