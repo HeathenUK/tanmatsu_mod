@@ -417,6 +417,14 @@ esp_err_t vgm_player_stop(void) {
     }
 
     if (i2s_handle && audio_output_is_owner(AUDIO_OUTPUT_OWNER_VGM)) {
+        // Flush DMA with silence before disabling to avoid repeating the last buffer
+        memset(vgm_dma_buffer, 0, VGM_DMA_CHUNK_SAMPLES * 2 * sizeof(int16_t));
+        for (int i = 0; i < 3; i++) {
+            size_t bytes_written = 0;
+            i2s_channel_write(i2s_handle, vgm_dma_buffer,
+                              VGM_DMA_CHUNK_SAMPLES * 2 * sizeof(int16_t),
+                              &bytes_written, 0);
+        }
         // Stop DMA to prevent looping the last buffer when playback stops
         i2s_channel_disable(i2s_handle);
     }

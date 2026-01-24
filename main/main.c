@@ -46,10 +46,8 @@
 #include "ui/ui_file_browser.h"
 #include "ui/ui_input_handler.h"
 
-// VGM player support (conditionally compiled via Kconfig)
-#ifdef CONFIG_VGM_ENABLE
+// VGM player support (always enabled)
 #include "vgm_player.h"
-#endif
 
 // Constants
 static char const TAG[] = "main";
@@ -224,7 +222,6 @@ void app_main(void) {
             ESP_LOGW(TAG, "MOD player initialization failed: %s", esp_err_to_name(res));
         }
 
-#ifdef CONFIG_VGM_ENABLE
         // Initialize VGM player
         res = vgm_player_init(VGM_PLAYBACK_SAMPLE_RATE);
         if (res == ESP_OK) {
@@ -232,7 +229,6 @@ void app_main(void) {
         } else {
             ESP_LOGW(TAG, "VGM player initialization failed: %s", esp_err_to_name(res));
         }
-#endif
     } else {
         ESP_LOGW(TAG, "Audio initialization failed: %s", esp_err_to_name(res));
         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, RGB565_BLACK);
@@ -359,10 +355,8 @@ void app_main(void) {
         // Set up input handler context
         bool is_playing = mod_player_is_playing();
         bool is_paused = mod_player_is_paused();
-#ifdef CONFIG_VGM_ENABLE
         is_playing = is_playing || vgm_player_is_playing();
         is_paused = is_paused || vgm_player_is_paused();
-#endif
         input_handler_context_t input_ctx = {
             .browser = &state->browser,
             .browser_active = &state->browser_active,
@@ -439,7 +433,6 @@ void app_main(void) {
                                                           RGB565_WHITE, 2, "Loading...");
                                     blit(-1, 0);
 
-#ifdef CONFIG_VGM_ENABLE
                                     if (is_vgm) {
                                         ESP_LOGI("main", "Loading VGM file...");
                                         // Stop MOD player if playing
@@ -471,15 +464,11 @@ void app_main(void) {
                                             blit(-1, 0);
                                         }
                                     } else
-#endif
                                     {
                                         // Stop VGM player if playing
-#ifdef CONFIG_VGM_ENABLE
                                         if (vgm_player_is_playing()) {
                                             vgm_player_stop();
                                         }
-#endif
-                                        (void)is_vgm;  // Suppress unused warning when VGM disabled
 
                                         // Load and start MOD file
                                         res = mod_player_load(state->mod_file.data, state->mod_file.size);
@@ -532,11 +521,9 @@ void app_main(void) {
                         if (mod_player_is_playing()) {
                             mod_player_stop();
                         }
-#ifdef CONFIG_VGM_ENABLE
                         if (vgm_player_is_playing()) {
                             vgm_player_stop();
                         }
-#endif
                         audio_stop();
                         audio_set_volume(0.0f);
                         vTaskDelay(pdMS_TO_TICKS(50));
@@ -545,9 +532,7 @@ void app_main(void) {
 
                     case INPUT_ACTION_RETURN_TO_BROWSER:
                         mod_player_stop();
-#ifdef CONFIG_VGM_ENABLE
                         vgm_player_stop();
-#endif
                         state->browser_active = true;
                         file_browser_refresh(&state->browser);
                         needs_render = true;
@@ -558,7 +543,6 @@ void app_main(void) {
                         break;
                         
                     case INPUT_ACTION_PAUSE_RESUME:
-#ifdef CONFIG_VGM_ENABLE
                         if (state->current_view == APP_VIEW_VGM) {
                             // VGM pause/resume
                             if (vgm_player_is_paused()) {
@@ -567,7 +551,6 @@ void app_main(void) {
                                 vgm_player_pause();
                             }
                         } else
-#endif
                         {
                             // MOD pause/resume
                             if (mod_player_is_paused()) {
@@ -620,9 +603,7 @@ void app_main(void) {
         // Render playback UI if playing (MOD or VGM)
         // For smooth scrolling, we need to render every frame, not just on row changes
         bool any_player_active = mod_player_is_playing();
-#ifdef CONFIG_VGM_ENABLE
         any_player_active = any_player_active || vgm_player_is_playing();
-#endif
         if (any_player_active && !state->browser_active) {
             // Track mode transitions - clear framebuffer when switching from browser to playback
             static bool last_browser_active = true;
@@ -1679,7 +1660,6 @@ void app_main(void) {
                         const char *info_pause = mod_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, info_hx, info_text_y, THEME_TEXT_MUTED, 1, info_pause);
                     }
-#ifdef CONFIG_VGM_ENABLE
                     else if (state->current_view == APP_VIEW_VGM) {
                         // VGM playback view
                         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
@@ -1916,7 +1896,6 @@ void app_main(void) {
                         const char *vgm_pause = vgm_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, vgm_pause);
                     }
-#endif
 
                     PROFILING_END(render, render);
                     // Note: state->tracker.last_row is now updated when we finish scrolling, not immediately
@@ -1924,7 +1903,6 @@ void app_main(void) {
                     did_render = true;  // Tracker UI always renders (smooth scrolling)
                 }
             }
-#ifdef CONFIG_VGM_ENABLE
             else if (vgm_player_is_playing() && state->current_view == APP_VIEW_VGM) {
                 // VGM is playing but MOD is not - render VGM view directly
                 PROFILING_START(render);
@@ -2150,7 +2128,6 @@ void app_main(void) {
                 PROFILING_END(render, render);
                 did_render = true;
             }
-#endif
         }
 
         // Only call blit() if we actually rendered something this frame

@@ -4,19 +4,13 @@
  * @file mod_backend_config.h
  * @brief MOD backend configuration
  * 
- * Configure MOD playback settings. All settings apply to both backends (libxmp and libopenmpt).
+ * Configure MOD playback settings for libxmp.
  */
 
 // ============================================================================
 // BACKEND SELECTION
 // ============================================================================
-// NOTE: Backend selection is now done via menuconfig (Kconfig)
-// Run 'idf.py menuconfig' and navigate to "MOD Playback Configuration"
-// Or set CONFIG_MOD_BACKEND_XMP=y or CONFIG_MOD_BACKEND_OPENMPT=y in sdkconfig
-//
-// The old #define method is still supported for backward compatibility:
-// #define MOD_BACKEND_XMP
-// #define MOD_BACKEND_OPENMPT
+// libxmp is the only supported backend.
 
 // ============================================================================
 // AUDIO CONFIGURATION

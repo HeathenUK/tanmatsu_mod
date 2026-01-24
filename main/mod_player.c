@@ -9,7 +9,7 @@
 #include "freertos/semphr.h"
 #include <string.h>
 
-// Unified backend interface (selects libxmp or libopenmpt at compile time)
+// Unified backend interface (libxmp only)
 #include "mod_backend.h"
 
 // Include xmp_compat.h for structure definitions (we still need the struct definitions for compatibility)
@@ -63,7 +63,7 @@ static void mod_playback_task(void *arg) {
                 if (mod_playing && !mod_paused) {
                     // Render MOD audio (format from config, 16-bit)
                     // mod_backend_play_buffer expects buffer size in bytes (samples * sizeof(int16_t))
-                    rc = mod_backend_play_buffer(mod_ctx, mono_buffer, sizeof(mono_buffer), MOD_CONFIG_DEFAULT_LOOP);
+                    rc = mod_backend_play_buffer(mod_ctx, mono_buffer, MOD_BUFFER_SAMPLES * sizeof(int16_t), MOD_CONFIG_DEFAULT_LOOP);
                 }
                 xSemaphoreGive(playback_mutex);
 
@@ -135,7 +135,7 @@ static void mod_playback_task(void *arg) {
                         int pre_rc = -1;
                         if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                             if (mod_playing) {
-                                pre_rc = mod_backend_play_buffer(mod_ctx, mono_buffer, sizeof(mono_buffer), MOD_CONFIG_DEFAULT_LOOP);
+                                pre_rc = mod_backend_play_buffer(mod_ctx, mono_buffer, MOD_BUFFER_SAMPLES * sizeof(int16_t), MOD_CONFIG_DEFAULT_LOOP);
                             }
                             xSemaphoreGive(playback_mutex);
                         }
@@ -407,6 +407,15 @@ esp_err_t mod_player_stop(void) {
         // Timeout - force end anyway (shouldn't happen normally)
         ESP_LOGW(TAG, "Timeout waiting for playback mutex in stop()");
         mod_backend_end_player(mod_ctx);
+    }
+
+    // Flush I2S with silence before releasing ownership to avoid repeating the last buffer
+    if (i2s_handle && audio_output_is_owner(AUDIO_OUTPUT_OWNER_MOD)) {
+        memset(stereo_buffer, 0, sizeof(stereo_buffer));
+        for (int i = 0; i < 3; i++) {
+            size_t bytes_written = 0;
+            i2s_channel_write(i2s_handle, stereo_buffer, sizeof(stereo_buffer), &bytes_written, 0);
+        }
     }
 
     audio_output_release(AUDIO_OUTPUT_OWNER_MOD);

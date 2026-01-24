@@ -24,7 +24,7 @@ void font_draw_string(uint16_t *fb, int width, int height, int x, int y, uint16_
 
 // Render a string with scaling (scale factor: 1=8x16, 2=16x32, etc.)
 // Hardware-accelerated where possible (PPA for large blocks, optimized loops for small blocks)
-void IRAM_ATTR font_draw_string_scaled(uint16_t *fb, int width, int height, int x, int y, uint16_t color, int scale, const char *text);
+void font_draw_string_scaled(uint16_t *fb, int width, int height, int x, int y, uint16_t color, int scale, const char *text);
 
 // NOTE: fb_fill() and fb_rect() are deprecated - use PPA functions in main.c instead:
 // - ppa_fill_framebuffer() for full framebuffer fills (hardware-accelerated via PPA)

@@ -1,57 +1,11 @@
 # libvgm ESP-IDF component for VGM/VGZ playback
 # Builds chip emulators for various retro gaming systems
 
-# Only build this component if VGM playback is enabled via Kconfig
-if(NOT CONFIG_VGM_ENABLE)
-    # Component not selected - create minimal stub
-    idf_component_register(
-        SRCS
-            "stub.c"
-        INCLUDE_DIRS
-            "include"
-    )
-
-    # Create stub file if it doesn't exist
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stub.c")
-        file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/stub.c"
-            "// libvgm component disabled - CONFIG_VGM_ENABLE not selected\n"
-        )
-    endif()
-
-    message(STATUS "libvgm: Component disabled (CONFIG_VGM_ENABLE not selected)")
-    return()
-endif()
-
 # libvgm source root (submodule)
 set(LIBVGM_DIR "${CMAKE_CURRENT_LIST_DIR}/../../external/libvgm")
 
 if(NOT EXISTS "${LIBVGM_DIR}/emu")
     message(FATAL_ERROR "libvgm submodule not found at ${LIBVGM_DIR}. Run: git submodule update --init --recursive")
-endif()
-
-set(LIBVGM_PATCH_FILE "${CMAKE_CURRENT_LIST_DIR}/patches/psram_bss.patch")
-if(EXISTS "${LIBVGM_PATCH_FILE}")
-    execute_process(
-        COMMAND git -C "${LIBVGM_DIR}" apply --check "${LIBVGM_PATCH_FILE}"
-        RESULT_VARIABLE LIBVGM_PATCH_CHECK
-    )
-    if(LIBVGM_PATCH_CHECK EQUAL 0)
-        execute_process(
-            COMMAND git -C "${LIBVGM_DIR}" apply "${LIBVGM_PATCH_FILE}"
-            RESULT_VARIABLE LIBVGM_PATCH_APPLY
-        )
-        if(NOT LIBVGM_PATCH_APPLY EQUAL 0)
-            message(FATAL_ERROR "libvgm: failed to apply PSRAM patch")
-        endif()
-    else()
-        execute_process(
-            COMMAND git -C "${LIBVGM_DIR}" apply --reverse --check "${LIBVGM_PATCH_FILE}"
-            RESULT_VARIABLE LIBVGM_PATCH_REVERSE_CHECK
-        )
-        if(NOT LIBVGM_PATCH_REVERSE_CHECK EQUAL 0)
-            message(FATAL_ERROR "libvgm: PSRAM patch check failed (neither clean nor already applied)")
-        endif()
-    endif()
 endif()
 
 # Core emulator sources (required by all chips)
@@ -143,16 +97,12 @@ set(EMU_SEGAPCM_SRCS
     "${LIBVGM_DIR}/emu/cores/segapcm.c"
 )
 
-# Sega CD PCM (RF5C68) - optional
-if(CONFIG_VGM_ENABLE_SEGACD)
-    set(EMU_SEGACD_SRCS
-        "${LIBVGM_DIR}/emu/cores/scd_pcm.c"
-        "${LIBVGM_DIR}/emu/cores/rf5cintf.c"
-        "${LIBVGM_DIR}/emu/cores/rf5c68.c"
-    )
-else()
-    set(EMU_SEGACD_SRCS)
-endif()
+# Sega CD PCM (RF5C68) - always enabled
+set(EMU_SEGACD_SRCS
+    "${LIBVGM_DIR}/emu/cores/scd_pcm.c"
+    "${LIBVGM_DIR}/emu/cores/rf5cintf.c"
+    "${LIBVGM_DIR}/emu/cores/rf5c68.c"
+)
 
 # Player module sources (C++ files)
 set(PLAYER_SRCS
@@ -205,6 +155,8 @@ idf_component_register(
         "${LIBVGM_DIR}/utils"
     PRIV_REQUIRES
         driver
+    LDFRAGMENTS
+        "linker.lf"
 )
 
 # libvgm compile definitions - enable supported chips
@@ -225,12 +177,13 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     # MSX / ZX Spectrum / Amstrad
     SNDDEV_AY8910      # PSG
 
-    # NES / GB / Arcade / OPL
+    # NES / GB / Arcade / OPL / Sega CD
     SNDDEV_NES_APU     # NES APU
     SNDDEV_GAMEBOY     # Game Boy
     SNDDEV_SEGAPCM     # Sega arcade PCM
     SNDDEV_YM3812      # OPL2
     SNDDEV_YMF262      # OPL3
+    SNDDEV_RF5C68      # Sega CD PCM
 
     # ========== Emulator core enables ==========
     # When SNDDEV_SELECT is defined, we must explicitly enable cores.
@@ -254,11 +207,6 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     # NES APU - NSFPlay core (matches current source set)
     EC_NES_NSFPLAY
 )
-
-# Optional Sega CD support
-if(CONFIG_VGM_ENABLE_SEGACD)
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE SNDDEV_RF5C68)
-endif()
 
 # C++ standard for player module
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD 11)

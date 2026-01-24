@@ -1,12 +1,6 @@
 [submodule "components/libxmp"]
 	path = components/libxmp
 	url = https://github.com/libxmp/libxmp.git
-[submodule "components/libopenmpt"]
-	path = components/libopenmpt
-	url = https://github.com/OpenMPT/openmpt.git
-[submodule "components/micromod"]
-	path = components/micromod
-	url = https://github.com/martincameron/micromod.git
 [submodule "external/libvgm"]
 	path = external/libvgm
 	url = https://github.com/ValleyBell/libvgm.git
