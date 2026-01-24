@@ -1,4 +1,4 @@
-# Tanmatsu_mod tracker audio player
+# Trackmatsu tracker/VGM audio player
 
 This player for tracker audio is based on the tanmatsu template provided [here](https://github.com/Nicolai-Electronics/tanmatsu-template).
 
