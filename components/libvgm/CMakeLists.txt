@@ -22,99 +22,133 @@ if(NOT CONFIG_VGM_ENABLE)
     return()
 endif()
 
+# libvgm source root (submodule)
+set(LIBVGM_DIR "${CMAKE_CURRENT_LIST_DIR}/../../external/libvgm")
+
+if(NOT EXISTS "${LIBVGM_DIR}/emu")
+    message(FATAL_ERROR "libvgm submodule not found at ${LIBVGM_DIR}. Run: git submodule update --init --recursive")
+endif()
+
+set(LIBVGM_PATCH_FILE "${CMAKE_CURRENT_LIST_DIR}/patches/psram_bss.patch")
+if(EXISTS "${LIBVGM_PATCH_FILE}")
+    execute_process(
+        COMMAND git -C "${LIBVGM_DIR}" apply --check "${LIBVGM_PATCH_FILE}"
+        RESULT_VARIABLE LIBVGM_PATCH_CHECK
+    )
+    if(LIBVGM_PATCH_CHECK EQUAL 0)
+        execute_process(
+            COMMAND git -C "${LIBVGM_DIR}" apply "${LIBVGM_PATCH_FILE}"
+            RESULT_VARIABLE LIBVGM_PATCH_APPLY
+        )
+        if(NOT LIBVGM_PATCH_APPLY EQUAL 0)
+            message(FATAL_ERROR "libvgm: failed to apply PSRAM patch")
+        endif()
+    else()
+        execute_process(
+            COMMAND git -C "${LIBVGM_DIR}" apply --reverse --check "${LIBVGM_PATCH_FILE}"
+            RESULT_VARIABLE LIBVGM_PATCH_REVERSE_CHECK
+        )
+        if(NOT LIBVGM_PATCH_REVERSE_CHECK EQUAL 0)
+            message(FATAL_ERROR "libvgm: PSRAM patch check failed (neither clean nor already applied)")
+        endif()
+    endif()
+endif()
+
 # Core emulator sources (required by all chips)
 set(EMU_CORE_SRCS
-    "src/emu/SoundEmu.c"
-    "src/emu/Resampler.c"
-    "src/emu/panning.c"
-    "src/emu/dac_control.c"
-    "src/emu/logging.c"
+    "${LIBVGM_DIR}/emu/SoundEmu.c"
+    "${LIBVGM_DIR}/emu/Resampler.c"
+    "${LIBVGM_DIR}/emu/panning.c"
+    "${LIBVGM_DIR}/emu/dac_control.c"
+    "${LIBVGM_DIR}/emu/logging.c"
 )
 
 # Genesis/MegaDrive: YM2612 (FM) + SN76496 (PSG)
+# Note: fmopn.c is for GPGX/MAME core (EC_YM2612_GPGX), ym2612.c is for Gens core (EC_YM2612_GENS)
 set(EMU_GENESIS_SRCS
-    "src/emu/cores/2612intf.c"
-    "src/emu/cores/ym2612.c"
-    "src/emu/cores/sn764intf.c"
-    "src/emu/cores/sn76496.c"
+    "${LIBVGM_DIR}/emu/cores/2612intf.c"
+    "${LIBVGM_DIR}/emu/cores/fmopn.c"
+    "${LIBVGM_DIR}/emu/cores/ym2612.c"
+    "${LIBVGM_DIR}/emu/cores/sn764intf.c"
+    "${LIBVGM_DIR}/emu/cores/sn76496.c"
+    "${LIBVGM_DIR}/emu/cores/sn76489.c"
 )
 
 # YM2151 - Arcade FM (CPS1, many arcade boards)
 set(EMU_YM2151_SRCS
-    "src/emu/cores/2151intf.c"
-    "src/emu/cores/ym2151.c"
+    "${LIBVGM_DIR}/emu/cores/2151intf.c"
+    "${LIBVGM_DIR}/emu/cores/ym2151.c"
 )
 
 # YM2413 (OPLL) - SMS FM Unit, MSX-MUSIC
 set(EMU_YM2413_SRCS
-    "src/emu/cores/2413intf.c"
-    "src/emu/cores/emu2413.c"
+    "${LIBVGM_DIR}/emu/cores/2413intf.c"
+    "${LIBVGM_DIR}/emu/cores/emu2413.c"
 )
 
 # AY8910 - MSX, ZX Spectrum, Amstrad CPC, Atari ST
 set(EMU_AY8910_SRCS
-    "src/emu/cores/ayintf.c"
-    "src/emu/cores/emu2149.c"
+    "${LIBVGM_DIR}/emu/cores/ayintf.c"
+    "${LIBVGM_DIR}/emu/cores/emu2149.c"
 )
 
 # NES APU - Nintendo Entertainment System / Famicom
 set(EMU_NES_SRCS
-    "src/emu/cores/nesintf.c"
-    "src/emu/cores/np_nes_apu.c"
-    "src/emu/cores/np_nes_dmc.c"
-    "src/emu/cores/np_nes_fds.c"
+    "${LIBVGM_DIR}/emu/cores/nesintf.c"
+    "${LIBVGM_DIR}/emu/cores/np_nes_apu.c"
+    "${LIBVGM_DIR}/emu/cores/np_nes_dmc.c"
+    "${LIBVGM_DIR}/emu/cores/np_nes_fds.c"
 )
 
 # Game Boy APU
 set(EMU_GAMEBOY_SRCS
-    "src/emu/cores/gb.c"
+    "${LIBVGM_DIR}/emu/cores/gb.c"
 )
 
 # HuC6280 - PC Engine / TurboGrafx-16
 set(EMU_PCE_SRCS
-    "src/emu/cores/c6280intf.c"
-    "src/emu/cores/Ootake_PSG.c"
+    "${LIBVGM_DIR}/emu/cores/c6280intf.c"
 )
 
 # OPL2 (YM3812) - AdLib, Sound Blaster, many DOS games
 set(EMU_OPL2_SRCS
-    "src/emu/cores/oplintf.c"
-    "src/emu/cores/fmopl.c"
+    "${LIBVGM_DIR}/emu/cores/oplintf.c"
+    "${LIBVGM_DIR}/emu/cores/fmopl.c"
 )
 
 # OPL3 (YMF262) - Sound Blaster Pro 2, AWE32, DOS games
 set(EMU_OPL3_SRCS
-    "src/emu/cores/262intf.c"
-    "src/emu/cores/ymf262.c"
+    "${LIBVGM_DIR}/emu/cores/262intf.c"
+    "${LIBVGM_DIR}/emu/cores/ymf262.c"
 )
 
 # QSound - Capcom CPS1.5/CPS2 arcade
 set(EMU_QSOUND_SRCS
-    "src/emu/cores/qsoundintf.c"
-    "src/emu/cores/qsound_ctr.c"
+    "${LIBVGM_DIR}/emu/cores/qsoundintf.c"
+    "${LIBVGM_DIR}/emu/cores/qsound_ctr.c"
 )
 
 # POKEY - Atari 8-bit, Atari 5200, some arcade
 set(EMU_POKEY_SRCS
-    "src/emu/cores/pokey.c"
+    "${LIBVGM_DIR}/emu/cores/pokey.c"
 )
 
 # K051649 (SCC) - Konami MSX cartridges
 set(EMU_SCC_SRCS
-    "src/emu/cores/k051649.c"
+    "${LIBVGM_DIR}/emu/cores/k051649.c"
 )
 
 # SegaPCM - Sega arcade (OutRun, After Burner, etc.)
 set(EMU_SEGAPCM_SRCS
-    "src/emu/cores/segapcm.c"
+    "${LIBVGM_DIR}/emu/cores/segapcm.c"
 )
 
 # Sega CD PCM (RF5C68) - optional
 if(CONFIG_VGM_ENABLE_SEGACD)
     set(EMU_SEGACD_SRCS
-        "src/emu/cores/scd_pcm.c"
-        "src/emu/cores/rf5cintf.c"
-        "src/emu/cores/rf5c68.c"
+        "${LIBVGM_DIR}/emu/cores/scd_pcm.c"
+        "${LIBVGM_DIR}/emu/cores/rf5cintf.c"
+        "${LIBVGM_DIR}/emu/cores/rf5c68.c"
     )
 else()
     set(EMU_SEGACD_SRCS)
@@ -122,12 +156,12 @@ endif()
 
 # Player module sources (C++ files)
 set(PLAYER_SRCS
-    "src/player/vgmplayer.cpp"
-    "src/player/vgmplayer_cmdhandler.cpp"
-    "src/player/playerbase.cpp"
-    "src/player/playera.cpp"
-    "src/player/helper.c"
-    "src/player/dblk_compr.c"
+    "${LIBVGM_DIR}/player/vgmplayer.cpp"
+    "${LIBVGM_DIR}/player/vgmplayer_cmdhandler.cpp"
+    "${LIBVGM_DIR}/player/playerbase.cpp"
+    "${LIBVGM_DIR}/player/playera.cpp"
+    "${LIBVGM_DIR}/player/helper.c"
+    "${LIBVGM_DIR}/player/dblk_compr.c"
 )
 
 # Utils module sources
@@ -135,7 +169,7 @@ set(PLAYER_SRCS
 # to avoid zlib dependency (VGZ decompression is handled in vgm_backend.cpp)
 # Using StrUtils_simple.c instead of StrUtils-CPConv_IConv.c to avoid iconv dependency
 set(UTILS_SRCS
-    "src/utils/DataLoader.c"
+    "${LIBVGM_DIR}/utils/DataLoader.c"
     "MemoryLoader_simple.c"
     "StrUtils_simple.c"
 )
@@ -160,46 +194,65 @@ idf_component_register(
         ${PLAYER_SRCS}
         ${UTILS_SRCS}
     INCLUDE_DIRS
-        "src"
-        "src/emu"
-        "src/player"
-        "src/utils"
+        "${LIBVGM_DIR}"
+        "${LIBVGM_DIR}/emu"
+        "${LIBVGM_DIR}/player"
+        "${LIBVGM_DIR}/utils"
     PRIV_INCLUDE_DIRS
-        "src"
-        "src/emu"
-        "src/player"
-        "src/utils"
+        "${LIBVGM_DIR}"
+        "${LIBVGM_DIR}/emu"
+        "${LIBVGM_DIR}/player"
+        "${LIBVGM_DIR}/utils"
     PRIV_REQUIRES
         driver
 )
 
-# libvgm compile definitions - enable all supported chips
+# libvgm compile definitions - enable supported chips
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     # Endianness for ESP32-P4 (RISC-V, little-endian)
     VGM_LITTLE_ENDIAN
     # Enable device selection mode (instead of building all emulators)
     SNDDEV_SELECT
-    # Sega chips
+
+    # ========== Sound device enables ==========
+    # Genesis/Mega Drive (most common VGMs)
     SNDDEV_YM2612      # Genesis FM
     SNDDEV_SN76496     # Genesis/SMS PSG
-    # Arcade chips
-    SNDDEV_YM2151      # Arcade FM (CPS1, etc.)
-    SNDDEV_QSOUND      # Capcom CPS1.5/CPS2
-    # Yamaha FM chips
-    SNDDEV_YM2413      # OPLL (SMS FM, MSX)
-    SNDDEV_YM3812      # OPL2 (AdLib)
-    SNDDEV_YM3526      # OPL (predecessor to OPL2)
-    SNDDEV_YMF262      # OPL3 (Sound Blaster Pro 2)
-    # PSG chips
-    SNDDEV_AY8910      # MSX, ZX Spectrum, Amstrad
-    # Console chips
-    SNDDEV_NES_APU     # NES/Famicom
+
+    # Master System / Game Gear
+    SNDDEV_YM2413      # OPLL FM
+
+    # MSX / ZX Spectrum / Amstrad
+    SNDDEV_AY8910      # PSG
+
+    # NES / GB / Arcade / OPL
+    SNDDEV_NES_APU     # NES APU
     SNDDEV_GAMEBOY     # Game Boy
-    SNDDEV_C6280       # PC Engine/TurboGrafx-16
-    # Other chips
-    SNDDEV_POKEY       # Atari
-    SNDDEV_K051649     # SCC (Konami MSX)
     SNDDEV_SEGAPCM     # Sega arcade PCM
+    SNDDEV_YM3812      # OPL2
+    SNDDEV_YMF262      # OPL3
+
+    # ========== Emulator core enables ==========
+    # When SNDDEV_SELECT is defined, we must explicitly enable cores.
+
+    # Genesis FM - Gens core (faster than GPGX)
+    EC_YM2612_GENS
+
+    # Genesis/SMS PSG - Maxim core (faster than MAME)
+    EC_SN76496_MAXIM
+
+    # OPLL (SMS FM, MSX) - EMU2413 is lightweight
+    EC_YM2413_EMU2413
+
+    # AY8910 PSG - EMU2149 is lightweight
+    EC_AY8910_EMU2149
+
+    # OPL2/OPL3 - MAME cores (compatible with current build flags)
+    EC_YM3812_MAME
+    EC_YMF262_MAME
+
+    # NES APU - NSFPlay core (matches current source set)
+    EC_NES_NSFPLAY
 )
 
 # Optional Sega CD support
@@ -210,8 +263,14 @@ endif()
 # C++ standard for player module
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD 11)
 
-# Disable some warnings that appear in libvgm code
+# Optimization flags for performance-critical emulation code
+# -O3 for maximum optimization
+# -ffast-math for faster floating point (chip emulators are not precision-critical)
+# -funroll-loops to unroll tight loops in emulators
 target_compile_options(${COMPONENT_LIB} PRIVATE
+    -O3
+    -ffast-math
+    -funroll-loops
     -Wno-unused-parameter
     -Wno-sign-compare
     -Wno-implicit-fallthrough

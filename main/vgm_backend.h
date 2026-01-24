@@ -20,6 +20,9 @@ extern "C" {
 
 // VGM native sample rate
 #define VGM_NATIVE_SAMPLE_RATE 44100
+#ifndef VGM_PLAYBACK_SAMPLE_RATE
+#define VGM_PLAYBACK_SAMPLE_RATE 22050
+#endif
 
 // Maximum tag string length
 #define VGM_TAG_MAX_LEN 256

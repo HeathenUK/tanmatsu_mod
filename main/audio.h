@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 
 /**
  * @brief Initialize audio system (I2S and ES8156 codec)
@@ -33,6 +34,18 @@ esp_err_t audio_beep(uint32_t duration_ms);
  * @return esp_err_t ESP_OK on success
  */
 esp_err_t audio_stop(void);
+esp_err_t audio_set_sample_rate(uint32_t rate);
+
+typedef enum {
+    AUDIO_OUTPUT_OWNER_NONE = 0,
+    AUDIO_OUTPUT_OWNER_MOD,
+    AUDIO_OUTPUT_OWNER_VGM,
+} audio_output_owner_t;
+
+bool audio_output_acquire(audio_output_owner_t owner);
+void audio_output_release(audio_output_owner_t owner);
+bool audio_output_is_owner(audio_output_owner_t owner);
+audio_output_owner_t audio_output_get_owner(void);
 
 /**
  * @brief Set audio volume

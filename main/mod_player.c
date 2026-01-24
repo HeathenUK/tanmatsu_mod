@@ -39,9 +39,8 @@ static StaticTask_t *mod_task_tcb = NULL;
 #define MOD_BUFFER_SAMPLES MOD_CONFIG_BUFFER_SAMPLES
 #define MOD_BUFFER_SIZE (MOD_BUFFER_SAMPLES * 2 * sizeof(int16_t))  // Stereo 16-bit
 
-// Audio buffers - placed in internal SRAM for fast DMA access
-// DRAM_ATTR ensures these stay in internal RAM, not PSRAM
-static DRAM_ATTR int16_t mono_buffer[MOD_BUFFER_SAMPLES] = {0};
+// Audio buffers - mono can live in PSRAM, stereo stays in internal SRAM for DMA
+static int16_t *mono_buffer = NULL;  // PSRAM
 static DRAM_ATTR int16_t stereo_buffer[MOD_BUFFER_SAMPLES * 2] = {0};
 
 /**
@@ -151,11 +150,19 @@ static void mod_playback_task(void *arg) {
 
                 // Write to I2S (blocking, same as beep - ensures continuous playback)
                 // Channel is already enabled by audio_init(), no need to re-enable
-                i2s_channel_write(i2s_handle, stereo_buffer, 
-                                   sizeof(stereo_buffer), 
-                                   &bytes_written, 
+                esp_err_t write_ret = i2s_channel_write(i2s_handle, stereo_buffer,
+                                   sizeof(stereo_buffer),
+                                   &bytes_written,
                                    portMAX_DELAY);  // Blocking to ensure continuous audio
-                
+
+                // Log first write result for debugging
+                static bool mod_first_write_logged = false;
+                if (!mod_first_write_logged) {
+                    ESP_LOGI(TAG, "MOD first write: handle=%p, ret=%s, bytes=%zu",
+                             (void *)i2s_handle, esp_err_to_name(write_ret), bytes_written);
+                    mod_first_write_logged = true;
+                }
+
                 buffer_count++;
                 
                 // No yield needed - blocking I2S write already handles timing
@@ -166,11 +173,12 @@ static void mod_playback_task(void *arg) {
                     // ESP_LOGI(TAG, "MOD playback ended (rc=%d) after %lu buffers", rc, buffer_count);
                     mod_playing = false;
                     buffer_count = 0;
+                    audio_output_release(AUDIO_OUTPUT_OWNER_MOD);
                 }
             }  // xSemaphoreTake block
         } else {
             // Not playing, write silence to prevent audio glitches
-            if (i2s_handle) {
+            if (i2s_handle && audio_output_is_owner(AUDIO_OUTPUT_OWNER_MOD)) {
                 memset(stereo_buffer, 0, sizeof(stereo_buffer));
                 i2s_channel_write(i2s_handle, stereo_buffer, sizeof(stereo_buffer), &bytes_written, 0);  // Non-blocking
             }
@@ -196,6 +204,7 @@ esp_err_t mod_player_init(uint32_t sample_rate_in) {
         ESP_LOGE(TAG, "I2S handle not available - call audio_init() first");
         return ESP_ERR_INVALID_STATE;
     }
+    ESP_LOGI(TAG, "Got I2S handle: %p", (void *)i2s_handle);
 
     // Create mutex to protect play_buffer/end_player from racing
     playback_mutex = xSemaphoreCreateMutex();
@@ -212,11 +221,22 @@ esp_err_t mod_player_init(uint32_t sample_rate_in) {
         return ESP_ERR_NO_MEM;
     }
 
+    // Allocate mono render buffer in PSRAM to save internal RAM
+    mono_buffer = (int16_t *)heap_caps_malloc(MOD_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (mono_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate MOD mono buffer in PSRAM");
+        mod_backend_free(mod_ctx);
+        mod_ctx = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     // Allocate task stack in PSRAM (much larger than SRAM allows)
     // This allows us to use a 16KB stack without worrying about SRAM constraints
     mod_task_stack = (StackType_t *)heap_caps_malloc(MOD_TASK_STACK_SIZE * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     if (mod_task_stack == NULL) {
         ESP_LOGE(TAG, "Failed to allocate task stack in PSRAM");
+        heap_caps_free(mono_buffer);
+        mono_buffer = NULL;
         mod_backend_free(mod_ctx);
         mod_ctx = NULL;
         return ESP_ERR_NO_MEM;
@@ -228,6 +248,8 @@ esp_err_t mod_player_init(uint32_t sample_rate_in) {
         ESP_LOGE(TAG, "Failed to allocate task TCB");
         heap_caps_free(mod_task_stack);
         mod_task_stack = NULL;
+        heap_caps_free(mono_buffer);
+        mono_buffer = NULL;
         mod_backend_free(mod_ctx);
         mod_ctx = NULL;
         return ESP_ERR_NO_MEM;
@@ -252,6 +274,8 @@ esp_err_t mod_player_init(uint32_t sample_rate_in) {
         mod_task_stack = NULL;
         vPortFree(mod_task_tcb);
         mod_task_tcb = NULL;
+        heap_caps_free(mono_buffer);
+        mono_buffer = NULL;
         mod_backend_free(mod_ctx);
         mod_ctx = NULL;
         return ESP_ERR_NO_MEM;
@@ -313,8 +337,22 @@ esp_err_t mod_player_start(void) {
     if (MOD_CONFIG_DSP_ENABLE) {
         mod_backend_set_player(mod_ctx, MOD_PLAYER_DSP, MOD_DSP_LOWPASS);
     }
-    
-    // I2S channel should already be enabled by audio_init()
+
+    // Ensure I2S channel is enabled (may have been disabled by audio_stop())
+    if (i2s_handle) {
+        if (!audio_output_acquire(AUDIO_OUTPUT_OWNER_MOD)) {
+            ESP_LOGW(TAG, "MOD start: audio output owned by another player");
+            return ESP_ERR_INVALID_STATE;
+        }
+        esp_err_t rate_ret = audio_set_sample_rate(sample_rate);
+        if (rate_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set MOD sample rate: %s", esp_err_to_name(rate_ret));
+            audio_output_release(AUDIO_OUTPUT_OWNER_MOD);
+            return rate_ret;
+        }
+        // audio_set_sample_rate() already re-enabled the channel
+    }
+
     // Start player with configured format
     esp_err_t ret = mod_backend_start_player(mod_ctx, sample_rate, MOD_CONFIG_FORMAT);
     if (ret != ESP_OK) {
@@ -370,6 +408,8 @@ esp_err_t mod_player_stop(void) {
         ESP_LOGW(TAG, "Timeout waiting for playback mutex in stop()");
         mod_backend_end_player(mod_ctx);
     }
+
+    audio_output_release(AUDIO_OUTPUT_OWNER_MOD);
 
     ESP_LOGI(TAG, "MOD playback stopped");
     return ESP_OK;

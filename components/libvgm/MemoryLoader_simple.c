@@ -10,9 +10,9 @@
 #include <string.h>
 #include <stdio.h>  // For SEEK_SET, SEEK_CUR, SEEK_END
 
-#include "src/common_def.h"
-#include "src/utils/DataLoader.h"
-#include "src/utils/MemoryLoader.h"
+#include "common_def.h"
+#include "utils/DataLoader.h"
+#include "utils/MemoryLoader.h"
 
 typedef struct _memory_loader {
     const UINT8 *data;

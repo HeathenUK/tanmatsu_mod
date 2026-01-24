@@ -207,8 +207,8 @@ void fkey_icons_init(void) {
     xSemaphoreTake(done_sem, portMAX_DELAY);
 
     vSemaphoreDelete(done_sem);
-    heap_caps_free(task_stack);
-    heap_caps_free(task_tcb);
+    // Keep task stack/TCB allocated: the task may still be unwinding after
+    // signalling completion, and freeing here can corrupt the heap.
 
     ESP_LOGI(TAG, "Icon loading complete");
 }

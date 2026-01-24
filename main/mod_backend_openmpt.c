@@ -4,6 +4,7 @@
 #if defined(MOD_BACKEND_OPENMPT)
 
 #include "mod_backend_config.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include <string.h>
 #include <stdlib.h>
@@ -47,6 +48,15 @@ openmpt_backend_t* openmpt_backend_create(void) {
     if (ctx == NULL) {
         ESP_LOGE(TAG, "Failed to allocate backend context");
         return NULL;
+    }
+
+    if (float_buffer == NULL) {
+        float_buffer = (float *)heap_caps_malloc(MAX_RENDER_SAMPLES * sizeof(float), MALLOC_CAP_SPIRAM);
+        if (float_buffer == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate OpenMPT float buffer in PSRAM");
+            free(ctx);
+            return NULL;
+        }
     }
     
     ctx->mod_ext = NULL;
@@ -220,13 +230,15 @@ void openmpt_backend_end_player(openmpt_backend_t *ctx) {
     ctx->is_playing = false;
 }
 
-// Static float buffer for rendering - placed in internal SRAM for fast access
-// DRAM_ATTR forces placement in internal data RAM, avoiding slow PSRAM
 #define MAX_RENDER_SAMPLES 4096
-static DRAM_ATTR float float_buffer[MAX_RENDER_SAMPLES];
+static float *float_buffer = NULL;
 
 int openmpt_backend_play_buffer(openmpt_backend_t *ctx, int16_t *buffer, size_t buffer_size, int loop) {
     if (ctx == NULL || ctx->mod == NULL || !ctx->is_playing) {
+        return -1;
+    }
+    if (float_buffer == NULL) {
+        ESP_LOGE(TAG, "OpenMPT float buffer not available");
         return -1;
     }
 

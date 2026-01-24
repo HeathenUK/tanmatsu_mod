@@ -226,7 +226,7 @@ void app_main(void) {
 
 #ifdef CONFIG_VGM_ENABLE
         // Initialize VGM player
-        res = vgm_player_init(VGM_NATIVE_SAMPLE_RATE);
+        res = vgm_player_init(VGM_PLAYBACK_SAMPLE_RATE);
         if (res == ESP_OK) {
             ESP_LOGI(TAG, "VGM player initialized");
         } else {
@@ -357,11 +357,17 @@ void app_main(void) {
         bsp_input_event_t event;
         
         // Set up input handler context
+        bool is_playing = mod_player_is_playing();
+        bool is_paused = mod_player_is_paused();
+#ifdef CONFIG_VGM_ENABLE
+        is_playing = is_playing || vgm_player_is_playing();
+        is_paused = is_paused || vgm_player_is_paused();
+#endif
         input_handler_context_t input_ctx = {
             .browser = &state->browser,
             .browser_active = &state->browser_active,
-            .playing = mod_player_is_playing(),
-            .paused = mod_player_is_paused(),
+            .playing = is_playing,
+            .paused = is_paused,
             .current_volume = 0.0f,
             .current_view = state->current_view,
             .tab_pressed = &state->tab_pressed_this_frame,
@@ -611,9 +617,13 @@ void app_main(void) {
         }
         last_sdcard_mounted = current_sdcard_mounted;
         
-        // Render tracker UI if playing
+        // Render playback UI if playing (MOD or VGM)
         // For smooth scrolling, we need to render every frame, not just on row changes
-        if (mod_player_is_playing() && !state->browser_active) {
+        bool any_player_active = mod_player_is_playing();
+#ifdef CONFIG_VGM_ENABLE
+        any_player_active = any_player_active || vgm_player_is_playing();
+#endif
+        if (any_player_active && !state->browser_active) {
             // Track mode transitions - clear framebuffer when switching from browser to playback
             static bool last_browser_active = true;
             if (last_browser_active && !state->browser_active) {
@@ -756,7 +766,7 @@ void app_main(void) {
 
                         // Header height: use smaller header to maximize tracker content area
                         // Font scale 1 = 16px text height, add small padding
-                        int header_height = FONT_HEIGHT + 4;  // 20px total
+                        const int header_height = FONT_HEIGHT + 4;  // shared header height
                         int header_y = MARGIN_TOP + header_height;  // First row starts immediately after header
                         
                         // Track volume changes to update header
@@ -1369,7 +1379,7 @@ void app_main(void) {
                     // Draw view-dependent overlays
                     if (state->current_view == APP_VIEW_TRACKER) {
                         // Layout: VU meters above hint bar at bottom
-                        int hint_bar_height = 20;  // Height for hint bar
+                        const int hint_bar_height = 20;  // Height for hint bar
                         int vu_height = state->vu_state.cached_line_height;
                         int hint_bar_y = FB_HEIGHT - MARGIN_BOTTOM - hint_bar_height;
                         int vu_footer_y = hint_bar_y - vu_height;
@@ -1500,7 +1510,7 @@ void app_main(void) {
                             }
                         }
 
-                        int hint_bar_height_spec = 20;
+                        const int hint_bar_height_spec = 20;
                         int spec_y = MARGIN_TOP + 50;
                         int spec_height = FB_HEIGHT - spec_y - MARGIN_BOTTOM - hint_bar_height_spec;
                         ui_draw_spectrum_bars(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
@@ -1674,42 +1684,55 @@ void app_main(void) {
                         // VGM playback view
                         ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
 
-                        // Header
-                        ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                          0, MARGIN_TOP, FB_WIDTH, THEME_HEADER_HEIGHT,
-                                          THEME_BG_HEADER, THEME_BG_PRIMARY);
-                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                MARGIN_LEFT, MARGIN_TOP + 4,
-                                                THEME_TEXT_PRIMARY, 2, "VGM PLAYER");
-
                         // Get VGM tags and playback info
                         vgm_tags_t vgm_tags;
                         vgm_playback_info_t vgm_info;
                         vgm_player_get_tags(&vgm_tags);
                         vgm_player_get_info(&vgm_info);
 
-                        int vgm_y = MARGIN_TOP + THEME_HEADER_HEIGHT + 16;
-                        int line_spacing = 24;
-                        char vgm_line[128];
+                        // Header (match MOD header style)
+                        const int header_height = FONT_HEIGHT + 4;  // shared header height
+                        ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                          0, MARGIN_TOP, FB_WIDTH, header_height,
+                                          THEME_BG_HEADER, THEME_BG_PRIMARY);
 
-                        // Title (or filename as fallback)
+                        // Title (or filename) on the left
+                        const char *vgm_title = NULL;
                         if (vgm_tags.title[0]) {
-                            snprintf(vgm_line, sizeof(vgm_line), "Title: %.50s", vgm_tags.title);
+                            vgm_title = vgm_tags.title;
                         } else {
-                            // Extract filename from path
                             const char *fname = strrchr(state->mod_file.path, '/');
-                            fname = fname ? fname + 1 : state->mod_file.path;
-                            snprintf(vgm_line, sizeof(vgm_line), "File: %.50s", fname);
+                            vgm_title = fname ? fname + 1 : state->mod_file.path;
                         }
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                MARGIN_LEFT, vgm_y, THEME_TEXT_PRIMARY, 2, vgm_line);
-                        vgm_y += line_spacing;
+                                                MARGIN_LEFT, MARGIN_TOP + 2,
+                                                THEME_TEXT_PRIMARY, 1, vgm_title);
+
+                        // Volume on the right (same as MOD header)
+                        float header_vol = 0.0f;
+                        if (audio_get_volume(&header_vol) == ESP_OK) {
+                            char vol_text[16];
+                            int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
+                            if (vol_percent < 0) vol_percent = 0;
+                            if (vol_percent > 100) vol_percent = 100;
+                            snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
+                            int vol_width = strlen(vol_text) * FONT_WIDTH;  // font_scale = 1
+                            int vol_x = FB_WIDTH - MARGIN_RIGHT - vol_width;
+                            font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                    vol_x, MARGIN_TOP + 2,
+                                                    THEME_TEXT_PRIMARY, 1, vol_text);
+                        }
+
+                        int vgm_y = MARGIN_TOP + header_height + 16;
+                        int line_spacing = FONT_HEIGHT + 8;
+                        const int meta_scale = 1;
+                        char vgm_line[128];
 
                         // Game
                         if (vgm_tags.game[0]) {
                             snprintf(vgm_line, sizeof(vgm_line), "Game: %.50s", vgm_tags.game);
                             font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, 2, vgm_line);
+                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, meta_scale, vgm_line);
                             vgm_y += line_spacing;
                         }
 
@@ -1717,7 +1740,7 @@ void app_main(void) {
                         if (vgm_tags.system[0]) {
                             snprintf(vgm_line, sizeof(vgm_line), "System: %.50s", vgm_tags.system);
                             font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, 2, vgm_line);
+                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, meta_scale, vgm_line);
                             vgm_y += line_spacing;
                         }
 
@@ -1725,25 +1748,24 @@ void app_main(void) {
                         if (vgm_tags.author[0]) {
                             snprintf(vgm_line, sizeof(vgm_line), "Author: %.50s", vgm_tags.author);
                             font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, 2, vgm_line);
+                                                    MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, meta_scale, vgm_line);
                             vgm_y += line_spacing;
                         }
 
                         // Chip info
                         vgm_y += 8;
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                MARGIN_LEFT, vgm_y, THEME_TEXT_PRIMARY, 2, "Chips:");
-                        vgm_y += line_spacing;
+                                                MARGIN_LEFT, vgm_y, THEME_TEXT_MUTED, meta_scale, "Chips:");
 
-                        // Display active chips
-                        int chip_x = MARGIN_LEFT + 16;
+                        // Display active chips on same line
+                        int chip_x = MARGIN_LEFT + (FONT_WIDTH * meta_scale * 6);
                         for (int i = 0; i < vgm_info.num_chips && i < 4; i++) {
                             vgm_chip_info_t chip;
                             if (vgm_player_get_chip_info(i, &chip) == ESP_OK && chip.name) {
                                 snprintf(vgm_line, sizeof(vgm_line), "[%s]", chip.name);
                                 font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
-                                                        chip_x, vgm_y, THEME_VU_MID, 2, vgm_line);
-                                chip_x += strlen(vgm_line) * FONT_WIDTH * 2 + 16;
+                                                        chip_x, vgm_y, THEME_VU_MID, meta_scale, vgm_line);
+                                chip_x += strlen(vgm_line) * FONT_WIDTH * meta_scale + 8;
                             }
                         }
                         vgm_y += line_spacing + 16;
@@ -1780,17 +1802,87 @@ void app_main(void) {
                         snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / %d:%02d", cur_min, cur_sec, tot_min, tot_sec);
                         font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                                 progress_bar_x + progress_bar_w + 8, progress_bar_y,
-                                                THEME_TEXT_SECONDARY, 2, vgm_line);
+                                                THEME_TEXT_SECONDARY, 1, vgm_line);
+
+                        // Oscilloscope waveform visualization
+                        vgm_y = progress_bar_y + progress_bar_h + 24;
+                        int scope_w = CONTENT_WIDTH;
+                        int scope_h = 120;  // Height for both channels
+                        int scope_x = MARGIN_LEFT;
+                        int scope_y = vgm_y;
+                        int channel_h = (scope_h - 8) / 2;  // Height per channel with gap
+
+                        // Scope background
+                        ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                      scope_x, scope_y, scope_w, scope_h, THEME_VU_BG);
+
+                        // Get waveform data
+                        static int16_t wave_left[512];
+                        static int16_t wave_right[512];
+                        size_t wave_samples = 0;
+                        if (vgm_player_get_waveform(wave_left, wave_right, 512, &wave_samples) == ESP_OK && wave_samples > 0) {
+                            // Draw left channel (green) - top half
+                            int left_center_y = scope_y + channel_h / 2;
+                            int prev_left_y = left_center_y;
+                            for (size_t i = 0; i < wave_samples && i < (size_t)scope_w; i++) {
+                                int x = scope_x + (int)(i * scope_w / wave_samples);
+                                // Map -32768..32767 to -channel_h/2..channel_h/2
+                                int y_offset = (wave_left[i] * (channel_h / 2)) / 32768;
+                                int y = left_center_y - y_offset;
+                                if (y < scope_y) y = scope_y;
+                                if (y >= scope_y + channel_h) y = scope_y + channel_h - 1;
+                                // Draw vertical line from prev_y to y for smoothness
+                                if (i > 0) {
+                                    int y1 = (prev_left_y < y) ? prev_left_y : y;
+                                    int y2 = (prev_left_y > y) ? prev_left_y : y;
+                                    ui_draw_vline(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y1, y2 - y1 + 1, THEME_VU_LOW);
+                                }
+                                prev_left_y = y;
+                            }
+
+                            // Draw right channel (cyan) - bottom half
+                            int right_center_y = scope_y + channel_h + 8 + channel_h / 2;
+                            int prev_right_y = right_center_y;
+                            for (size_t i = 0; i < wave_samples && i < (size_t)scope_w; i++) {
+                                int x = scope_x + (int)(i * scope_w / wave_samples);
+                                int y_offset = (wave_right[i] * (channel_h / 2)) / 32768;
+                                int y = right_center_y - y_offset;
+                                if (y < scope_y + channel_h + 8) y = scope_y + channel_h + 8;
+                                if (y >= scope_y + scope_h) y = scope_y + scope_h - 1;
+                                if (i > 0) {
+                                    int y1 = (prev_right_y < y) ? prev_right_y : y;
+                                    int y2 = (prev_right_y > y) ? prev_right_y : y;
+                                    ui_draw_vline(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y1, y2 - y1 + 1, THEME_ACCENT_6);
+                                }
+                                prev_right_y = y;
+                            }
+
+                            // Draw center lines (dim)
+                            ui_draw_hline(CURRENT_FB, FB_WIDTH, FB_HEIGHT, scope_x, left_center_y, scope_w, THEME_TEXT_MUTED);
+                            ui_draw_hline(CURRENT_FB, FB_WIDTH, FB_HEIGHT, scope_x, right_center_y, scope_w, THEME_TEXT_MUTED);
+                        } else {
+                            // No waveform data - draw center lines only
+                            ui_draw_hline(CURRENT_FB, FB_WIDTH, FB_HEIGHT, scope_x, scope_y + channel_h / 2, scope_w, THEME_TEXT_MUTED);
+                            ui_draw_hline(CURRENT_FB, FB_WIDTH, FB_HEIGHT, scope_x, scope_y + channel_h + 8 + channel_h / 2, scope_w, THEME_TEXT_MUTED);
+                        }
+
+                        // Channel labels
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                scope_x + 4, scope_y + 2, THEME_VU_LOW, 1, "L");
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                scope_x + 4, scope_y + channel_h + 10, THEME_ACCENT_6, 1, "R");
+
+                        vgm_y = scope_y + scope_h + 8;
 
                         // Loop indicator
                         if (vgm_info.has_loop) {
-                            vgm_y += line_spacing + 8;
                             font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                                     MARGIN_LEFT, vgm_y, THEME_TEXT_MUTED, 1, "(Looping track)");
+                            vgm_y += line_spacing;
                         }
 
                         // Footer hint bar
-                        int vgm_hint_h = 20;
+                        const int vgm_hint_h = 20;
                         int vgm_hint_y = FB_HEIGHT - MARGIN_BOTTOM - vgm_hint_h;
                         ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
                                       0, vgm_hint_y, FB_WIDTH, vgm_hint_h, THEME_BG_PRIMARY);
@@ -1798,7 +1890,10 @@ void app_main(void) {
                         int vgm_icon_w = 16, vgm_icon_h = 16;
                         if (fkey_icon_available(6)) fkey_icon_get_size(6, &vgm_icon_w, &vgm_icon_h);
                         int vgm_gap = 20;
-                        int vgm_hx = MARGIN_LEFT + 20;
+                        int vgm_total = (vgm_icon_w + 4 + FONT_WIDTH * 4 + vgm_gap) +  // F6 Exit
+                                        (FONT_WIDTH * 6 + vgm_gap) +                   // arrows Vol
+                                        (FONT_WIDTH * 8);                              // space Pause
+                        int vgm_hx = (FB_WIDTH - vgm_total) / 2;
                         int vgm_icon_y_pos = vgm_hint_y + (vgm_hint_h - vgm_icon_h) / 2;
                         int vgm_text_y = vgm_hint_y + (vgm_hint_h - FONT_HEIGHT) / 2 + 1;
 
@@ -1829,8 +1924,235 @@ void app_main(void) {
                     did_render = true;  // Tracker UI always renders (smooth scrolling)
                 }
             }
+#ifdef CONFIG_VGM_ENABLE
+            else if (vgm_player_is_playing() && state->current_view == APP_VIEW_VGM) {
+                // VGM is playing but MOD is not - render VGM view directly
+                PROFILING_START(render);
+
+                ppa_fill_framebuffer(CURRENT_FB, FB_WIDTH, FB_HEIGHT, THEME_BG_PRIMARY);
+
+                // Get VGM tags and playback info
+                vgm_tags_t vgm_tags;
+                vgm_playback_info_t vgm_info;
+                vgm_player_get_tags(&vgm_tags);
+                vgm_player_get_info(&vgm_info);
+
+                // Header (match MOD header style)
+                const int header_height = FONT_HEIGHT + 4;  // shared header height
+                ui_draw_vgradient(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                  0, MARGIN_TOP, FB_WIDTH, header_height,
+                                  THEME_BG_HEADER, THEME_BG_PRIMARY);
+
+                // Title (or filename) on the left
+                const char *vgm_title = NULL;
+                if (vgm_tags.title[0]) {
+                    vgm_title = vgm_tags.title;
+                } else {
+                    const char *fname = strrchr(state->mod_file.path, '/');
+                    vgm_title = fname ? fname + 1 : state->mod_file.path;
+                }
+                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                        MARGIN_LEFT, MARGIN_TOP + 2,
+                                        THEME_TEXT_PRIMARY, 1, vgm_title);
+
+                // Volume on the right
+                float header_vol = 0.0f;
+                if (audio_get_volume(&header_vol) == ESP_OK) {
+                    char vol_text[16];
+                    int vol_percent = (int)((header_vol - 0.20f) / 0.80f * 100.0f + 0.5f);
+                    if (vol_percent < 0) vol_percent = 0;
+                    if (vol_percent > 100) vol_percent = 100;
+                    snprintf(vol_text, sizeof(vol_text), "Vol: %d%%", vol_percent);
+                    int vol_width = strlen(vol_text) * FONT_WIDTH;  // font_scale = 1
+                    int vol_x = FB_WIDTH - MARGIN_RIGHT - vol_width;
+                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                            vol_x, MARGIN_TOP + 2,
+                                            THEME_TEXT_PRIMARY, 1, vol_text);
+                }
+
+                int vgm_y = MARGIN_TOP + header_height + 16;
+                int line_spacing = FONT_HEIGHT + 8;
+                const int meta_scale = 1;
+                char vgm_line[128];
+
+                // Game
+                if (vgm_tags.game[0]) {
+                    snprintf(vgm_line, sizeof(vgm_line), "Game: %.50s", vgm_tags.game);
+                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                            MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, meta_scale, vgm_line);
+                    vgm_y += line_spacing;
+                }
+
+                // System
+                if (vgm_tags.system[0]) {
+                    snprintf(vgm_line, sizeof(vgm_line), "System: %.50s", vgm_tags.system);
+                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                            MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, meta_scale, vgm_line);
+                    vgm_y += line_spacing;
+                }
+
+                // Author
+                if (vgm_tags.author[0]) {
+                    snprintf(vgm_line, sizeof(vgm_line), "Author: %.50s", vgm_tags.author);
+                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                            MARGIN_LEFT, vgm_y, THEME_TEXT_SECONDARY, meta_scale, vgm_line);
+                    vgm_y += line_spacing;
+                }
+
+                // Chip info - display on same line as label
+                vgm_y += 8;
+                int chip_x = MARGIN_LEFT;
+                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                        chip_x, vgm_y, THEME_TEXT_MUTED, meta_scale, "Chips:");
+                chip_x += 6 * FONT_WIDTH * meta_scale;  // "Chips:" width
+
+                bool found_chip = false;
+                for (int i = 0; i < vgm_info.num_chips && i < 4; i++) {
+                    vgm_chip_info_t chip;
+                    if (vgm_player_get_chip_info(i, &chip) == ESP_OK && chip.name) {
+                        snprintf(vgm_line, sizeof(vgm_line), "[%s]", chip.name);
+                        font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                                chip_x, vgm_y, THEME_VU_MID, meta_scale, vgm_line);
+                        chip_x += strlen(vgm_line) * FONT_WIDTH * meta_scale + 8;
+                        found_chip = true;
+                    }
+                }
+                if (!found_chip) {
+                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                            chip_x, vgm_y, THEME_TEXT_MUTED, meta_scale, "(detecting...)");
+                }
+                vgm_y += line_spacing + 16;
+
+                // Progress bar - leave more room for time string
+                int progress_bar_w = CONTENT_WIDTH - 200;
+                int progress_bar_h = 16;
+                int progress_bar_x = MARGIN_LEFT;
+                int progress_bar_y = vgm_y;
+
+                ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                              progress_bar_x, progress_bar_y, progress_bar_w, progress_bar_h,
+                              THEME_VU_BG);
+
+                double progress = 0.0;
+                if (vgm_info.total_time_sec > 0) {
+                    progress = vgm_info.current_time_sec / vgm_info.total_time_sec;
+                    if (progress > 1.0) progress = 1.0;
+                }
+                int fill_w = (int)(progress_bar_w * progress);
+                if (fill_w > 0) {
+                    ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                  progress_bar_x, progress_bar_y, fill_w, progress_bar_h,
+                                  THEME_VU_MID);
+                }
+
+                // Time display
+                int cur_min = (int)(vgm_info.current_time_sec / 60);
+                int cur_sec = (int)(vgm_info.current_time_sec) % 60;
+                int tot_min = (int)(vgm_info.total_time_sec / 60);
+                int tot_sec = (int)(vgm_info.total_time_sec) % 60;
+                snprintf(vgm_line, sizeof(vgm_line), "%d:%02d / %d:%02d", cur_min, cur_sec, tot_min, tot_sec);
+                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                        progress_bar_x + progress_bar_w + 8, progress_bar_y,
+                                        THEME_TEXT_SECONDARY, 1, vgm_line);
+
+                // Mono oscilloscope waveform visualization (L+R mixed)
+                vgm_y = progress_bar_y + progress_bar_h + 24;
+                int scope_w = CONTENT_WIDTH;
+                int scope_h = 140;  // Taller single scope
+                int scope_x = MARGIN_LEFT;
+                int scope_y = vgm_y;
+                int half_h = scope_h / 2;
+
+                ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                              scope_x, scope_y, scope_w, scope_h, THEME_VU_BG);
+
+                static int16_t wave_left[512];
+                static int16_t wave_right[512];
+                size_t wave_samples = 0;
+                if (vgm_player_get_waveform(wave_left, wave_right, 512, &wave_samples) == ESP_OK && wave_samples > 0) {
+                    int center_y = scope_y + half_h;
+                    int prev_y = center_y;
+
+                    // Find peak for auto-scaling
+                    int32_t peak = 1;
+                    for (size_t i = 0; i < wave_samples; i++) {
+                        int32_t mixed = ((int32_t)wave_left[i] + (int32_t)wave_right[i]) / 2;
+                        int32_t abs_val = (mixed < 0) ? -mixed : mixed;
+                        if (abs_val > peak) peak = abs_val;
+                    }
+                    // Scale factor: map peak to 90% of half height
+                    int scale_height = (half_h * 9) / 10;
+
+                    for (size_t i = 0; i < wave_samples && i < (size_t)scope_w; i++) {
+                        int x = scope_x + (int)(i * scope_w / wave_samples);
+                        // Mix L+R for mono display
+                        int32_t mixed = ((int32_t)wave_left[i] + (int32_t)wave_right[i]) / 2;
+                        // Auto-scale based on peak
+                        int y_offset = (int)((mixed * scale_height) / peak);
+                        int y = center_y - y_offset;
+                        if (y < scope_y) y = scope_y;
+                        if (y >= scope_y + scope_h) y = scope_y + scope_h - 1;
+                        if (i > 0) {
+                            int y1 = (prev_y < y) ? prev_y : y;
+                            int y2 = (prev_y > y) ? prev_y : y;
+                            ui_draw_vline(CURRENT_FB, FB_WIDTH, FB_HEIGHT, x, y1, y2 - y1 + 1, THEME_VU_LOW);
+                        }
+                        prev_y = y;
+                    }
+
+                    // Center line
+                    ui_draw_hline(CURRENT_FB, FB_WIDTH, FB_HEIGHT, scope_x, center_y, scope_w, THEME_TEXT_MUTED);
+                } else {
+                    // No data - just draw center line
+                    ui_draw_hline(CURRENT_FB, FB_WIDTH, FB_HEIGHT, scope_x, scope_y + half_h, scope_w, THEME_TEXT_MUTED);
+                }
+
+                vgm_y = scope_y + scope_h + 8;
+
+                if (vgm_info.has_loop) {
+                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                                            MARGIN_LEFT, vgm_y, THEME_TEXT_MUTED, 1, "(Looping track)");
+                    vgm_y += line_spacing;
+                }
+
+                // Footer hint bar
+                const int vgm_hint_h = 20;
+                int vgm_hint_y = FB_HEIGHT - MARGIN_BOTTOM - vgm_hint_h;
+                ppa_fill_rect(CURRENT_FB, FB_WIDTH, FB_HEIGHT,
+                              0, vgm_hint_y, FB_WIDTH, vgm_hint_h, THEME_BG_PRIMARY);
+
+                int vgm_icon_w = 16, vgm_icon_h = 16;
+                if (fkey_icon_available(6)) fkey_icon_get_size(6, &vgm_icon_w, &vgm_icon_h);
+                int vgm_gap = 20;
+                int vgm_total = (vgm_icon_w + 4 + FONT_WIDTH * 4 + vgm_gap) +  // F6 Exit
+                                (FONT_WIDTH * 6 + vgm_gap) +                   // arrows Vol
+                                (FONT_WIDTH * 8);                              // space Pause
+                int vgm_hx = (FB_WIDTH - vgm_total) / 2;
+                int vgm_icon_y_pos = vgm_hint_y + (vgm_hint_h - vgm_icon_h) / 2;
+                int vgm_text_y = vgm_hint_y + (vgm_hint_h - FONT_HEIGHT) / 2 + 1;
+
+                if (fkey_icon_available(6)) {
+                    fkey_icon_draw(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_icon_y_pos, 6, 1);
+                    vgm_hx += vgm_icon_w + 4;
+                } else {
+                    font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "F6");
+                    vgm_hx += FONT_WIDTH * 2 + 4;
+                }
+                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "Exit");
+                vgm_hx += FONT_WIDTH * 4 + vgm_gap;
+
+                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, "\x80\x81 Vol");
+                vgm_hx += FONT_WIDTH * 6 + vgm_gap;
+
+                const char *vgm_pause = vgm_player_is_paused() ? "\x85 Resume" : "\x85 Pause";
+                font_draw_string_scaled(CURRENT_FB, FB_WIDTH, FB_HEIGHT, vgm_hx, vgm_text_y, THEME_TEXT_MUTED, 1, vgm_pause);
+
+                PROFILING_END(render, render);
+                did_render = true;
+            }
+#endif
         }
-        
+
         // Only call blit() if we actually rendered something this frame
         // This prevents unnecessary rotation and display updates when nothing has changed
         if (did_render) {

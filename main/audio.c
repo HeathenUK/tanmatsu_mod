@@ -29,6 +29,8 @@ static i2s_chan_handle_t i2s_handle = NULL;
 static bool audio_initialized = false;
 static bool amplifier_enabled = false;
 static uint8_t current_volume = 100;  // 0-100%
+static audio_output_owner_t audio_owner = AUDIO_OUTPUT_OWNER_NONE;
+static portMUX_TYPE audio_owner_lock = portMUX_INITIALIZER_UNLOCKED;
 
 esp_err_t audio_init(void) {
     if (audio_initialized) {
@@ -44,11 +46,12 @@ esp_err_t audio_init(void) {
     
     // Get the I2S handle from BSP (must be done before disabling channel)
     bsp_audio_get_i2s_handle(&i2s_handle);
-    
+
     if (i2s_handle == NULL) {
         ESP_LOGE(TAG, "Failed to get I2S handle from BSP");
         return ESP_ERR_INVALID_STATE;
     }
+    ESP_LOGI(TAG, "Got I2S handle from BSP: %p", (void *)i2s_handle);
     
     // Set the actual sample rate (bsp_audio_initialize hardcodes 44100, ignore rate param)
     // Note: I2S channel must be disabled before reconfiguring the clock
@@ -64,6 +67,7 @@ esp_err_t audio_init(void) {
         ESP_LOGE(TAG, "Failed to re-enable I2S channel after rate change: %s", esp_err_to_name(enable_ret));
         return enable_ret;
     }
+    ESP_LOGI(TAG, "I2S channel enabled successfully, handle=%p", (void *)i2s_handle);
 
     // Enable amplifier (required for sound output)
     bsp_audio_set_amplifier(true);
@@ -84,6 +88,14 @@ esp_err_t audio_init(void) {
         volume_percent = 70.0f;
     }
     current_volume = (uint8_t)volume_percent;
+
+    // Actually SET the volume on the codec (critical - codec may start at 0!)
+    esp_err_t set_vol_ret = bsp_audio_set_volume(volume_percent);
+    if (set_vol_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set initial volume: %s", esp_err_to_name(set_vol_ret));
+    } else {
+        ESP_LOGI(TAG, "Initial volume set to %.0f%%", volume_percent);
+    }
 
     // Get ES8156 handle for diagnostics and optimization
     // Commented out - using BSP functions instead
@@ -174,6 +186,8 @@ esp_err_t audio_beep(uint32_t duration_ms) {
 }
 
 esp_err_t audio_stop(void) {
+    ESP_LOGW(TAG, "audio_stop() called! handle=%p", (void *)i2s_handle);
+
     if (!audio_initialized || i2s_handle == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -201,6 +215,56 @@ esp_err_t audio_stop(void) {
     i2s_channel_disable(i2s_handle);
 
     return ESP_OK;
+}
+
+esp_err_t audio_set_sample_rate(uint32_t rate) {
+    if (!audio_initialized || i2s_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // I2S channel must be disabled before reconfiguring the clock
+    i2s_channel_disable(i2s_handle);
+    esp_err_t ret = bsp_audio_set_rate(rate);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set audio sample rate to %u Hz: %s", rate, esp_err_to_name(ret));
+        return ret;
+    }
+    return i2s_channel_enable(i2s_handle);
+}
+
+bool audio_output_acquire(audio_output_owner_t owner) {
+    bool acquired = false;
+    taskENTER_CRITICAL(&audio_owner_lock);
+    if (audio_owner == AUDIO_OUTPUT_OWNER_NONE || audio_owner == owner) {
+        audio_owner = owner;
+        acquired = true;
+    }
+    taskEXIT_CRITICAL(&audio_owner_lock);
+    return acquired;
+}
+
+void audio_output_release(audio_output_owner_t owner) {
+    taskENTER_CRITICAL(&audio_owner_lock);
+    if (audio_owner == owner) {
+        audio_owner = AUDIO_OUTPUT_OWNER_NONE;
+    }
+    taskEXIT_CRITICAL(&audio_owner_lock);
+}
+
+bool audio_output_is_owner(audio_output_owner_t owner) {
+    bool is_owner = false;
+    taskENTER_CRITICAL(&audio_owner_lock);
+    is_owner = (audio_owner == owner);
+    taskEXIT_CRITICAL(&audio_owner_lock);
+    return is_owner;
+}
+
+audio_output_owner_t audio_output_get_owner(void) {
+    audio_output_owner_t owner;
+    taskENTER_CRITICAL(&audio_owner_lock);
+    owner = audio_owner;
+    taskEXIT_CRITICAL(&audio_owner_lock);
+    return owner;
 }
 
 esp_err_t audio_set_volume(float volume) {
@@ -261,9 +325,12 @@ esp_err_t audio_get_volume(float *volume) {
 
 esp_err_t audio_get_i2s_handle(void **handle) {
     if (!audio_initialized || i2s_handle == NULL) {
+        ESP_LOGE(TAG, "audio_get_i2s_handle: not ready (initialized=%d, handle=%p)",
+                 audio_initialized, (void *)i2s_handle);
         return ESP_ERR_INVALID_STATE;
     }
     *handle = (void *)i2s_handle;
+    ESP_LOGI(TAG, "audio_get_i2s_handle: returning %p", (void *)i2s_handle);
     return ESP_OK;
 }
 

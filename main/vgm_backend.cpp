@@ -8,6 +8,7 @@
 #include "esp_heap_caps.h"
 #include <cstring>
 #include <cstdlib>
+#include <new>
 
 // libvgm includes
 #include "playera.hpp"
@@ -23,6 +24,10 @@ extern "C" {
 }
 
 static const char *TAG = "vgm_backend";
+
+static bool vgm_device_has_core(const DEV_DECL *decl) {
+    return decl && decl->cores[0];
+}
 
 // VGM backend context structure
 struct vgm_backend {
@@ -155,19 +160,36 @@ vgm_backend_t *vgm_backend_create(void) {
         return NULL;
     }
 
-    // Create PlayerA instance
-    ctx->player = new (std::nothrow) PlayerA();
+    // Create PlayerA instance in PSRAM
+    void *player_mem = heap_caps_malloc(sizeof(PlayerA), MALLOC_CAP_SPIRAM);
+    if (!player_mem) {
+        ESP_LOGE(TAG, "Failed to allocate PlayerA in PSRAM");
+        heap_caps_free(ctx);
+        return NULL;
+    }
+    ctx->player = new (player_mem) PlayerA();
     if (!ctx->player) {
         ESP_LOGE(TAG, "Failed to create PlayerA");
+        heap_caps_free(player_mem);
         heap_caps_free(ctx);
         return NULL;
     }
 
     // Create VGMPlayer instance and register it
-    ctx->vgmPlayer = new (std::nothrow) VGMPlayer();
+    void *vgmplayer_mem = heap_caps_malloc(sizeof(VGMPlayer), MALLOC_CAP_SPIRAM);
+    if (!vgmplayer_mem) {
+        ESP_LOGE(TAG, "Failed to allocate VGMPlayer in PSRAM");
+        ctx->player->~PlayerA();
+        heap_caps_free(ctx->player);
+        heap_caps_free(ctx);
+        return NULL;
+    }
+    ctx->vgmPlayer = new (vgmplayer_mem) VGMPlayer();
     if (!ctx->vgmPlayer) {
         ESP_LOGE(TAG, "Failed to create VGMPlayer");
-        delete ctx->player;
+        heap_caps_free(vgmplayer_mem);
+        ctx->player->~PlayerA();
+        heap_caps_free(ctx->player);
         heap_caps_free(ctx);
         return NULL;
     }
@@ -177,7 +199,7 @@ vgm_backend_t *vgm_backend_create(void) {
     // Default settings
     ctx->loopCount = 2;  // Play twice (1 loop)
     ctx->fadeSamples = 44100 * 3;  // 3 second fade
-    ctx->sampleRate = VGM_NATIVE_SAMPLE_RATE;
+    ctx->sampleRate = VGM_PLAYBACK_SAMPLE_RATE;
 
     ESP_LOGI(TAG, "VGM backend created");
     return ctx;
@@ -190,10 +212,12 @@ void vgm_backend_free(vgm_backend_t *ctx) {
 
     if (ctx->player) {
         ctx->player->UnregisterAllPlayers();
-        delete ctx->player;
+        ctx->player->~PlayerA();
+        heap_caps_free(ctx->player);
     }
     if (ctx->vgmPlayer) {
-        delete ctx->vgmPlayer;
+        ctx->vgmPlayer->~VGMPlayer();
+        heap_caps_free(ctx->vgmPlayer);
     }
 
     heap_caps_free(ctx);
@@ -269,6 +293,38 @@ esp_err_t vgm_backend_load(vgm_backend_t *ctx, const uint8_t *data, size_t size)
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Reject files that reference devices without a built core
+    {
+        std::vector<PLR_DEV_INFO> devInfoList;
+        bool unsupported = false;
+        if (ctx->vgmPlayer->GetSongDeviceInfo(devInfoList) == 0) {
+            for (const auto &devInfo : devInfoList) {
+                if (!vgm_device_has_core(devInfo.devDecl)) {
+                    ESP_LOGE(TAG, "Unsupported VGM device: type=0x%02x (no core built)",
+                             devInfo.type);
+                    unsupported = true;
+                }
+                for (const auto &linkDev : devInfo.devLink) {
+                    if (!vgm_device_has_core(linkDev.devDecl)) {
+                        ESP_LOGE(TAG, "Unsupported linked device: type=0x%02x (no core built)",
+                                 linkDev.type);
+                        unsupported = true;
+                    }
+                }
+            }
+        }
+        if (unsupported) {
+            ctx->player->UnloadFile();
+            DataLoader_Deinit(ctx->dataLoader);
+            ctx->dataLoader = NULL;
+            if (ctx->vgmData) {
+                heap_caps_free(ctx->vgmData);
+                ctx->vgmData = NULL;
+            }
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+    }
+
     ctx->loaded = true;
 
     // Get file info
@@ -313,8 +369,9 @@ esp_err_t vgm_backend_start(vgm_backend_t *ctx, uint32_t sample_rate) {
 
     ctx->sampleRate = sample_rate;
 
-    // Configure output: stereo 16-bit
-    UINT8 ret = ctx->player->SetOutputSettings(sample_rate, 2, 16, 0);
+    // Configure output: stereo 16-bit, 4096 sample buffer
+    // The 4th parameter is the internal sample buffer length - must be > 0!
+    UINT8 ret = ctx->player->SetOutputSettings(sample_rate, 2, 16, 4096);
     if (ret != 0) {
         ESP_LOGE(TAG, "SetOutputSettings failed: %d", ret);
         return ESP_FAIL;
@@ -366,7 +423,17 @@ uint32_t vgm_backend_render(vgm_backend_t *ctx, int16_t *buffer, uint32_t num_sa
     UINT32 rendered = ctx->player->Render(num_samples * 4, buffer);
 
     // Convert from bytes to sample frames
-    return rendered / 4;
+    uint32_t sample_frames = rendered / 4;
+
+    // Attenuate output slightly (-6dB) to reduce clipping risk
+    for (uint32_t i = 0; i < sample_frames * 2; i++) {
+        int32_t sample = ((int32_t)buffer[i]) >> 1;
+        if (sample > 32767) sample = 32767;
+        else if (sample < -32768) sample = -32768;
+        buffer[i] = (int16_t)sample;
+    }
+
+    return sample_frames;
 }
 
 esp_err_t vgm_backend_get_tags(vgm_backend_t *ctx, vgm_tags_t *tags) {
@@ -438,6 +505,18 @@ esp_err_t vgm_backend_get_info(vgm_backend_t *ctx, vgm_playback_info_t *info) {
         if (info->has_loop) {
             info->loop_time_sec = ctx->vgmPlayer->Tick2Second(songInfo.loopTick);
         }
+    } else {
+        ESP_LOGW(TAG, "GetSongInfo failed; falling back to device list");
+    }
+
+    {
+        std::vector<PLR_DEV_INFO> devInfoList;
+        UINT8 devInfoRet = ctx->vgmPlayer->GetSongDeviceInfo(devInfoList);
+        if (devInfoRet == 0x00 || devInfoRet == 0x01) {
+            if (!devInfoList.empty()) {
+                info->num_chips = (uint8_t)devInfoList.size();
+            }
+        }
     }
 
     if (ctx->playing) {
@@ -453,7 +532,8 @@ esp_err_t vgm_backend_get_chip_info(vgm_backend_t *ctx, uint8_t index, vgm_chip_
     if (!ctx || !chip_info || !ctx->loaded) return ESP_ERR_INVALID_ARG;
 
     std::vector<PLR_DEV_INFO> devInfoList;
-    if (ctx->vgmPlayer->GetSongDeviceInfo(devInfoList) != 0) {
+    UINT8 devInfoRet = ctx->vgmPlayer->GetSongDeviceInfo(devInfoList);
+    if (devInfoRet != 0x00 && devInfoRet != 0x01) {
         return ESP_FAIL;
     }
 

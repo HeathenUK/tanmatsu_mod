@@ -14,6 +14,7 @@ static const char TAG[] __attribute__((unused)) = "ui_input";
 esp_err_t ui_input_handle_event(const bsp_input_event_t *event,
                                  input_handler_context_t *ctx,
                                  input_action_result_t *result) {
+    static int input_log_count = 0;
     if (!event || !ctx || !result) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -24,6 +25,10 @@ esp_err_t ui_input_handle_event(const bsp_input_event_t *event,
 
     switch (event->type) {
         case INPUT_EVENT_TYPE_NAVIGATION:
+            if (input_log_count < 20) {
+                ESP_LOGI(TAG, "NAV event: key=%d state=%d", event->args_navigation.key, event->args_navigation.state);
+                input_log_count++;
+            }
             if (event->args_navigation.state) {  // Only process key press (not release)
                 return ui_input_handle_navigation(event->args_navigation.key, ctx, result);
             }
@@ -38,6 +43,12 @@ esp_err_t ui_input_handle_event(const bsp_input_event_t *event,
             break;
 
         case INPUT_EVENT_TYPE_SCANCODE:
+            if (input_log_count < 40) {
+                ESP_LOGI(TAG, "SCANCODE event: 0x%02X", event->args_scancode.scancode);
+                input_log_count++;
+            } else if (event->args_scancode.scancode == 0x40) {
+                ESP_LOGI(TAG, "SCANCODE event: 0x40 (F6)");
+            }
             return ui_input_handle_scancode(event->args_scancode.scancode, ctx, result);
 
         default:
@@ -105,10 +116,13 @@ esp_err_t ui_input_handle_navigation(bsp_input_navigation_key_t key,
                 break;
         }
     }
-    // Volume control during playback
+    // Volume control / navigation during playback
     else if (ctx->playing) {
         float new_vol = ctx->current_volume;
-        if (key == BSP_INPUT_NAVIGATION_KEY_UP) {
+        if (key == BSP_INPUT_NAVIGATION_KEY_LEFT) {
+            // Treat LEFT as "back" during playback
+            result->action = INPUT_ACTION_RETURN_TO_BROWSER;
+        } else if (key == BSP_INPUT_NAVIGATION_KEY_UP) {
             new_vol += 0.04f;  // 5% display step
             if (new_vol > 1.00f) new_vol = 1.00f;  // Cap at 100%
             result->action = INPUT_ACTION_SET_VOLUME;

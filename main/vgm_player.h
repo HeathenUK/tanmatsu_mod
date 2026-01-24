@@ -137,6 +137,20 @@ void vgm_player_set_loop_count(uint32_t loops);
  */
 void vgm_player_set_fade_time(uint32_t fade_ms);
 
+/**
+ * @brief Get waveform data for visualization
+ *
+ * Returns the most recent audio samples for oscilloscope display.
+ * Data is decimated from the render buffer to fit the requested size.
+ *
+ * @param left Output buffer for left channel samples
+ * @param right Output buffer for right channel samples
+ * @param max_samples Maximum samples to return (size of output buffers)
+ * @param out_samples Actual number of samples written
+ * @return ESP_OK on success, ESP_ERR_NOT_FOUND if no data available
+ */
+esp_err_t vgm_player_get_waveform(int16_t *left, int16_t *right, size_t max_samples, size_t *out_samples);
+
 #ifdef __cplusplus
 }
 #endif
