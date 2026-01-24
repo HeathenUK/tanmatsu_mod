@@ -5,7 +5,7 @@ set(MOD_BACKEND_DEFINE "MOD_BACKEND_XMP=1")
 message(STATUS "MOD backend: libxmp")
 
 set(VGM_SRCS "vgm_player.c" "vgm_backend.cpp")
-set(VGM_REQUIRES libvgm)
+set(VGM_REQUIRES libvgm_wrapper)
 message(STATUS "VGM playback: enabled")
 
 idf_component_register(
@@ -34,7 +34,7 @@ idf_component_register(
 		badge-bsp
 		tanmatsu-wifi
 		libxmp
-		libvgm
+		libvgm_wrapper
 		esp_driver_sdmmc
 		esp_driver_ppa
 		esp-dsp
