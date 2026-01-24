@@ -1,0 +1,14 @@
+[scheme:libvgm_extram_bss]
+entries:
+    bss -> extern_ram
+    common -> extern_ram
+
+[mapping:libvgm_extram_bss]
+archive: liblibvgm_wrapper.a
+entries:
+    emu2413 (libvgm_extram_bss)
+    fmopl (libvgm_extram_bss)
+    fmopn (libvgm_extram_bss)
+    ym2151 (libvgm_extram_bss)
+    ym2612 (libvgm_extram_bss)
+    ymf262 (libvgm_extram_bss)
