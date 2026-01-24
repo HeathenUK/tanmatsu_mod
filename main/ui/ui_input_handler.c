@@ -7,6 +7,7 @@
 #include "file_browser.h"
 #include "app_state.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -17,6 +18,7 @@ esp_err_t ui_input_handle_event(const bsp_input_event_t *event,
                                  input_handler_context_t *ctx,
                                  input_action_result_t *result) {
     static int input_log_count = 0;
+    static int64_t last_backlight_toggle_us = 0;
     if (!event || !ctx || !result) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -71,7 +73,16 @@ esp_err_t ui_input_handle_event(const bsp_input_event_t *event,
             } else if (event->args_scancode.scancode == 0x40) {
                 ESP_LOGI(TAG, "SCANCODE event: 0x40 (F6)");
             }
-            return ui_input_handle_scancode(event->args_scancode.scancode, ctx, result);
+            if (ui_input_handle_scancode(event->args_scancode.scancode, ctx, result) == ESP_OK &&
+                result->action == INPUT_ACTION_TOGGLE_BACKLIGHT) {
+                int64_t now_us = esp_timer_get_time();
+                if (now_us - last_backlight_toggle_us < 200000) {
+                    result->action = INPUT_ACTION_NONE;
+                    return ESP_OK;
+                }
+                last_backlight_toggle_us = now_us;
+            }
+            return ESP_OK;
 
         default:
             break;
@@ -170,9 +181,15 @@ esp_err_t ui_input_handle_scancode(bsp_input_scancode_t scancode,
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Handle F1 key (0x3B) for backlight toggle during playback
-    if (scancode == 0x3B && !(*ctx->browser_active)) {
-        result->action = INPUT_ACTION_TOGGLE_BACKLIGHT;
+    // Ignore break (key release) scancodes
+    if (scancode & 0x80) {
+        result->action = INPUT_ACTION_NONE;
+        return ESP_OK;
+    }
+
+    // F1 is handled via navigation events to avoid double-trigger with scancodes
+    if (scancode == 0x3B) {
+        result->action = INPUT_ACTION_NONE;
         return ESP_OK;
     }
     // Handle F6 key (0x40) for exit

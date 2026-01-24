@@ -183,6 +183,7 @@ void app_main(void) {
     uint8_t backlight_current = backlight_full;
     uint8_t keyboard_current = keyboard_full;
     bool backlight_forced_off = false;
+    int64_t backlight_restore_block_until_us = 0;
     int64_t last_input_us = esp_timer_get_time();
     bsp_display_set_backlight_brightness(backlight_full);
     bsp_input_set_backlight_brightness(keyboard_full);
@@ -381,6 +382,13 @@ void app_main(void) {
                 is_press = event.args_navigation.state != 0;
             } else if (event.type == INPUT_EVENT_TYPE_ACTION) {
                 is_press = event.args_action.state != 0;
+            } else if (event.type == INPUT_EVENT_TYPE_SCANCODE) {
+                // Treat break codes as releases; ignore F1 scancode for wake/restore.
+                if (event.args_scancode.scancode & 0x80) {
+                    is_press = false;
+                } else if (event.args_scancode.scancode == 0x3B) {
+                    is_press = false;
+                }
             }
             if (is_press) {
                 last_input_us = esp_timer_get_time();
@@ -390,15 +398,20 @@ void app_main(void) {
             // Process input event
             if (ui_input_handle_event(&event, &input_ctx, &action_result) == ESP_OK) {
                 if (is_press && action_result.action != INPUT_ACTION_TOGGLE_BACKLIGHT) {
-                    if (backlight_forced_off || backlight_current != backlight_full) {
-                        bsp_display_set_backlight_brightness(backlight_full);
-                        backlight_current = backlight_full;
+                    int64_t now_us = esp_timer_get_time();
+                    if (backlight_forced_off && now_us < backlight_restore_block_until_us) {
+                        // Ignore input right after toggling off (multiple events from same key press).
+                    } else {
+                        if (backlight_forced_off || backlight_current != backlight_full) {
+                            bsp_display_set_backlight_brightness(backlight_full);
+                            backlight_current = backlight_full;
+                        }
+                        if (backlight_forced_off || keyboard_current != keyboard_full) {
+                            bsp_input_set_backlight_brightness(keyboard_full);
+                            keyboard_current = keyboard_full;
+                        }
+                        backlight_forced_off = false;
                     }
-                    if (backlight_forced_off || keyboard_current != keyboard_full) {
-                        bsp_input_set_backlight_brightness(keyboard_full);
-                        keyboard_current = keyboard_full;
-                    }
-                    backlight_forced_off = false;
                 }
                 // Execute action based on result
                 switch (action_result.action) {
@@ -617,11 +630,22 @@ void app_main(void) {
                         break;
                         
                     case INPUT_ACTION_TOGGLE_BACKLIGHT:
-                        backlight_forced_off = true;
-                        bsp_display_set_backlight_brightness(0);
-                        bsp_input_set_backlight_brightness(0);
-                        backlight_current = 0;
-                        keyboard_current = 0;
+                        if (backlight_forced_off || backlight_current == 0 || keyboard_current == 0) {
+                            ESP_LOGI(TAG, "Backlight toggle: restoring (display=%u, keyboard=%u)", backlight_full, keyboard_full);
+                            backlight_forced_off = false;
+                            bsp_display_set_backlight_brightness(backlight_full);
+                            bsp_input_set_backlight_brightness(keyboard_full);
+                            backlight_current = backlight_full;
+                            keyboard_current = keyboard_full;
+                        } else {
+                            backlight_restore_block_until_us = esp_timer_get_time() + 300000;  // 300ms
+                            ESP_LOGI(TAG, "Backlight toggle: turning off");
+                            backlight_forced_off = true;
+                            bsp_display_set_backlight_brightness(0);
+                            bsp_input_set_backlight_brightness(0);
+                            backlight_current = 0;
+                            keyboard_current = 0;
+                        }
                         break;
                         
                     case INPUT_ACTION_NONE:

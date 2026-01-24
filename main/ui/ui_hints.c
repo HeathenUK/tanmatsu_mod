@@ -24,21 +24,42 @@ void ui_draw_hint_bar(uint16_t *fb,
 
     hw_accel_fill_rect(fb, fb_width, fb_height, 0, y, fb_width, height, bg_color);
 
-    int total_width = 0;
+    ui_hint_item_t ordered[item_count];
+    int ordered_count = 0;
+    // Insert F-key items sorted by fkey (F1..F6), stable for equal keys.
     for (int i = 0; i < item_count; i++) {
+        if (items[i].fkey > 0) {
+            int pos = ordered_count;
+            while (pos > 0 && ordered[pos - 1].fkey > items[i].fkey) {
+                ordered[pos] = ordered[pos - 1];
+                pos--;
+            }
+            ordered[pos] = items[i];
+            ordered_count++;
+        }
+    }
+    // Append non-F-key items in original order.
+    for (int i = 0; i < item_count; i++) {
+        if (items[i].fkey <= 0) {
+            ordered[ordered_count++] = items[i];
+        }
+    }
+
+    int total_width = 0;
+    for (int i = 0; i < ordered_count; i++) {
         int icon_w = 0;
-        if (items[i].fkey > 0 && fkey_icon_available(items[i].fkey)) {
+        if (ordered[i].fkey > 0 && fkey_icon_available(ordered[i].fkey)) {
             int icon_h = 0;
-            fkey_icon_get_size(items[i].fkey, &icon_w, &icon_h);
+            fkey_icon_get_size(ordered[i].fkey, &icon_w, &icon_h);
             total_width += icon_w;
-            if (items[i].label && items[i].label[0]) {
+            if (ordered[i].label && ordered[i].label[0]) {
                 total_width += 4;
             }
         }
-        if (items[i].label && items[i].label[0]) {
-            total_width += (int)strlen(items[i].label) * FONT_WIDTH;
+        if (ordered[i].label && ordered[i].label[0]) {
+            total_width += (int)strlen(ordered[i].label) * FONT_WIDTH;
         }
-        if (i < item_count - 1) {
+        if (i < ordered_count - 1) {
             total_width += gap;
         }
     }
@@ -46,23 +67,23 @@ void ui_draw_hint_bar(uint16_t *fb,
     int x = (fb_width - total_width) / 2;
     int text_y = y + (height - FONT_HEIGHT) / 2 + 1;
 
-    for (int i = 0; i < item_count; i++) {
-        if (items[i].fkey > 0 && fkey_icon_available(items[i].fkey)) {
+    for (int i = 0; i < ordered_count; i++) {
+        if (ordered[i].fkey > 0 && fkey_icon_available(ordered[i].fkey)) {
             int icon_w = 0;
             int icon_h = 0;
-            fkey_icon_get_size(items[i].fkey, &icon_w, &icon_h);
+            fkey_icon_get_size(ordered[i].fkey, &icon_w, &icon_h);
             int icon_y = y + (height - icon_h) / 2;
-            fkey_icon_draw(fb, fb_width, fb_height, x, icon_y, items[i].fkey, 1);
+            fkey_icon_draw(fb, fb_width, fb_height, x, icon_y, ordered[i].fkey, 1);
             x += icon_w;
-            if (items[i].label && items[i].label[0]) {
+            if (ordered[i].label && ordered[i].label[0]) {
                 x += 4;
             }
         }
-        if (items[i].label && items[i].label[0]) {
-            font_draw_string_scaled(fb, fb_width, fb_height, x, text_y, text_color, 1, items[i].label);
-            x += (int)strlen(items[i].label) * FONT_WIDTH;
+        if (ordered[i].label && ordered[i].label[0]) {
+            font_draw_string_scaled(fb, fb_width, fb_height, x, text_y, text_color, 1, ordered[i].label);
+            x += (int)strlen(ordered[i].label) * FONT_WIDTH;
         }
-        if (i < item_count - 1) {
+        if (i < ordered_count - 1) {
             x += gap;
         }
     }
