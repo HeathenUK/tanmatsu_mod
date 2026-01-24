@@ -658,6 +658,15 @@ void app_main(void) {
         // Render file browser if needed (input handlers set needs_render flag)
         // Also render on first loop if browser is active but hasn't been rendered yet
         static bool browser_rendered = false;
+        static bool last_indexing = false;
+        if (state->browser_active) {
+            if (last_indexing != state->browser.search_cache_building) {
+                needs_render = true;
+                last_indexing = state->browser.search_cache_building;
+            }
+        } else if (last_indexing) {
+            last_indexing = false;
+        }
         if (state->browser_active && (needs_render || !browser_rendered)) {
             draw_file_browser(&state->browser);
             if (state->volume_osd_ticks > 0) {
