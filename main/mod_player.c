@@ -351,6 +351,12 @@ esp_err_t mod_player_start(void) {
             return rate_ret;
         }
         // audio_set_sample_rate() already re-enabled the channel
+        // Reset DMA state and preload silence to avoid replaying old buffers
+        i2s_channel_disable(i2s_handle);
+        memset(stereo_buffer, 0, sizeof(stereo_buffer));
+        size_t bytes_loaded = 0;
+        i2s_channel_preload_data(i2s_handle, stereo_buffer, sizeof(stereo_buffer), &bytes_loaded);
+        i2s_channel_enable(i2s_handle);
     }
 
     // Start player with configured format
@@ -416,6 +422,8 @@ esp_err_t mod_player_stop(void) {
             size_t bytes_written = 0;
             i2s_channel_write(i2s_handle, stereo_buffer, sizeof(stereo_buffer), &bytes_written, 0);
         }
+        // Stop DMA to prevent looping the last buffer when playback stops
+        i2s_channel_disable(i2s_handle);
     }
 
     audio_output_release(AUDIO_OUTPUT_OWNER_MOD);

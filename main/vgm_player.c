@@ -376,6 +376,16 @@ esp_err_t vgm_player_start(void) {
             return rate_ret;
         }
         // audio_set_sample_rate() already re-enabled the channel
+        // Reset DMA state and preload silence to avoid replaying old buffers
+        i2s_channel_disable(i2s_handle);
+        if (vgm_dma_buffer) {
+            memset(vgm_dma_buffer, 0, VGM_DMA_CHUNK_SAMPLES * 2 * sizeof(int16_t));
+            size_t bytes_loaded = 0;
+            i2s_channel_preload_data(i2s_handle, vgm_dma_buffer,
+                                     VGM_DMA_CHUNK_SAMPLES * 2 * sizeof(int16_t),
+                                     &bytes_loaded);
+        }
+        i2s_channel_enable(i2s_handle);
     } else {
         ESP_LOGE(TAG, "i2s_handle is NULL!");
         return ESP_ERR_INVALID_STATE;

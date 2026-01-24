@@ -4,7 +4,7 @@ entries:
     common -> extern_ram
 
 [mapping:libvgm_extram_bss]
-archive: liblibvgm.a
+archive: liblibvgm_wrapper.a
 entries:
     emu2413 (libvgm_extram_bss)
     fmopl (libvgm_extram_bss)
