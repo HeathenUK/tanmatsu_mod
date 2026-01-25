@@ -43,9 +43,9 @@ static StaticTask_t *mod_task_tcb = NULL;
 #define MOD_BUFFER_SAMPLES MOD_CONFIG_BUFFER_SAMPLES
 #define MOD_BUFFER_SIZE (MOD_BUFFER_SAMPLES * 2 * sizeof(int16_t))  // Stereo 16-bit
 
-// Audio buffers - mono can live in PSRAM, stereo stays in internal SRAM for DMA
-static int16_t *mono_buffer = NULL;  // PSRAM
-static DRAM_ATTR int16_t stereo_buffer[MOD_BUFFER_SAMPLES * 2] = {0};
+// Audio buffers - render in PSRAM, DMA buffer in internal SRAM
+static int16_t *render_buffer = NULL;  // PSRAM, stereo interleaved
+static DRAM_ATTR int16_t dma_buffer[MOD_BUFFER_SAMPLES * 2] = {0};  // Internal SRAM for DMA
 
 // Task-local state that needs to be reset for each new song
 static volatile bool mod_task_first_fill = true;
@@ -76,62 +76,38 @@ static void mod_playback_task(void *arg) {
                 // Re-check mod_playing and mod_paused after acquiring mutex (stop() may have set it false while we waited)
                 int rc = -1;
                 if (mod_playing && !mod_paused) {
-                    // Render MOD audio (format from config, 16-bit)
-                    // mod_backend_play_buffer expects buffer size in bytes (samples * sizeof(int16_t))
-                    rc = mod_backend_play_buffer(mod_ctx, mono_buffer, MOD_BUFFER_SAMPLES * sizeof(int16_t), MOD_CONFIG_DEFAULT_LOOP);
+                    // Render MOD audio in stereo (interleaved L/R pairs)
+                    // Buffer size is stereo samples * 2 channels * sizeof(int16_t)
+                    rc = mod_backend_play_buffer(mod_ctx, render_buffer, MOD_BUFFER_SAMPLES * 2 * sizeof(int16_t), MOD_CONFIG_DEFAULT_LOOP);
                 }
                 xSemaphoreGive(playback_mutex);
 
                 if (rc == 0) {
-                // First write after starting - logging commented out
-                // static bool first_write = true;
-                // if (first_write) {
-                //     ESP_LOGI(TAG, "First MOD audio buffer written to I2S");
-                //     // Check if buffer actually contains audio data (not all zeros)
-                //     int16_t max_sample = 0;
-                //     int16_t min_sample = 0;
-                //     for (int i = 0; i < MOD_BUFFER_SAMPLES; i++) {
-                //         if (mono_buffer[i] > max_sample) max_sample = mono_buffer[i];
-                //         if (mono_buffer[i] < min_sample) min_sample = mono_buffer[i];
-                //     }
-                //     ESP_LOGI(TAG, "First buffer sample range: min=%d, max=%d", min_sample, max_sample);
-                //     first_write = false;
-                // }
-                
-                // Convert mono to stereo (duplicate L/R) - SIMD-optimized
-                // Match the beep's format: buffer[i * I2S_CHANNELS + 0] for L, +1 for R
-                // Use 32-bit words for mono (2 samples), 64-bit words for stereo (4 samples)
-                // Process 2 mono samples → 4 stereo samples per iteration (SIMD-friendly)
-                uint32_t *mono_words = (uint32_t *)mono_buffer;  // 2 int16_t samples per 32-bit word
-                uint64_t *stereo_words = (uint64_t *)stereo_buffer;  // 4 int16_t samples per 64-bit word
-                int word_pairs = MOD_BUFFER_SAMPLES / 2;  // Process 2 mono samples at a time (becomes 4 stereo samples)
-                
-                for (int i = 0; i < word_pairs; i++) {
-                    uint32_t mono_pair = mono_words[i];  // 2 int16_t samples (16 bits each = 32 bits total)
+                // Process stereo render buffer to DMA buffer
+                // Check output mode: stereo for headphones, mono (downmixed) for speakers
+                bool stereo_output = audio_is_stereo_output();
 
-                    // Extract samples and apply -6 dB attenuation for headroom
-                    int16_t s0 = audio_soft_clip(mod_attenuate_q15((int16_t)(mono_pair & 0xFFFF)));
-                    int16_t s1 = audio_soft_clip(mod_attenuate_q15((int16_t)((mono_pair >> 16) & 0xFFFF)));
-                    uint16_t sample0 = (uint16_t)s0;
-                    uint16_t sample1 = (uint16_t)s1;
+                if (stereo_output) {
+                    // Headphones: copy stereo with attenuation and soft clip
+                    for (int i = 0; i < MOD_BUFFER_SAMPLES; i++) {
+                        int16_t left = render_buffer[i * 2 + 0];
+                        int16_t right = render_buffer[i * 2 + 1];
+                        dma_buffer[i * 2 + 0] = audio_soft_clip(mod_attenuate_q15(left));
+                        dma_buffer[i * 2 + 1] = audio_soft_clip(mod_attenuate_q15(right));
+                    }
+                } else {
+                    // Speakers: downmix stereo to mono, then duplicate for I2S
+                    for (int i = 0; i < MOD_BUFFER_SAMPLES; i++) {
+                        int16_t left = render_buffer[i * 2 + 0];
+                        int16_t right = render_buffer[i * 2 + 1];
+                        // Downmix: average L+R (with headroom to prevent clipping)
+                        int32_t mono = ((int32_t)left + (int32_t)right) / 2;
+                        int16_t sample = audio_soft_clip(mod_attenuate_q15((int16_t)mono));
+                        dma_buffer[i * 2 + 0] = sample;
+                        dma_buffer[i * 2 + 1] = sample;
+                    }
+                }
 
-                    // Expand to stereo: L0,R0,L1,R1 (4 int16_t = 64 bits)
-                    // On little-endian, lower bits go to lower memory addresses
-                    // So bits 0-15 -> bytes 0-1, bits 16-31 -> bytes 2-3, etc.
-                    uint64_t stereo_word = ((uint64_t)sample1 << 48) | ((uint64_t)sample1 << 32) |  // L1,R1 (bytes 4-7)
-                                           ((uint64_t)sample0 << 16) | (uint64_t)sample0;            // L0,R0 (bytes 0-3)
-                    stereo_words[i] = stereo_word;
-                }
-                
-                // Handle remaining samples (0-1 sample)
-                int remainder = MOD_BUFFER_SAMPLES % 2;
-                if (remainder > 0) {
-                    int start_idx = word_pairs * 2;
-                    int16_t sample = audio_soft_clip(mod_attenuate_q15(mono_buffer[start_idx]));
-                    stereo_buffer[start_idx * 2 + 0] = sample;  // Left
-                    stereo_buffer[start_idx * 2 + 1] = sample;  // Right
-                }
-                
                 // Pre-fill I2S buffer with a few buffers to ensure continuous playback
                 // (I2S DMA might need multiple buffers to start output)
                 if (mod_task_first_fill) {
@@ -139,33 +115,42 @@ static void mod_playback_task(void *arg) {
                     // Write 4 buffers quickly to fill DMA buffer
                     for (int j = 0; j < 4; j++) {
                         size_t temp_written = 0;
-                        i2s_channel_write(i2s_handle, stereo_buffer, sizeof(stereo_buffer),
+                        i2s_channel_write(i2s_handle, dma_buffer, sizeof(dma_buffer),
                                          &temp_written, 0);  // Non-blocking for quick fill
-                        if (temp_written < sizeof(stereo_buffer)) {
+                        if (temp_written < sizeof(dma_buffer)) {
                             break;  // Buffer full, stop pre-filling
                         }
                         // Get next buffer from backend for pre-fill (with mutex protection)
                         int pre_rc = -1;
                         if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                             if (mod_playing) {
-                                pre_rc = mod_backend_play_buffer(mod_ctx, mono_buffer, MOD_BUFFER_SAMPLES * sizeof(int16_t), MOD_CONFIG_DEFAULT_LOOP);
+                                pre_rc = mod_backend_play_buffer(mod_ctx, render_buffer, MOD_BUFFER_SAMPLES * 2 * sizeof(int16_t), MOD_CONFIG_DEFAULT_LOOP);
                             }
                             xSemaphoreGive(playback_mutex);
                         }
                         if (pre_rc != 0) break;
-                        for (int i = 0; i < MOD_BUFFER_SAMPLES; i++) {
-                            int16_t s = audio_soft_clip(mod_attenuate_q15(mono_buffer[i]));
-                            stereo_buffer[i * 2 + 0] = s;
-                            stereo_buffer[i * 2 + 1] = s;
+                        // Process pre-fill buffer with same stereo/mono logic
+                        stereo_output = audio_is_stereo_output();
+                        if (stereo_output) {
+                            for (int i = 0; i < MOD_BUFFER_SAMPLES; i++) {
+                                dma_buffer[i * 2 + 0] = audio_soft_clip(mod_attenuate_q15(render_buffer[i * 2 + 0]));
+                                dma_buffer[i * 2 + 1] = audio_soft_clip(mod_attenuate_q15(render_buffer[i * 2 + 1]));
+                            }
+                        } else {
+                            for (int i = 0; i < MOD_BUFFER_SAMPLES; i++) {
+                                int32_t mono = ((int32_t)render_buffer[i * 2 + 0] + (int32_t)render_buffer[i * 2 + 1]) / 2;
+                                int16_t sample = audio_soft_clip(mod_attenuate_q15((int16_t)mono));
+                                dma_buffer[i * 2 + 0] = sample;
+                                dma_buffer[i * 2 + 1] = sample;
+                            }
                         }
                     }
-                    // ESP_LOGI(TAG, "I2S buffer pre-filled");
                 }
 
                 // Write to I2S (blocking, same as beep - ensures continuous playback)
                 // Channel is already enabled by audio_init(), no need to re-enable
-                esp_err_t write_ret = i2s_channel_write(i2s_handle, stereo_buffer,
-                                   sizeof(stereo_buffer),
+                esp_err_t write_ret = i2s_channel_write(i2s_handle, dma_buffer,
+                                   sizeof(dma_buffer),
                                    &bytes_written,
                                    portMAX_DELAY);  // Blocking to ensure continuous audio
 
@@ -193,8 +178,8 @@ static void mod_playback_task(void *arg) {
         } else {
             // Not playing, write silence to prevent audio glitches
             if (i2s_handle && audio_output_is_owner(AUDIO_OUTPUT_OWNER_MOD)) {
-                memset(stereo_buffer, 0, sizeof(stereo_buffer));
-                i2s_channel_write(i2s_handle, stereo_buffer, sizeof(stereo_buffer), &bytes_written, 0);  // Non-blocking
+                memset(dma_buffer, 0, sizeof(dma_buffer));
+                i2s_channel_write(i2s_handle, dma_buffer, sizeof(dma_buffer), &bytes_written, 0);  // Non-blocking
             }
             buffer_count = 0;
             // last_log_time = 0;  // Commented out - logging disabled
@@ -235,10 +220,10 @@ esp_err_t mod_player_init(uint32_t sample_rate_in) {
         return ESP_ERR_NO_MEM;
     }
 
-    // Allocate mono render buffer in PSRAM to save internal RAM
-    mono_buffer = (int16_t *)heap_caps_malloc(MOD_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    if (mono_buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate MOD mono buffer in PSRAM");
+    // Allocate stereo render buffer in PSRAM to save internal RAM
+    render_buffer = (int16_t *)heap_caps_malloc(MOD_BUFFER_SAMPLES * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (render_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate MOD render buffer in PSRAM");
         mod_backend_free(mod_ctx);
         mod_ctx = NULL;
         return ESP_ERR_NO_MEM;
@@ -249,8 +234,8 @@ esp_err_t mod_player_init(uint32_t sample_rate_in) {
     mod_task_stack = (StackType_t *)heap_caps_malloc(MOD_TASK_STACK_SIZE * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     if (mod_task_stack == NULL) {
         ESP_LOGE(TAG, "Failed to allocate task stack in PSRAM");
-        heap_caps_free(mono_buffer);
-        mono_buffer = NULL;
+        heap_caps_free(render_buffer);
+        render_buffer = NULL;
         mod_backend_free(mod_ctx);
         mod_ctx = NULL;
         return ESP_ERR_NO_MEM;
@@ -262,8 +247,8 @@ esp_err_t mod_player_init(uint32_t sample_rate_in) {
         ESP_LOGE(TAG, "Failed to allocate task TCB");
         heap_caps_free(mod_task_stack);
         mod_task_stack = NULL;
-        heap_caps_free(mono_buffer);
-        mono_buffer = NULL;
+        heap_caps_free(render_buffer);
+        render_buffer = NULL;
         mod_backend_free(mod_ctx);
         mod_ctx = NULL;
         return ESP_ERR_NO_MEM;
@@ -288,8 +273,8 @@ esp_err_t mod_player_init(uint32_t sample_rate_in) {
         mod_task_stack = NULL;
         vPortFree(mod_task_tcb);
         mod_task_tcb = NULL;
-        heap_caps_free(mono_buffer);
-        mono_buffer = NULL;
+        heap_caps_free(render_buffer);
+        render_buffer = NULL;
         mod_backend_free(mod_ctx);
         mod_ctx = NULL;
         return ESP_ERR_NO_MEM;
@@ -364,7 +349,7 @@ esp_err_t mod_player_start(void) {
         }
         // audio_set_sample_rate() already re-enabled the channel
         // Reset DMA state and preload silence to avoid replaying old buffers
-        audio_i2s_preload_and_enable(i2s_handle, stereo_buffer, sizeof(stereo_buffer));
+        audio_i2s_preload_and_enable(i2s_handle, dma_buffer, sizeof(dma_buffer));
     }
 
     // Start player with configured format
@@ -435,7 +420,7 @@ esp_err_t mod_player_stop(void) {
 
     // Flush I2S with silence before releasing ownership to avoid repeating the last buffer
     if (i2s_handle && audio_output_is_owner(AUDIO_OUTPUT_OWNER_MOD)) {
-        audio_i2s_silence_and_disable(i2s_handle, stereo_buffer, sizeof(stereo_buffer), 3);
+        audio_i2s_silence_and_disable(i2s_handle, dma_buffer, sizeof(dma_buffer), 3);
     }
 
     audio_output_release(AUDIO_OUTPUT_OWNER_MOD);
@@ -598,7 +583,7 @@ esp_err_t mod_player_pause(void) {
     }
     mod_paused = true;
     if (i2s_handle && audio_output_is_owner(AUDIO_OUTPUT_OWNER_MOD)) {
-        audio_i2s_silence_and_disable(i2s_handle, stereo_buffer, sizeof(stereo_buffer), 2);
+        audio_i2s_silence_and_disable(i2s_handle, dma_buffer, sizeof(dma_buffer), 2);
     }
     return ESP_OK;
 }
@@ -613,7 +598,7 @@ esp_err_t mod_player_resume(void) {
             ESP_LOGE(TAG, "Failed to set MOD sample rate: %s", esp_err_to_name(rate_ret));
             return rate_ret;
         }
-        audio_i2s_preload_and_enable(i2s_handle, stereo_buffer, sizeof(stereo_buffer));
+        audio_i2s_preload_and_enable(i2s_handle, dma_buffer, sizeof(dma_buffer));
     }
     mod_paused = false;
     return ESP_OK;

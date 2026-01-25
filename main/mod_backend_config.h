@@ -31,19 +31,19 @@
 
 /**
  * @brief Audio output format
- * 
+ *
+ * - MOD_CONFIG_FORMAT_STEREO: Native stereo output
+ *   - Enables proper stereo panning and headphone output
+ *   - Downmixed to mono for speaker output at runtime
+ *
  * - MOD_CONFIG_FORMAT_MONO: Mono output (converted to stereo for I2S)
  *   - Uses less memory and CPU (single channel rendering)
- *   - Recommended for embedded systems
- * 
- * - MOD_CONFIG_FORMAT_STEREO: Native stereo output
- *   - Better for modules with stereo panning
- *   - Uses more memory and CPU
- * 
- * Default: MOD_CONFIG_FORMAT_MONO
+ *   - No stereo panning support
+ *
+ * Default: MOD_CONFIG_FORMAT_STEREO (allows seamless headphone/speaker switching)
  */
 #ifndef MOD_CONFIG_FORMAT
-#define MOD_CONFIG_FORMAT MOD_CONFIG_FORMAT_MONO
+#define MOD_CONFIG_FORMAT MOD_CONFIG_FORMAT_STEREO
 #endif
 
 #define MOD_CONFIG_FORMAT_MONO   4  // Mono (matches MOD_FORMAT_MONO)

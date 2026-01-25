@@ -84,7 +84,31 @@ void audio_diagnose_es8156(void);
 
 /**
  * @brief Optimize ES8156 codec settings for better audio quality
- * 
+ *
  * @return esp_err_t ESP_OK on success
  */
 esp_err_t audio_optimize_es8156(void);
+
+/**
+ * @brief Handle headphone insertion/removal event
+ *
+ * Disables speaker amplifier when headphones are inserted,
+ * enables it when removed.
+ *
+ * @param inserted true if headphones inserted, false if removed
+ */
+void audio_handle_headphone_event(bool inserted);
+
+/**
+ * @brief Check if headphones are currently inserted
+ *
+ * @return true if headphones are inserted
+ */
+bool audio_is_headphones_inserted(void);
+
+/**
+ * @brief Check if output should be stereo (headphones) or mono (speakers)
+ *
+ * @return true if stereo output is preferred (headphones inserted)
+ */
+bool audio_is_stereo_output(void);

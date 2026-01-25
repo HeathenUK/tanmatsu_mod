@@ -1,6 +1,7 @@
 #include "audio.h"
 #include "bsp/audio.h"
 #include "bsp/i2c.h"
+#include "bsp/input.h"
 #include "bsp/tanmatsu.h"
 #include "driver/i2s_std.h"
 #include "es8156.h"
@@ -28,6 +29,7 @@ extern void bsp_audio_initialize(uint32_t rate);
 static i2s_chan_handle_t i2s_handle = NULL;
 static bool audio_initialized = false;
 static bool amplifier_enabled = false;
+static bool headphones_inserted = false;
 static uint8_t current_volume = 100;  // 0-100%
 static audio_output_owner_t audio_owner = AUDIO_OUTPUT_OWNER_NONE;
 static portMUX_TYPE audio_owner_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -88,9 +90,16 @@ esp_err_t audio_init(void) {
     }
     ESP_LOGI(TAG, "I2S channel enabled successfully, handle=%p", (void *)i2s_handle);
 
-    // Enable amplifier (required for sound output)
-    bsp_audio_set_amplifier(true);
-    amplifier_enabled = true;
+    // Check initial headphone state and set amplifier accordingly
+    // Headphones inserted = disable amplifier (use headphones), removed = enable amplifier (use speakers)
+    if (bsp_input_read_action(BSP_INPUT_ACTION_TYPE_AUDIO_JACK, &headphones_inserted) == ESP_OK) {
+        ESP_LOGI(TAG, "Headphones %s at startup", headphones_inserted ? "inserted" : "not inserted");
+    } else {
+        ESP_LOGW(TAG, "Failed to read headphone state, assuming not inserted");
+        headphones_inserted = false;
+    }
+    bsp_audio_set_amplifier(!headphones_inserted);
+    amplifier_enabled = !headphones_inserted;
 
     // Set initial volume to 70% of the UI range (mapped to codec range)
     float display_percent = 70.0f;
@@ -385,4 +394,23 @@ void audio_diagnose_es8156(void) {
 esp_err_t audio_optimize_es8156(void) {
     ESP_LOGW(TAG, "audio_optimize_es8156: ES8156 optimization disabled (using BSP)");
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+void audio_handle_headphone_event(bool inserted) {
+    headphones_inserted = inserted;
+    // Disable amplifier (speakers) when headphones inserted, enable when removed
+    bsp_audio_set_amplifier(!inserted);
+    amplifier_enabled = !inserted;
+    ESP_LOGI(TAG, "Headphones %s, amplifier %s",
+             inserted ? "inserted" : "removed",
+             amplifier_enabled ? "enabled" : "disabled");
+}
+
+bool audio_is_headphones_inserted(void) {
+    return headphones_inserted;
+}
+
+bool audio_is_stereo_output(void) {
+    // Stereo output when headphones are inserted, mono when using speakers
+    return headphones_inserted;
 }

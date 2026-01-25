@@ -229,12 +229,27 @@ static void vgm_playback_task(void *arg) {
                     // Write to I2S in DMA-sized chunks (render buffer lives in PSRAM)
                     uint32_t remaining = rendered;
                     uint32_t offset = 0;
+                    bool stereo_output = audio_is_stereo_output();
                     while (remaining > 0) {
                         uint32_t chunk = (remaining > VGM_DMA_CHUNK_SAMPLES) ? VGM_DMA_CHUNK_SAMPLES : remaining;
                         int64_t copy_start_us = esp_timer_get_time();
-                        memcpy(vgm_dma_buffer,
-                               &vgm_render_buffer[offset * 2],
-                               chunk * 2 * sizeof(int16_t));
+                        // Process audio: stereo for headphones, mono downmix for speakers
+                        int16_t *src = &vgm_render_buffer[offset * 2];
+                        if (stereo_output) {
+                            // Headphones: copy stereo with soft clipping
+                            for (uint32_t i = 0; i < chunk; i++) {
+                                vgm_dma_buffer[i * 2 + 0] = audio_soft_clip(src[i * 2 + 0]);
+                                vgm_dma_buffer[i * 2 + 1] = audio_soft_clip(src[i * 2 + 1]);
+                            }
+                        } else {
+                            // Speakers: downmix to mono, duplicate for I2S
+                            for (uint32_t i = 0; i < chunk; i++) {
+                                int32_t mono = ((int32_t)src[i * 2 + 0] + (int32_t)src[i * 2 + 1]) / 2;
+                                int16_t sample = audio_soft_clip((int16_t)mono);
+                                vgm_dma_buffer[i * 2 + 0] = sample;
+                                vgm_dma_buffer[i * 2 + 1] = sample;
+                            }
+                        }
                         uint32_t copy_us = (uint32_t)(esp_timer_get_time() - copy_start_us);
                         if (copy_us > stat_copy_max_us) stat_copy_max_us = copy_us;
                         int64_t write_start_us = esp_timer_get_time();

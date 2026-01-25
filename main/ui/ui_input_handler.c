@@ -6,6 +6,7 @@
 #include "ui_input_handler.h"
 #include "file_browser.h"
 #include "app_state.h"
+#include "audio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <string.h>
@@ -59,6 +60,11 @@ esp_err_t ui_input_handle_event(const bsp_input_event_t *event,
             break;
 
         case INPUT_EVENT_TYPE_ACTION:
+            if (event->args_action.type == BSP_INPUT_ACTION_TYPE_AUDIO_JACK) {
+                // Handle headphone insert/remove - switches between speaker (mono) and headphones (stereo)
+                audio_handle_headphone_event(event->args_action.state);
+                return ESP_OK;
+            }
             if (event->args_action.state &&
                 event->args_action.type == BSP_INPUT_ACTION_TYPE_POWER_BUTTON) {
                 result->action = INPUT_ACTION_EXIT_TO_LAUNCHER;
