@@ -47,6 +47,17 @@ static StaticTask_t *mod_task_tcb = NULL;
 static int16_t *mono_buffer = NULL;  // PSRAM
 static DRAM_ATTR int16_t stereo_buffer[MOD_BUFFER_SAMPLES * 2] = {0};
 
+// Task-local state that needs to be reset for each new song
+static volatile bool mod_task_first_fill = true;
+
+/**
+ * @brief Reset playback task state for a new song
+ * Called from mod_player_start() to ensure clean state for each playback
+ */
+void mod_player_reset_task_state(void) {
+    mod_task_first_fill = true;
+}
+
 /**
  * @brief MOD playback task - renders MOD audio and writes to I2S
  */
@@ -123,9 +134,8 @@ static void mod_playback_task(void *arg) {
                 
                 // Pre-fill I2S buffer with a few buffers to ensure continuous playback
                 // (I2S DMA might need multiple buffers to start output)
-                static bool first_fill = true;
-                if (first_fill) {
-                    first_fill = false;
+                if (mod_task_first_fill) {
+                    mod_task_first_fill = false;
                     // Write 4 buffers quickly to fill DMA buffer
                     for (int j = 0; j < 4; j++) {
                         size_t temp_written = 0;
@@ -297,11 +307,9 @@ esp_err_t mod_player_load(const uint8_t* mod_data, size_t mod_size) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Stop current playback if any
+    // Stop current playback if any (also releases module and clears mod_loaded)
     if (mod_loaded) {
         mod_player_stop();
-        mod_backend_release_module(mod_ctx);
-        mod_loaded = false;
     }
 
     // Load MOD from memory
@@ -387,6 +395,11 @@ esp_err_t mod_player_start(void) {
     #endif
 
     mod_playing = true;
+
+    // Reset playback task state for new song
+    extern void mod_player_reset_task_state(void);
+    mod_player_reset_task_state();
+
     ESP_LOGI(TAG, "MOD playback started");
     return ESP_OK;
 }
@@ -396,7 +409,7 @@ esp_err_t mod_player_stop(void) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!mod_playing) {
+    if (!mod_playing && !mod_loaded) {
         return ESP_OK;
     }
 
@@ -408,12 +421,17 @@ esp_err_t mod_player_stop(void) {
     // This guarantees we don't call end_player while play_buffer is running
     if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         mod_backend_end_player(mod_ctx);
+        mod_backend_release_module(mod_ctx);
         xSemaphoreGive(playback_mutex);
     } else {
         // Timeout - force end anyway (shouldn't happen normally)
         ESP_LOGW(TAG, "Timeout waiting for playback mutex in stop()");
         mod_backend_end_player(mod_ctx);
+        mod_backend_release_module(mod_ctx);
     }
+
+    // Mark as unloaded after backend cleanup
+    mod_loaded = false;
 
     // Flush I2S with silence before releasing ownership to avoid repeating the last buffer
     if (i2s_handle && audio_output_is_owner(AUDIO_OUTPUT_OWNER_MOD)) {
@@ -438,11 +456,17 @@ esp_err_t mod_player_get_frame_info(struct xmp_frame_info *frame_info) {
     if (mod_ctx == NULL || !mod_loaded || frame_info == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    
+
+    // Protect against race with playback task modifying backend state
+    if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     // Convert from backend frame info to libxmp frame info
     mod_frame_info_t mod_frame;
     esp_err_t ret = mod_backend_get_frame_info(mod_ctx, &mod_frame);
     if (ret != ESP_OK) {
+        xSemaphoreGive(playback_mutex);
         return ret;
     }
     
@@ -465,7 +489,8 @@ esp_err_t mod_player_get_frame_info(struct xmp_frame_info *frame_info) {
         frame_info->channel_info[ch].volume = mod_frame.channel_info[ch].volume;
         frame_info->channel_info[ch].period = mod_frame.channel_info[ch].period;
     }
-    
+
+    xSemaphoreGive(playback_mutex);
     return ESP_OK;
 }
 

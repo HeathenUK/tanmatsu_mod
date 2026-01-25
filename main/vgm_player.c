@@ -100,13 +100,24 @@ static esp_err_t vgm_player_check_supported(void) {
     return ESP_OK;
 }
 
+// Task-local state that needs to be reset for each new song
+static volatile bool vgm_task_first_write_logged = false;
+static volatile uint32_t vgm_task_enable_fail_count = 0;
+
+/**
+ * @brief Reset playback task state for a new song
+ * Called from vgm_player_start() to ensure clean state for each playback
+ */
+void vgm_player_reset_task_state(void) {
+    vgm_task_first_write_logged = false;
+    vgm_task_enable_fail_count = 0;
+}
+
 /**
  * @brief VGM playback task - renders VGM audio and writes to I2S
  */
 static void vgm_playback_task(void *arg) {
     size_t bytes_written;
-    static bool first_write_logged = false;
-    static uint32_t enable_fail_count = 0;
     int64_t last_stats_time = 0;
     uint32_t stat_render_max_us = 0;
     uint32_t stat_copy_max_us = 0;
@@ -196,21 +207,21 @@ static void vgm_playback_task(void *arg) {
                 xSemaphoreGive(playback_mutex);
 
                 if (rendered > 0) {
-                    if (!first_write_logged) {
+                    if (!vgm_task_first_write_logged) {
                         // Try to enable channel right before first write
                         esp_err_t en_ret = i2s_channel_enable(i2s_handle);
                         if (en_ret == ESP_OK || en_ret == ESP_ERR_INVALID_STATE) {
                             // INVALID_STATE can mean already enabled; treat as OK for first write
                             ESP_LOGI(TAG, "VGM TASK: handle=%p, enable=%s(0x%x), rendered=%lu",
                                      (void *)i2s_handle, esp_err_to_name(en_ret), en_ret, rendered);
-                            first_write_logged = true;
-                            enable_fail_count = 0;
+                            vgm_task_first_write_logged = true;
+                            vgm_task_enable_fail_count = 0;
                         } else {
-                            if (enable_fail_count < 3) {
+                            if (vgm_task_enable_fail_count < 3) {
                                 ESP_LOGE(TAG, "VGM TASK: enable failed: %s(0x%x), handle=%p",
                                          esp_err_to_name(en_ret), en_ret, (void *)i2s_handle);
                             }
-                            enable_fail_count++;
+                            vgm_task_enable_fail_count++;
                             vTaskDelay(pdMS_TO_TICKS(10));
                             continue;  // Skip write until channel is enabled
                         }
@@ -240,7 +251,7 @@ static void vgm_playback_task(void *arg) {
                                          esp_err_to_name(write_ret), (void *)i2s_handle);
                                 error_count++;
                             }
-                            first_write_logged = false;
+                            vgm_task_first_write_logged = false;
                             vTaskDelay(pdMS_TO_TICKS(10));
                             break;
                         }
@@ -250,7 +261,7 @@ static void vgm_playback_task(void *arg) {
                 } else {
                     // Playback ended
                     vgm_playing = false;
-                    first_write_logged = false;  // Reset for next playback
+                    vgm_task_first_write_logged = false;  // Reset for next playback
                     if (i2s_handle && audio_output_is_owner(AUDIO_OUTPUT_OWNER_VGM)) {
                         i2s_channel_disable(i2s_handle);
                     }
@@ -501,6 +512,11 @@ esp_err_t vgm_player_start(void) {
 
     vgm_playing = true;
     vgm_paused = false;
+
+    // Reset playback task state for new song
+    extern void vgm_player_reset_task_state(void);
+    vgm_player_reset_task_state();
+
     ESP_LOGI(TAG, "VGM playback started");
     return ESP_OK;
 }
@@ -521,11 +537,16 @@ esp_err_t vgm_player_stop(void) {
     // Acquire mutex to ensure task has finished any in-progress render
     if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         vgm_backend_stop(vgm_ctx);
+        vgm_backend_unload(vgm_ctx);
         xSemaphoreGive(playback_mutex);
     } else {
         ESP_LOGW(TAG, "Timeout waiting for playback mutex in stop()");
         vgm_backend_stop(vgm_ctx);
+        vgm_backend_unload(vgm_ctx);
     }
+
+    // Mark as unloaded after backend cleanup
+    vgm_loaded = false;
 
     if (i2s_handle && audio_output_is_owner(AUDIO_OUTPUT_OWNER_VGM)) {
         // Flush DMA with silence before disabling to avoid repeating the last buffer
@@ -666,21 +687,42 @@ esp_err_t vgm_player_get_tags(vgm_tags_t *tags) {
     if (vgm_ctx == NULL || !vgm_loaded || tags == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    return vgm_backend_get_tags(vgm_ctx, tags);
+
+    // Protect against race with playback task modifying backend state
+    if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t ret = vgm_backend_get_tags(vgm_ctx, tags);
+    xSemaphoreGive(playback_mutex);
+    return ret;
 }
 
 esp_err_t vgm_player_get_info(vgm_playback_info_t *info) {
     if (vgm_ctx == NULL || info == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    return vgm_backend_get_info(vgm_ctx, info);
+
+    // Protect against race with playback task modifying backend state
+    if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t ret = vgm_backend_get_info(vgm_ctx, info);
+    xSemaphoreGive(playback_mutex);
+    return ret;
 }
 
 esp_err_t vgm_player_get_chip_info(uint8_t index, vgm_chip_info_t *chip_info) {
     if (vgm_ctx == NULL || !vgm_loaded || chip_info == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    return vgm_backend_get_chip_info(vgm_ctx, index, chip_info);
+
+    // Protect against race with playback task modifying backend state
+    if (xSemaphoreTake(playback_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t ret = vgm_backend_get_chip_info(vgm_ctx, index, chip_info);
+    xSemaphoreGive(playback_mutex);
+    return ret;
 }
 
 void vgm_player_set_loop_count(uint32_t loops) {

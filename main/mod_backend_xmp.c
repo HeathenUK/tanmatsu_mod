@@ -49,18 +49,19 @@ void xmp_backend_free(xmp_backend_t *backend) {
     if (backend == NULL) {
         return;
     }
-    
+
     if (backend->ctx != NULL) {
-        if (backend->is_loaded) {
-            xmp_release_module(backend->ctx);
-        }
+        // Must end player before releasing module
         if (backend->is_playing) {
             xmp_end_player(backend->ctx);
+        }
+        if (backend->is_loaded) {
+            xmp_release_module(backend->ctx);
         }
         xmp_free_context(backend->ctx);
         backend->ctx = NULL;
     }
-    
+
     free(backend);
 }
 
